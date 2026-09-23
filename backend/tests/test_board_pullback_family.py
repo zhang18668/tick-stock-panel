@@ -186,5 +186,3 @@ def test_additional_exit_and_entry_parameter_change(engine, exit_mode):
     assert result.entry[65, 0]
     assert result.exit[66, 0]  # Price falls to 10, below both MAs and the known pullback low.
     assert sd.matrix_strategy.compute_signals(m, {"depth_max": 0.01}).entry.sum() == 0
-
-
