@@ -58,6 +58,10 @@ class MatcherConfig:
     stamp_tax_pct: float | None = None
     slippage_bps: float = 5.0
     stop_loss_pct: float | None = None
+    stop_loss_trigger: Literal["intraday", "close"] = "intraday"
+    second_day_gap_stop_pct: float | None = None
+    conditional_stop_loss_pct: float | None = None
+    reserve_scale_in: bool = False
     take_profit_pct: float | None = None
     trailing_stop_pct: float | None = None
     trailing_take_profit_activate_pct: float | None = None
@@ -875,11 +879,14 @@ class BacktestEngine:
 
         minute_cache: dict = {}
         if config.minute_fill:
-            trigger_times, trigger_assets = np.nonzero(matrix.entry | matrix.exit)
+            trigger_times, trigger_assets = np.nonzero(
+                matrix.entry | matrix.exit | matrix.second_day_review
+            )
             dates = {matrix.timestamp_labels[int(t)][:10] for t in trigger_times}
             symbols = {matrix.symbols[int(a)] for a in trigger_assets}
             if dates and symbols:
-                loaded = self._load_minute_for_fills(self.repo, list(symbols), dates, "stock")
+                minute_options = {"include_time": True} if matrix.second_day_review.any() else {}
+                loaded = self._load_minute_for_fills(self.repo, list(symbols), dates, "stock", **minute_options)
                 minute_cache = {key: value for key, value in loaded.items() if value is not None and len(value) > 0}
 
         def _count(key: str) -> None:
@@ -964,6 +971,17 @@ class BacktestEngine:
             low_price = float(matrix.low[time_id, asset_id])
             high_price = float(matrix.high[time_id, asset_id])
             peak_price = float(pos["max_high"])
+            if config.second_day_gap_stop_pct is not None and pos["hold_days"] == 1:
+                previous_time = time_id - 1
+                while previous_time >= 0:
+                    previous_close = float(matrix.close[previous_time, asset_id])
+                    if _valid_price(previous_close):
+                        gap_line = previous_close * (1 - abs(float(config.second_day_gap_stop_pct)))
+                        gap_tolerance = max(abs(previous_close) * 1e-6, 1e-8)
+                        if _valid_price(open_price) and open_price <= gap_line + gap_tolerance:
+                            return "second_day_gap_stop", open_price
+                        break
+                    previous_time -= 1
             lines: list[tuple[float, str]] = []
             if config.stop_loss_pct is not None:
                 lines.append((entry_price * (1 - abs(config.stop_loss_pct)), "stop_loss"))
@@ -987,6 +1005,11 @@ class BacktestEngine:
                     return "take_profit", open_price
                 if _valid_price(high_price) and high_price >= take_profit:
                     return "take_profit", take_profit
+            if config.conditional_stop_loss_pct is not None and matrix.conditional_stop[time_id, asset_id]:
+                close_price = float(matrix.close[time_id, asset_id])
+                stop_line = entry_price * (1 - abs(float(config.conditional_stop_loss_pct)))
+                if _valid_price(close_price) and close_price <= stop_line:
+                    return "ma_loss_stop", close_price
             return None, None
 
         def _try_close(
@@ -1033,7 +1056,7 @@ class BacktestEngine:
             exit_price = float(override) if override is not None else _refill(
                 time_id, asset_id, "sell", float(exit_prices[time_id, asset_id])
             )
-            shares = 100.0
+            shares = float(pos.get("shares", 100.0))
             entry_value = shares * pos["entry_price"] * (1 + buy_cost_pct)
             exit_value = shares * exit_price * (1 - sell_cost_pct)
             pnl_amount = exit_value - entry_value
@@ -1048,7 +1071,7 @@ class BacktestEngine:
                 duration=int(pos["hold_days"]),
                 exit_reason=reason,
                 shares=shares,
-                lots=1.0,
+                lots=shares / 100,
                 entry_value=round(float(entry_value), 2),
                 exit_value=round(float(exit_value), 2),
                 pnl_amount=round(float(pnl_amount), 2),
@@ -1121,6 +1144,62 @@ class BacktestEngine:
             for future in future_times:
                 pos["hold_days"] += 1
                 date_text = matrix.timestamp_labels[future][:10]
+                if matrix.second_day_review[future, asset_id]:
+                    rows = minute_cache.get((matrix.symbols[asset_id], date_text))
+                    reason, review_price = self._resolve_second_day_exit(
+                        rows,
+                        float(pos["entry_price"]),
+                        float(matrix.high[future, asset_id]),
+                        float(matrix.close[future, asset_id]),
+                    )
+                    if reason and _try_close(
+                        pos, future, asset_id, reason, date_text, review_price
+                    ):
+                        closed = True
+                        break
+                    if matrix.scale_in[future, asset_id]:
+                        add_price = float(matrix.close[future, asset_id])
+                        if _valid_price(add_price):
+                            original_shares = float(pos.get("shares", 100.0))
+                            original_value = (
+                                original_shares * float(pos["entry_price"]) * (1 + buy_cost_pct)
+                            )
+                            add_value = original_shares * add_price * (1 + buy_cost_pct)
+                            total_shares = original_shares * 2
+                            pos["entry_price"] = (original_value + add_value) / (
+                                total_shares * (1 + buy_cost_pct)
+                            )
+                            pos["shares"] = total_shares
+                            pos["scale_in_count"] = 1
+                        continue
+                    if _try_close(
+                        pos,
+                        future,
+                        asset_id,
+                        "second_day_close_exit",
+                        date_text,
+                        float(matrix.close[future, asset_id]),
+                    ):
+                        closed = True
+                        break
+                forced_price = float(matrix.forced_exit_price[future, asset_id])
+                if _valid_price(forced_price):
+                    open_price = float(matrix.open[future, asset_id])
+                    high_price = float(matrix.high[future, asset_id])
+                    reached_target = (
+                        _valid_price(open_price) and open_price >= forced_price
+                    ) or (_valid_price(high_price) and high_price >= forced_price)
+                    override = (
+                        open_price
+                        if _valid_price(open_price) and open_price >= forced_price
+                        else forced_price
+                        if reached_target
+                        else float(matrix.close[future, asset_id])
+                    )
+                    reason = "planned_exit" if reached_target else "planned_close_exit"
+                    if _try_close(pos, future, asset_id, reason, date_text, override):
+                        closed = True
+                        break
                 reason, override = _risk_exit(pos, future, asset_id)
                 if reason and _try_close(pos, future, asset_id, reason, date_text, override):
                     closed = True
@@ -1387,7 +1466,13 @@ class BacktestEngine:
             risk_lines: list[tuple[float, str]] = []
 
             if config.stop_loss_pct is not None:
-                risk_lines.append((entry_price * (1 - abs(config.stop_loss_pct)), "stop_loss"))
+                stop_line = entry_price * (1 - abs(config.stop_loss_pct))
+                if config.stop_loss_trigger == "close":
+                    close_price = float(close_prices[idx])
+                    if _valid_price(close_price) and close_price <= stop_line:
+                        return "stop_loss", close_price
+                else:
+                    risk_lines.append((stop_line, "stop_loss"))
             if config.trailing_stop_pct is not None and peak_price > 0:
                 risk_lines.append((peak_price * (1 - abs(config.trailing_stop_pct)), "trailing_stop"))
 
@@ -1647,6 +1732,35 @@ class BacktestEngine:
             return None
         return float(opens[next_idx])
 
+    @staticmethod
+    def _resolve_second_day_exit(
+        minute_arr: np.ndarray | None,
+        entry_price: float,
+        daily_high: float,
+        daily_close: float,
+    ) -> tuple[str | None, float | None]:
+        """Resolve the strategy's ordered T+1 exit rules without future leakage."""
+        four_pct = entry_price * 1.04
+        minute_available = (
+            minute_arr is not None
+            and len(minute_arr) > 0
+            and minute_arr.shape[1] >= 7
+        )
+        if minute_available:
+            before_ten = minute_arr[:, 6] < 600
+            early_rows = minute_arr[before_ten]
+            early_highs = early_rows[:, 1]
+            if np.any(np.isfinite(early_highs) & (early_highs >= four_pct)):
+                first_open = float(early_rows[0, 0])
+                return "take_profit_4_before_10", max(first_open, four_pct)
+        two_pct = entry_price * 1.02
+        if np.isfinite(daily_high) and daily_high >= two_pct:
+            first_open = float(minute_arr[0, 0]) if minute_available else two_pct
+            return "take_profit_2", max(first_open, two_pct)
+        if np.isfinite(daily_close) and daily_close > entry_price:
+            return "second_day_red_close", daily_close
+        return None, None
+
     # 分钟K cache 存储的数值列及固定顺序 (_resolve_minute_fill 按此顺序整数索引)。
     _MINUTE_NUMERIC_COLS = ["open", "high", "low", "close", "volume", "amount"]
 
@@ -1656,6 +1770,8 @@ class BacktestEngine:
         symbols: list[str],
         dates_needed: set,
         asset_type: str,
+        *,
+        include_time: bool = False,
     ) -> dict:
         """按触发日加载分钟K, 返回 {(symbol, date_str): float64 2D ndarray}。
 
@@ -1697,9 +1813,15 @@ class BacktestEngine:
                 sym = sub["symbol"][0]
                 d_str = sub["_d_str"][0]
                 cols = [c for c in numeric_cols if c in sub.columns]
-                cache[(sym, d_str)] = sub.select(
-                    [pl.col(c).cast(pl.Float64) for c in cols]
-                ).to_numpy()
+                values = [pl.col(c).cast(pl.Float64) for c in cols]
+                if include_time:
+                    values.append(
+                        (
+                            pl.col("datetime").dt.hour().cast(pl.Int32) * 60
+                            + pl.col("datetime").dt.minute().cast(pl.Int32)
+                        ).cast(pl.Float64).alias("minute_of_day")
+                    )
+                cache[(sym, d_str)] = sub.select(values).to_numpy()
         return cache
 
     def simulate_portfolio(
@@ -1787,7 +1909,9 @@ class BacktestEngine:
 
         minute_cache: dict = {}
         if config.minute_fill:
-            trigger_times, trigger_assets = np.nonzero(matrix.entry | matrix.exit)
+            trigger_times, trigger_assets = np.nonzero(
+                matrix.entry | matrix.exit | matrix.second_day_review
+            )
             trigger_dates = {matrix.timestamp_labels[int(t)][:10] for t in trigger_times}
             trigger_symbols = {matrix.symbols[int(a)] for a in trigger_assets}
             if trigger_dates and trigger_symbols:
@@ -1795,8 +1919,9 @@ class BacktestEngine:
                     symbol.endswith(".SH") and symbol.startswith("5")
                     for symbol in list(trigger_symbols)[:5]
                 ) else "stock"
+                minute_options = {"include_time": True} if matrix.second_day_review.any() else {}
                 loaded = self._load_minute_for_fills(
-                    self.repo, list(trigger_symbols), trigger_dates, asset_type,
+                    self.repo, list(trigger_symbols), trigger_dates, asset_type, **minute_options,
                 )
                 minute_cache = {key: value for key, value in loaded.items() if value is not None and len(value) > 0}
 
@@ -2004,8 +2129,54 @@ class BacktestEngine:
                 pos["hold_days"] += 1
 
             for asset_id in list(positions):
+                if not matrix.second_day_review[time_id, asset_id]:
+                    continue
+                pos = positions.get(asset_id)
+                if pos is None:
+                    continue
+                rows = minute_cache.get((matrix.symbols[asset_id], date_text))
+                reason, review_price = self._resolve_second_day_exit(
+                    rows,
+                    float(pos["entry_price"]),
+                    float(matrix.high[time_id, asset_id]),
+                    float(matrix.close[time_id, asset_id]),
+                )
+                if reason:
+                    _try_sell(
+                        time_id, asset_id, reason, date_text, sold_today, review_price
+                    )
+                elif not matrix.scale_in[time_id, asset_id]:
+                    _try_sell(
+                        time_id,
+                        asset_id,
+                        "second_day_close_exit",
+                        date_text,
+                        sold_today,
+                        float(matrix.close[time_id, asset_id]),
+                    )
+
+            for asset_id in list(positions):
+                target = float(matrix.forced_exit_price[time_id, asset_id])
+                if not _valid_price(target):
+                    continue
+                open_price = float(matrix.open[time_id, asset_id])
+                high_price = float(matrix.high[time_id, asset_id])
+                override = (
+                    open_price
+                    if _valid_price(open_price) and open_price >= target
+                    else target if _valid_price(high_price) and high_price >= target else None
+                )
+                reason = "planned_exit"
+                if override is None:
+                    override = float(matrix.close[time_id, asset_id])
+                    reason = "planned_close_exit"
+                _try_sell(time_id, asset_id, reason, date_text, sold_today, override)
+
+            for asset_id in list(positions):
                 pos = positions.get(asset_id)
                 if pos is None or pos.get("pending_exit_reason") or pos["entry_date"] == date_text:
+                    continue
+                if matrix.second_day_review[time_id, asset_id] and matrix.scale_in[time_id, asset_id]:
                     continue
                 if not matrix.tradable[time_id, asset_id] or pos["entry_price"] <= 0:
                     continue
@@ -2014,9 +2185,40 @@ class BacktestEngine:
                 high_price = float(matrix.high[time_id, asset_id])
                 entry_price = float(pos["entry_price"])
                 peak_price = float(pos["max_high"])
+                gap_stop_triggered = False
+                if config.second_day_gap_stop_pct is not None and pos["hold_days"] == 1:
+                    previous_time = time_id - 1
+                    while previous_time >= 0:
+                        previous_close = float(matrix.close[previous_time, asset_id])
+                        if _valid_price(previous_close):
+                            gap_line = previous_close * (
+                                1 - abs(float(config.second_day_gap_stop_pct))
+                            )
+                            gap_tolerance = max(abs(previous_close) * 1e-6, 1e-8)
+                            if _valid_price(open_price) and open_price <= gap_line + gap_tolerance:
+                                gap_stop_triggered = True
+                                _try_sell(
+                                    time_id,
+                                    asset_id,
+                                    "second_day_gap_stop",
+                                    date_text,
+                                    sold_today,
+                                    open_price,
+                                )
+                            break
+                        previous_time -= 1
+                if gap_stop_triggered:
+                    continue
                 risk_lines: list[tuple[float, str]] = []
                 if config.stop_loss_pct is not None:
-                    risk_lines.append((entry_price * (1 - abs(config.stop_loss_pct)), "stop_loss"))
+                    stop_line = entry_price * (1 - abs(config.stop_loss_pct))
+                    if config.stop_loss_trigger == "close":
+                        close_price = float(matrix.close[time_id, asset_id])
+                        if _valid_price(close_price) and close_price <= stop_line:
+                            _try_sell(time_id, asset_id, "stop_loss", date_text, sold_today, close_price)
+                            continue
+                    else:
+                        risk_lines.append((stop_line, "stop_loss"))
                 if config.trailing_stop_pct is not None:
                     risk_lines.append((peak_price * (1 - abs(config.trailing_stop_pct)), "trailing_stop"))
                 activate = config.trailing_take_profit_activate_pct
@@ -2044,7 +2246,29 @@ class BacktestEngine:
 
             for asset_id in list(positions):
                 pos = positions.get(asset_id)
+                if (
+                    pos is None
+                    or pos.get("pending_exit_reason")
+                    or pos["entry_date"] == date_text
+                    or config.conditional_stop_loss_pct is None
+                    or not matrix.conditional_stop[time_id, asset_id]
+                    or (
+                        matrix.second_day_review[time_id, asset_id]
+                        and matrix.scale_in[time_id, asset_id]
+                    )
+                ):
+                    continue
+                entry_price = float(pos["entry_price"])
+                close_price = float(matrix.close[time_id, asset_id])
+                stop_line = entry_price * (1 - abs(float(config.conditional_stop_loss_pct)))
+                if _valid_price(close_price) and close_price <= stop_line:
+                    _try_sell(time_id, asset_id, "ma_loss_stop", date_text, sold_today, close_price)
+
+            for asset_id in list(positions):
+                pos = positions.get(asset_id)
                 if pos is None:
+                    continue
+                if matrix.second_day_review[time_id, asset_id] and matrix.scale_in[time_id, asset_id]:
                     continue
                 reason = ""
                 signal_date = date_text
@@ -2060,6 +2284,40 @@ class BacktestEngine:
                     reason = "end"
                 if reason:
                     _try_sell(time_id, asset_id, reason, signal_date, sold_today)
+
+            for asset_id in list(positions):
+                pos = positions.get(asset_id)
+                if (
+                    pos is None
+                    or pos.get("pending_exit_reason")
+                    or pos.get("scale_in_count", 0) > 0
+                    or not matrix.scale_in[time_id, asset_id]
+                ):
+                    continue
+                add_price = float(matrix.close[time_id, asset_id])
+                if not _valid_price(add_price):
+                    _count("buy_invalid_price")
+                    continue
+                add_shares = float(pos["shares"])
+                add_value = add_shares * add_price * (1 + buy_cost_pct)
+                market_value = _market_value()
+                equity = cash + market_value
+                capacity = equity * max_exposure_pct - market_value
+                if add_value > cash + 1e-6:
+                    _count("buy_cash")
+                    continue
+                if add_value > capacity + 1e-6:
+                    _count("buy_exposure")
+                    continue
+                cash -= add_value
+                pos["entry_value"] += add_value
+                pos["shares"] += add_shares
+                pos["lots"] = pos["shares"] / 100
+                pos["entry_price"] = pos["entry_value"] / (
+                    pos["shares"] * (1 + buy_cost_pct)
+                )
+                pos["position_pct"] = pos["entry_value"] / equity if equity > 0 else 0.0
+                pos["scale_in_count"] = 1
 
             if time_id < time_count - 1 and max_positions > 0:
                 candidates: list[tuple[int, float]] = []
@@ -2108,7 +2366,8 @@ class BacktestEngine:
                             market_value = _market_value()
                             equity = cash + market_value
                             capacity = equity * max_exposure_pct - market_value
-                            allocation = min(total_budget * float(weight), target_value, cash, capacity)
+                            asset_target_value = target_value * (0.5 if config.reserve_scale_in else 1.0)
+                            allocation = min(total_budget * float(weight), asset_target_value, cash, capacity)
                             if allocation <= 0:
                                 _count("buy_exposure")
                                 continue
@@ -2554,7 +2813,14 @@ class BacktestEngine:
                 risk_lines: list[tuple[float, str]] = []
 
                 if config.stop_loss_pct is not None:
-                    risk_lines.append((entry_price * (1 - abs(config.stop_loss_pct)), "stop_loss"))
+                    stop_line = entry_price * (1 - abs(config.stop_loss_pct))
+                    if config.stop_loss_trigger == "close":
+                        close_price = float(close_prices[idx])
+                        if _valid_price(close_price) and close_price <= stop_line:
+                            _try_sell(sym, idx, "stop_loss", d_str, sold_today, close_price)
+                            continue
+                    else:
+                        risk_lines.append((stop_line, "stop_loss"))
 
                 if config.trailing_stop_pct is not None and peak_price > 0:
                     risk_lines.append((peak_price * (1 - abs(config.trailing_stop_pct)), "trailing_stop"))

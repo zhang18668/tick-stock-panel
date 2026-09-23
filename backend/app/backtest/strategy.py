@@ -1104,9 +1104,38 @@ class StrategyBacktestService:
             unsupported = unsupported_minute_exit_signals(exit_signals)
             if unsupported:
                 return _err(f"以下卖出信号暂不支持分钟触发回放: {', '.join(unsupported)}")
+        if s.meta.get("requires_minute_execution"):
+            config.minute_fill = True
         stop_loss = self._override_value(overrides, "stop_loss", s.stop_loss)
+        if "execution_stop_loss_pct" in params:
+            configured_stop = float(params["execution_stop_loss_pct"] or 0)
+            stop_loss = configured_stop / 100 if configured_stop > 0 else None
+        conditional_stop_loss = None
+        if params.get("use_ma_loss_stop", False):
+            try:
+                conditional_stop_loss = self._normalize_pct(
+                    float(params.get("ma_loss_stop_pct", 3.0)) / 100,
+                    0.001,
+                    0.5,
+                )
+            except (TypeError, ValueError):
+                conditional_stop_loss = 0.03
+        second_day_gap_stop = None
+        if params.get("use_second_day_gap_stop", False):
+            try:
+                second_day_gap_stop = self._normalize_pct(
+                    float(params.get("second_day_gap_stop_pct", 2.0)) / 100,
+                    0.001,
+                    0.5,
+                )
+            except (TypeError, ValueError):
+                second_day_gap_stop = 0.02
         take_profit = self._normalize_pct(
-            self._override_value(overrides, "take_profit", getattr(s, "take_profit", None)),
+            (
+                float(params["execution_take_profit_pct"]) / 100
+                if "execution_take_profit_pct" in params
+                else self._override_value(overrides, "take_profit", getattr(s, "take_profit", None))
+            ),
             0.01,
             5.0,
         )
@@ -1307,13 +1336,17 @@ class StrategyBacktestService:
 
         matcher_config = MatcherConfig(
             matching=config.matching,
-            entry_fill=config.entry_fill,
-            exit_fill=config.exit_fill,
+            entry_fill=s.meta.get("execution_entry_fill", config.entry_fill),
+            exit_fill=s.meta.get("execution_exit_fill", config.exit_fill),
             fees_pct=config.fees_pct,
             commission_pct=config.commission_pct,
             stamp_tax_pct=config.stamp_tax_pct,
             slippage_bps=config.slippage_bps,
             stop_loss_pct=stop_loss,
+            stop_loss_trigger=s.meta.get("stop_loss_trigger", "intraday"),
+            second_day_gap_stop_pct=second_day_gap_stop,
+            conditional_stop_loss_pct=conditional_stop_loss,
+            reserve_scale_in=callable(getattr(s.matrix_strategy, "compute_execution_plan", None)),
             take_profit_pct=take_profit,
             trailing_stop_pct=trailing_stop,
             trailing_take_profit_activate_pct=trailing_take_profit_activate,
@@ -1329,6 +1362,10 @@ class StrategyBacktestService:
         )
         t_signal = time.perf_counter()
         selection_stats: dict[str, int | bool]
+        conditional_stop_mask: np.ndarray | None = None
+        scale_in_mask: np.ndarray | None = None
+        forced_exit_price: np.ndarray | None = None
+        second_day_review: np.ndarray | None = None
 
         if s.execution_backend == "composite":
             # composite 回测信号生成: 复用 matrix 数据加载, 逐子策略算信号后合并。
@@ -1511,6 +1548,28 @@ class StrategyBacktestService:
             except (TypeError, ValueError) as e:
                 return _err(f"矩阵策略信号计算失败: {e}")
 
+            compute_conditional_stop = getattr(s.matrix_strategy, "compute_conditional_stop", None)
+            if callable(compute_conditional_stop):
+                conditional_stop_mask = np.asarray(
+                    compute_conditional_stop(market_data, params),
+                    dtype=np.uint8,
+                )
+                if conditional_stop_mask.shape != market_data.shape:
+                    return _err("条件止损矩阵形状与行情矩阵不一致")
+
+            compute_execution_plan = getattr(s.matrix_strategy, "compute_execution_plan", None)
+            if callable(compute_execution_plan):
+                plan = compute_execution_plan(market_data, params, signal_matrix)
+                scale_in_mask = np.asarray(plan.get("scale_in"), dtype=np.uint8)
+                forced_exit_price = np.asarray(plan.get("forced_exit_price"), dtype=np.float32)
+                second_day_review = np.asarray(plan.get("second_day_review"), dtype=np.uint8)
+                if (
+                    scale_in_mask.shape != market_data.shape
+                    or forced_exit_price.shape != market_data.shape
+                    or second_day_review.shape != market_data.shape
+                ):
+                    return _err("策略执行计划矩阵形状与行情矩阵不一致")
+
             sim_market_data = slice_market_data_matrix(market_data, start_id, stop_id)
             sim_signal_matrix = slice_signal_matrix(signal_matrix, start_id, stop_id)
             sim_signal_matrix = apply_time_masks(
@@ -1538,6 +1597,22 @@ class StrategyBacktestService:
                 entry_delay_bars=1 if matcher_config.entry_fill == "open_t+1" else 0,
                 exit_delay_bars=1 if matcher_config.exit_fill == "open_t+1" else 0,
                 reference_price=reference_price,
+                conditional_stop=(
+                    conditional_stop_mask[start_id:stop_id]
+                    if conditional_stop_mask is not None
+                    else None
+                ),
+                scale_in=scale_in_mask[start_id:stop_id] if scale_in_mask is not None else None,
+                forced_exit_price=(
+                    forced_exit_price[start_id:stop_id]
+                    if forced_exit_price is not None
+                    else None
+                ),
+                second_day_review=(
+                    second_day_review[start_id:stop_id]
+                    if second_day_review is not None
+                    else None
+                ),
                 minute_exit_trigger=matcher_config.exit_fill == "signal_next_minute",
             )
             timing_ms["matrix_build"] = round((time.perf_counter() - t_matrix) * 1000, 1)

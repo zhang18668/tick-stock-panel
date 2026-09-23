@@ -544,6 +544,10 @@ class MarketMatrix:
     limit_up_locked: np.ndarray
     limit_down_locked: np.ndarray
     reference_price: np.ndarray
+    conditional_stop: np.ndarray
+    scale_in: np.ndarray
+    forced_exit_price: np.ndarray
+    second_day_review: np.ndarray
 
     entry_signal_time: np.ndarray
     exit_signal_time: np.ndarray
@@ -2315,6 +2319,10 @@ def build_market_matrix_from_signals(
     entry_delay_bars: int = 0,
     exit_delay_bars: int = 0,
     reference_price: np.ndarray | None = None,
+    conditional_stop: np.ndarray | None = None,
+    scale_in: np.ndarray | None = None,
+    forced_exit_price: np.ndarray | None = None,
+    second_day_review: np.ndarray | None = None,
     minute_exit_trigger: bool = False,
     entry_price_override: np.ndarray | None = None,
 ) -> MarketMatrix:
@@ -2352,6 +2360,23 @@ def build_market_matrix_from_signals(
             use = ~np.isfinite(resolved_reference_price) & np.isfinite(values) & (values > 0)
             resolved_reference_price[use] = values[use]
 
+    resolved_conditional_stop = _coerce_array(
+        conditional_stop,
+        market.shape,
+        np.uint8,
+        0,
+    )
+    resolved_scale_in = _coerce_array(scale_in, market.shape, np.uint8, 0)
+    resolved_forced_exit_price = _coerce_array(
+        forced_exit_price,
+        market.shape,
+        np.float32,
+        np.nan,
+    )
+    resolved_second_day_review = _coerce_array(
+        second_day_review, market.shape, np.uint8, 0
+    )
+
     if minute_exit_trigger:
         trigger_reference = build_minute_exit_reference(
             market.close,
@@ -2366,6 +2391,10 @@ def build_market_matrix_from_signals(
         entry,
         exit_,
         resolved_reference_price,
+        resolved_conditional_stop,
+        resolved_scale_in,
+        resolved_forced_exit_price,
+        resolved_second_day_review,
         entry_signal_time,
         exit_signal_time,
         entry_signal_code,
@@ -2390,6 +2419,10 @@ def build_market_matrix_from_signals(
         limit_up_locked=market.limit_up_locked,
         limit_down_locked=market.limit_down_locked,
         reference_price=resolved_reference_price,
+        conditional_stop=resolved_conditional_stop,
+        scale_in=resolved_scale_in,
+        forced_exit_price=resolved_forced_exit_price,
+        second_day_review=resolved_second_day_review,
         entry_signal_time=entry_signal_time,
         exit_signal_time=exit_signal_time,
         entry_signal_code=entry_signal_code,
@@ -2409,6 +2442,7 @@ def build_market_matrix(
     entries: pl.Series | None,
     exits: pl.Series | None,
     *,
+    conditional_stops: pl.Series | None = None,
     entry_delay_bars: int = 0,
     exit_delay_bars: int = 0,
     entry_signal_ids: list[str] | None = None,
@@ -2427,6 +2461,13 @@ def build_market_matrix(
 
     raw_entry = _scatter_bool_series(entries, len(panel), shape, time_id, asset_id)
     raw_exit = _scatter_bool_series(exits, len(panel), shape, time_id, asset_id)
+    raw_conditional_stop = _scatter_bool_series(
+        conditional_stops,
+        len(panel),
+        shape,
+        time_id,
+        asset_id,
+    )
     entry_codes, normalized_entry_ids = _signal_code_matrix(
         panel,
         entry_signal_ids,
@@ -2455,6 +2496,7 @@ def build_market_matrix(
     return build_market_matrix_from_signals(
         market,
         signals,
+        conditional_stop=raw_conditional_stop,
         entry_delay_bars=entry_delay_bars,
         exit_delay_bars=exit_delay_bars,
         minute_exit_trigger=minute_exit_trigger,

@@ -201,6 +201,7 @@ class StrategyDef:
     source: str  # "builtin" | "custom" | "ai" | "composite"
     required_features: frozenset[str] = field(default_factory=frozenset)
     file_path: Path | None = None
+    take_profit: float | None = None
     execution_backend: str = "polars_expr"
     matrix_strategy: Any | None = None
     composite: CompositeSpec | None = None  # 仅 backend=="composite" 时非空
@@ -569,6 +570,7 @@ class StrategyEngine:
             entry_signals=getattr(mod, "ENTRY_SIGNALS", []),
             exit_signals=getattr(mod, "EXIT_SIGNALS", []),
             stop_loss=getattr(mod, "STOP_LOSS", None),
+            take_profit=getattr(mod, "TAKE_PROFIT", None),
             trailing_stop=getattr(mod, "TRAILING_STOP", None),
             trailing_take_profit_activate=getattr(mod, "TRAILING_TAKE_PROFIT_ACTIVATE", None),
             trailing_take_profit_drawdown=getattr(mod, "TRAILING_TAKE_PROFIT_DRAWDOWN", None),
