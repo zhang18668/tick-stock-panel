@@ -12,6 +12,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from app import secrets_store
+from app.config import settings
 from app.data_providers.custom.config import MAX_TIMEOUT
 from app.tickflow import client as tf_client
 from app.tickflow.policy import (
@@ -51,7 +52,7 @@ class TickflowKeyIn(BaseModel):
 
 
 @router.get("")
-def get_settings() -> dict:
+def get_settings(request: Request) -> dict:
     """返回当前配置概况(Key 脱敏)。"""
     from app.config import settings
     from app.services import preferences
@@ -69,7 +70,7 @@ def get_settings() -> dict:
 
     key = secrets_store.get_tickflow_key()
     ai_provider = secrets_store.get_ai_config("ai_provider", settings.ai_provider)
-    return {
+    result = {
         "mode": tf_client.current_mode(),
         "tickflow_api_key_masked": secrets_store.mask(key),
         "has_tickflow_key": bool(key),
@@ -109,6 +110,7 @@ def switch_endpoint(req: SwitchEndpointIn, request: Request) -> dict:
     端点切换仅对付费档(starter+,走 api.tickflow.org)有意义;
     none/free 档运行在 free-api 服务器,无付费端点权限,禁止切换。
     """
+    _require_platform_configuration_access(request)
     # none/free 档没有付费端点权限,禁止切换
     if tf_client.current_mode() != "api_key":
         return {"ok": False, "error": "当前档位无法切换端点,仅付费套餐(Starter+)支持"}
@@ -142,9 +144,8 @@ def save_tickflow_key(req: TickflowKeyIn, request: Request) -> dict:
     端点联动:从无 key 升级到付费 key 时,残留的 free-api 端点不可用,
     故自动切到默认付费端点(api.tickflow.org);free 档则清除自定义端点。
     """
-    from app.tickflow.policy import (
-        base_tier_name, is_invalid_key,
-    )
+    _require_platform_configuration_access(request)
+    from app.tickflow.policy import base_tier_name, is_invalid_key
 
     key = req.api_key.strip()
     if not key:
@@ -218,6 +219,7 @@ def clear_tickflow_key(request: Request) -> dict:
     同时清除 tickflow_base_url(测速切换的自定义端点),使客户端走 free-api
     服务器取历史日K;档位标签为 None(无档)。
     """
+    _require_platform_configuration_access(request)
     secrets_store.clear("tickflow_api_key", "tickflow_base_url")
     tf_client.reset_clients()
 
@@ -259,9 +261,10 @@ class AiSettingsIn(BaseModel):
     context_window: int | None = None      # 输入上下文窗口上限 (约 token)
 
 
-@router.post("/ai")
-def save_ai_settings(req: AiSettingsIn) -> dict:
+def save_ai_settings(req: AiSettingsIn, request: Request | None = None) -> dict:
     """保存 AI 配置（全部持久化到 secrets.json）"""
+    if request is not None:
+        _require_platform_configuration_access(request)
     from app.config import settings
     from app.services.ai_provider import (
         OPENAI_PROVIDER,
@@ -279,6 +282,7 @@ def save_ai_settings(req: AiSettingsIn) -> dict:
         normalize_codex_model,
         normalize_codex_reasoning_effort,
     )
+    update_process_defaults = settings.app_mode == "standalone"
 
     updates: dict = {}
     if req.provider:
@@ -313,7 +317,8 @@ def save_ai_settings(req: AiSettingsIn) -> dict:
             updates["ai_reasoning_effort"] = req.reasoning_effort.strip()
     # user_agent 允许清空(回到默认浏览器 UA),故无条件持久化
     updates["ai_user_agent"] = req.user_agent
-    settings.ai_user_agent = req.user_agent
+    if update_process_defaults:
+        settings.ai_user_agent = req.user_agent
 
     # 输出上限 / 输入上下文窗口 (数值配置, 缺省保持原值)
     if req.max_output_tokens is not None:
@@ -346,12 +351,18 @@ def save_ai_settings(req: AiSettingsIn) -> dict:
     }
 
 
+@router.post("/ai")
+def _save_ai_settings_route(req: AiSettingsIn, request: Request) -> dict:
+    return save_ai_settings(req, request)
+
+
 @router.delete("/ai")
-def clear_ai_settings() -> dict:
+def clear_ai_settings(request: Request) -> dict:
     """一键清空 AI 配置(provider / base_url / api_key / model)。
 
     保留 ai_user_agent —— 自定义请求头与凭证解耦,清空凭证不影响绕过 CDN 拦截的设置。
     """
+    _require_platform_configuration_access(request)
     from app.config import settings
 
     secrets_store.clear(
@@ -970,6 +981,14 @@ def update_realtime_quotes(req: RealtimeQuotesPrefs, request: Request) -> dict:
     qs = getattr(request.app.state, "quote_service", None)
     depth_svc = getattr(request.app.state, "depth_service", None)
 
+    # In multi-user mode the quote collector is a shared platform service.
+    # A user's preference must never stop it for every other tenant.
+    if getattr(getattr(request, "state", None), "current_user", None) is not None:
+        preferences.save({"realtime_quotes_enabled": True})
+        if qs:
+            qs.enable()
+        return {"realtime_quotes_enabled": True, "realtime_allowed": True}
+
     def _sync_depth_polling(realtime_on: bool) -> None:
         """实时行情开关联动 depth 盘中轮询: 开→恢复(仍受监控开关/能力门控), 关→立即停。
 
@@ -1079,10 +1098,17 @@ def update_realtime_monitor_config(req: RealtimeMonitorConfigIn, request: Reques
     from app.services import preferences
 
     cfg = req.model_dump(exclude_none=True)
+    if settings.app_mode == "multi_user":
+        # Strategy monitors are user-owned PostgreSQL rules in multi-user mode;
+        # the legacy file migration below is standalone-only.
+        cfg.pop("strategy_monitor_ids", None)
+        cfg.pop("strategy_monitor_enabled", None)
     result = preferences.set_realtime_monitor_config(cfg)
 
     # 策略监控开关/池变化 → 同步迁移为 type=strategy 规则 + reload 引擎
-    if req.strategy_monitor_ids is not None or req.strategy_monitor_enabled is not None:
+    if settings.app_mode == "standalone" and (
+        req.strategy_monitor_ids is not None or req.strategy_monitor_enabled is not None
+    ):
         monitor_engine = getattr(request.app.state, "monitor_engine", None)
         strategy_engine = getattr(request.app.state, "strategy_engine", None)
         data_dir = request.app.state.repo.store.data_dir
@@ -1211,7 +1237,7 @@ def update_system_notify(req: SystemNotifyPrefsIn) -> dict:
 
 class FeishuWebhookPrefsIn(BaseModel):
     url: str
-    secret: str = ""
+    secret: str | None = None
 
 
 @router.put("/preferences/feishu-webhook")
@@ -1232,7 +1258,11 @@ def update_feishu_webhook(req: FeishuWebhookPrefsIn) -> dict:
                    "(https://open.feishu.cn/open-apis/bot/v2/hook/...)",
         )
     saved_url = preferences.set_feishu_webhook_url(url)
-    saved_secret = preferences.set_feishu_webhook_secret((req.secret or "").strip())
+    saved_secret = (
+        preferences.set_feishu_webhook_secret(req.secret.strip())
+        if req.secret is not None
+        else preferences.get_feishu_webhook_secret()
+    )
     return {"feishu_webhook_url": saved_url, "feishu_webhook_secret": saved_secret}
 
 

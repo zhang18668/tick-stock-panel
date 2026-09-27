@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib
+import inspect
 import logging
 import pkgutil
 from dataclasses import dataclass
@@ -86,7 +87,7 @@ def _validate_router_conflicts(app: FastAPI, registrar: BackendExtensionRegistra
                 staged.add(key)
 
 
-def start_backend_extensions(
+async def start_backend_extensions(
     context: ExtensionContext,
     registry: BackendExtensionRegistry,
 ) -> None:
@@ -98,9 +99,27 @@ def start_backend_extensions(
                 continue
             startup = getattr(module, "startup", None)
             if callable(startup):
-                startup(context)
+                result = startup(context)
+                if inspect.isawaitable(result):
+                    await result
         except Exception as exc:
             logger.warning("backend extension startup failed %s: %s", module_name, exc)
+
+
+async def stop_backend_extensions(registry: BackendExtensionRegistry) -> None:
+    """Stop registered extensions in reverse deterministic order."""
+    for module_name in reversed(_custom_module_names()):
+        try:
+            module = importlib.import_module(module_name)
+            if getattr(module, "EXTENSION_ID", None) not in registry.extension_ids():
+                continue
+            shutdown = getattr(module, "shutdown", None)
+            if callable(shutdown):
+                result = shutdown()
+                if inspect.isawaitable(result):
+                    await result
+        except Exception as exc:
+            logger.warning("backend extension shutdown failed %s: %s", module_name, exc)
 
 
 def current_extension_context(*, data_dir, repository) -> ExtensionContext:

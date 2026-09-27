@@ -56,6 +56,9 @@ import {
   PanelLeft,
   PanelLeftClose,
   PanelLeftOpen,
+  UserRound,
+  ShieldCheck,
+  LogOut,
 } from 'lucide-react'
 import { Logo } from './Logo'
 import { api, type CapabilityMatrix, type IndexQuote } from '@/lib/api'
@@ -462,6 +465,19 @@ export function Layout() {
 
   const qc = useQueryClient()
   const navigate = useNavigate()
+  const { data: authMode } = useQuery({
+    queryKey: ['auth-mode'], queryFn: api.authMode, staleTime: Infinity,
+  })
+  const { data: account } = useQuery({
+    queryKey: ['account-me'], queryFn: api.accountMe,
+    enabled: authMode?.mode === 'multi_user', staleTime: 60_000,
+  })
+  const handleLogout = async () => {
+    if (authMode?.mode === 'multi_user') await api.accountLogout()
+    else await api.authLogout()
+    qc.clear()
+    window.location.href = '/login'
+  }
   const version = versionData?.version
   const realtimeEnabled = prefs?.realtime_quotes_enabled ?? false
   // 自选实时模式限制提示: 可手动关闭, 不持久化 (刷新后恢复显示)
@@ -989,6 +1005,21 @@ export function Layout() {
         )}
 
         <div className={cn('border-t border-border py-3 shrink-0', railMode ? 'px-2 flex flex-col items-center gap-1' : 'px-2')}>
+          {authMode?.mode === 'multi_user' && account && (
+            <div className={cn('mb-1 flex items-center gap-1', railMode && 'flex-col')}>
+              <NavLink
+                to={account.role === 'admin' ? '/admin/users' : '/subscription'}
+                title={railMode ? (account.display_name || account.email) : undefined}
+                className={cn('flex min-w-0 flex-1 items-center rounded-btn text-sm text-foreground/75 hover:bg-elevated/70', railMode ? 'p-2' : 'gap-2 px-3 py-2')}
+              >
+                {account.role === 'admin' ? <ShieldCheck className="h-4 w-4 text-accent" /> : <UserRound className="h-4 w-4 text-accent" />}
+                {!railMode && <span className="truncate">{account.display_name || account.email}</span>}
+              </NavLink>
+              <button onClick={() => void handleLogout()} title="退出登录" className="rounded-btn p-2 text-muted hover:bg-elevated hover:text-foreground">
+                <LogOut className="h-4 w-4" />
+              </button>
+            </div>
+          )}
           <div className={railMode ? 'flex flex-col items-center gap-1' : 'flex items-center gap-1'}>
             <ThemeToggle />
             <NavLink

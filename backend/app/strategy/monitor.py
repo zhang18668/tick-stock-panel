@@ -349,6 +349,7 @@ class MonitorRuleEngine:
         self._strategy_signal_state: dict[tuple[str, str, str, str], tuple[str, set[str]]] = {}
         # 同一根 K 线的信号即使盘中回落后再次命中也只通知一次。
         self._strategy_signal_seen: dict[tuple[str, str, str, str, str], str] = {}
+        self._strategy_daily_pool_sent: dict[str, _dt.date] = {}
         # 数据目录 (用于加载策略 overrides)
         self._data_dir = None
         # 历史窗口加载器: (target_date, lookback_days) → 多日 enriched DataFrame。
@@ -402,6 +403,7 @@ class MonitorRuleEngine:
         self._strategy_pools.clear()
         self._strategy_signal_state.clear()
         self._strategy_signal_seen.clear()
+        self._strategy_daily_pool_sent.clear()
         self._latest_strategy_results = {}
         self._building_strategy_results = {}
         self._latest_strategy_result_ids.clear()
@@ -558,6 +560,30 @@ class MonitorRuleEngine:
         """
         return self._latest_strategy_results
 
+    def strategy_pool_snapshot(self, rule_id: str) -> dict | None:
+        """Return the latest cached pool digest for one strategy monitor rule."""
+        rule = self._rules.get(rule_id)
+        if not rule or rule.get("type") != "strategy":
+            return None
+        strategy_id = str(rule.get("strategy_id") or "")
+        result = self._latest_strategy_results.get(strategy_id)
+        if result is None:
+            return None
+        strategy_name = strategy_id
+        if self._strategy_engine is not None:
+            try:
+                strategy = self._strategy_engine.get(strategy_id)
+                strategy_name = strategy.meta.get("name", "") or strategy_id
+            except Exception:
+                pass
+        rows = list(result.get("rows") or [])
+        return {
+            "strategy_id": strategy_id,
+            "as_of": str(result.get("as_of") or ""),
+            "total": len(rows),
+            "message": self._pool_snapshot_message(strategy_name, rows),
+        }
+
     def consume_strategy_result_updates(self) -> bool:
         """返回并清除本轮成功写入的股票策略实时结果标记。"""
         updated = bool(self._latest_strategy_result_ids)
@@ -626,8 +652,6 @@ class MonitorRuleEngine:
             self._latest_strategy_result_ids.clear()
 
         matrix_rules: list[dict] = []
-        params_map: dict[str, dict] = {}
-        overrides_map: dict[str, dict] = {}
         if self._strategy_engine is not None:
             for rule in list(self._rules.values()):
                 if (
@@ -645,59 +669,76 @@ class MonitorRuleEngine:
                     continue
                 if getattr(strategy, "execution_backend", "polars_expr") != "matrix_native":
                     continue
-                overrides = {}
-                if self._data_dir:
+                overrides = dict(rule.get("_strategy_overrides") or {})
+                if not rule.get("user_id") and self._data_dir:
                     overrides = _strategy_config.load_override(self._data_dir, sid)
+                rule["_active_overrides"] = overrides
                 matrix_rules.append(rule)
-                overrides_map[sid] = overrides
-                params_map[sid] = dict(overrides.get("params") or {})
         if matrix_rules:
-            try:
-                history_loader = self._history_loader_for(matrix_rules[0])
-                if history_loader is None:
-                    raise ValueError("matrix strategy monitor requires history loader")
-                matrix_ids = [str(rule["strategy_id"]) for rule in matrix_rules]
-                history_bars = self._strategy_engine.required_history_bars(
-                    matrix_ids,
-                    params_map=params_map,
-                    overrides_map=overrides_map,
-                )
-                from app.strategy.engine import StrategyDataContext
-                context = StrategyDataContext(
-                    asset_type=asset_type,
-                    timeframe="1d",
-                    as_of=cn_today(),
-                    current=df,
-                    cache_key=f"monitor:{asset_type}",
-                )
+            snapshot_cache: dict[str, Any] = {}
+            for rule in matrix_rules:
                 try:
-                    snapshot = self._strategy_engine.prepare_realtime_matrix(
-                        context,
-                        matrix_ids,
-                        params_map=params_map,
-                        overrides_map=overrides_map,
-                    )
-                except ValueError as exc:
-                    if "requires history data" not in str(exc):
-                        raise
-                    history = history_loader(cn_today(), history_bars)
-                    snapshot = self._strategy_engine.prepare_realtime_matrix(
-                        StrategyDataContext(
+                    sid = str(rule["strategy_id"])
+                    overrides = dict(rule.get("_active_overrides") or {})
+                    params = dict(overrides.get("params") or {})
+                    signature = repr((sid, params, overrides))
+                    snapshot = snapshot_cache.get(signature)
+                    if snapshot is None:
+                        history_loader = self._history_loader_for(rule)
+                        if history_loader is None:
+                            raise ValueError("matrix strategy monitor requires history loader")
+                        history_bars = self._strategy_engine.required_history_bars(
+                            [sid],
+                            params_map={sid: params},
+                            overrides_map={sid: overrides},
+                        )
+                        from app.strategy.engine import StrategyDataContext
+                        cache_scope = (
+                            f"monitor:{asset_type}:{signature}"
+                            if rule.get("user_id")
+                            else f"monitor:{asset_type}"
+                        )
+                        context = StrategyDataContext(
                             asset_type=asset_type,
                             timeframe="1d",
                             as_of=cn_today(),
                             current=df,
-                            history=history,
-                            cache_key=f"monitor:{asset_type}",
-                        ),
-                        matrix_ids,
-                        params_map=params_map,
-                        overrides_map=overrides_map,
+                            cache_key=cache_scope,
+                        )
+                        try:
+                            snapshot = self._strategy_engine.prepare_realtime_matrix(
+                                context,
+                                [sid],
+                                params_map={sid: params},
+                                overrides_map={sid: overrides},
+                            )
+                        except ValueError as exc:
+                            if "requires history data" not in str(exc):
+                                raise
+                            history = history_loader(cn_today(), history_bars)
+                            snapshot = self._strategy_engine.prepare_realtime_matrix(
+                                StrategyDataContext(
+                                    asset_type=asset_type,
+                                    timeframe="1d",
+                                    as_of=cn_today(),
+                                    current=df,
+                                    history=history,
+                                    cache_key=cache_scope,
+                                ),
+                                [sid],
+                                params_map={sid: params},
+                                overrides_map={sid: overrides},
+                            )
+                        snapshot_cache[signature] = snapshot
+                    self._active_matrix_snapshots[str(rule["id"])] = snapshot
+                except Exception as exc:
+                    self._active_matrix_snapshots.pop(str(rule.get("id", "")), None)
+                    logger.warning(
+                        "%s 矩阵策略实时缓存准备失败 (%s): %s",
+                        asset_type,
+                        rule.get("id"),
+                        exc,
                     )
-                self._active_matrix_snapshots[asset_type] = snapshot
-            except Exception as e:
-                self._active_matrix_snapshots.pop(asset_type, None)
-                logger.warning("%s 矩阵策略实时缓存准备失败: %s", asset_type, e)
 
         # list() 快照: 本方法跑在行情轮询线程, API 线程同时 add/remove 规则
         # 会触发 "dictionary changed size during iteration", 整轮告警丢失
@@ -716,7 +757,8 @@ class MonitorRuleEngine:
         # 一次性提交本轮结果 (原子替换): /cached 读方要么拿到上一轮完整结果,
         # 要么拿到本轮完整结果, 不会读到空中间态。
         self._latest_strategy_results = self._building_strategy_results
-        self._active_matrix_snapshots.pop(asset_type, None)
+        for rule in matrix_rules:
+            self._active_matrix_snapshots.pop(str(rule.get("id", "")), None)
 
         return events
 
@@ -874,6 +916,7 @@ class MonitorRuleEngine:
             )
             event = {
                 "ts": int(now * 1000),
+                "user_id": rule.get("user_id"),
                 "rule_id": rule["id"],
                 "rule_name": rule.get("name", ""),
                 "strategy_id": None,
@@ -1091,7 +1134,7 @@ class MonitorRuleEngine:
         rtype = rule.get("type", "signal")
         if rtype == "strategy":
             # 策略类型: 跑策略选股, 同时产出所选的信号和结果池变更事件
-            hit_rows = self._match_strategy(scoped, rule)
+            hit_rows = self._match_strategy(scoped, rule, now)
         elif rtype == "ladder":
             # 连板梯队封单监控: 独立处理 (需带预警封单值, 走专属 message)
             return self._evaluate_ladder(scoped, rule, now)
@@ -1137,6 +1180,7 @@ class MonitorRuleEngine:
 
             ev = {
                 "ts": int(now * 1000),
+                "user_id": rule.get("user_id"),
                 "rule_id": rule["id"],
                 "rule_name": rule.get("name", ""),
                 "strategy_id": rule.get("strategy_id") if rtype == "strategy" else None,
@@ -1192,7 +1236,7 @@ class MonitorRuleEngine:
         return df
 
     def _match_strategy(
-        self, df: pl.DataFrame, rule: dict,
+        self, df: pl.DataFrame, rule: dict, now: float | None = None,
     ) -> list[tuple[str, str, Any, Any, Any, list[str]]]:
         """策略类型评估: 一次执行同时产出交易信号和结果池变更事件。
 
@@ -1215,8 +1259,8 @@ class MonitorRuleEngine:
             return []
 
         # 运行策略选股: 复用当前 enriched DataFrame 跳过数据加载
-        overrides = {}
-        if self._data_dir:
+        overrides = dict(rule.get("_strategy_overrides") or {})
+        if not rule.get("user_id") and self._data_dir:
             try:
                 overrides = _strategy_config.load_override(self._data_dir, sid)
             except Exception:
@@ -1240,7 +1284,7 @@ class MonitorRuleEngine:
             logger.debug("叠加策略 %s 暂不支持实时监控, 跳过", sid)
             return []
         if getattr(s, "execution_backend", "polars_expr") == "matrix_native":
-            matrix = self._active_matrix_snapshots.get(at)
+            matrix = self._active_matrix_snapshots.get(str(rule.get("id", "")))
             if matrix is None:
                 logger.debug("策略 %s 缺少本轮实时矩阵快照, 跳过", sid)
                 return []
@@ -1424,7 +1468,42 @@ class MonitorRuleEngine:
                     signal_map.get(event_type, {}).get(symbol, []),
                 ))
 
+        if rule.get("daily_pool_push_enabled") and self._daily_pool_push_due(rule, now):
+            rows = [row_map.get(symbol, {"symbol": symbol}) for symbol in sorted(current_pool)]
+            message = self._pool_snapshot_message(sname, rows)
+            results.append(("pool_snapshot", "_batch", message, None, None, []))
+
         return results
+
+    def _daily_pool_push_due(self, rule: dict, now: float | None) -> bool:
+        timestamp = time.time() if now is None else now
+        cn_tz = _dt.timezone(_dt.timedelta(hours=8))
+        current = _dt.datetime.fromtimestamp(timestamp, tz=cn_tz)
+        try:
+            hour, minute = (
+                int(part)
+                for part in str(rule.get("daily_pool_push_time", "14:45")).split(":")
+            )
+        except (TypeError, ValueError):
+            return False
+        rule_id = str(rule.get("id") or "")
+        if current.hour != hour or current.minute != minute:
+            return False
+        if self._strategy_daily_pool_sent.get(rule_id) == current.date():
+            return False
+        self._strategy_daily_pool_sent[rule_id] = current.date()
+        return True
+
+    def _pool_snapshot_message(self, strategy_name: str, rows: list[dict]) -> str:
+        lines = []
+        for index, row in enumerate(sorted(rows, key=lambda item: str(item.get("symbol", ""))), start=1):
+            symbol = str(row.get("symbol") or "")
+            name = str(row.get("name") or self._name_map.get(symbol, ""))
+            pct = row.get("change_pct")
+            pct_text = f" {float(pct) * 100:+.2f}%" if pct is not None else ""
+            lines.append(f"{index}. {symbol} {name}{pct_text}".rstrip())
+        message = f"策略「{strategy_name}」每日结果池汇总: 共 {len(rows)} 只"
+        return message + (("\n" + "\n".join(lines)) if lines else "\n当前结果池为空")
 
     def _new_strategy_signals(
         self,
@@ -1675,6 +1754,7 @@ class MonitorRuleEngine:
 
             events.append({
                 "ts": int(now * 1000),
+                "user_id": rule.get("user_id"),
                 "rule_id": rule["id"],
                 "rule_name": rule.get("name", ""),
                 "source": "ladder",
@@ -1722,6 +1802,7 @@ class MonitorRuleEngine:
                 "sell_signal": "卖出信号",
                 "pool_entry": "进入选股结果",
                 "pool_exit": "移出选股结果",
+                "pool_snapshot": "每日结果池汇总",
                 "new_entry": "进入选股结果",
                 "dropped": "移出选股结果",
             }.get(ev_type)

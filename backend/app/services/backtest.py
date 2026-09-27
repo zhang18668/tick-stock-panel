@@ -393,6 +393,8 @@ class BacktestService:
         return result
 
     def _persist(self, result: BacktestResult) -> None:
+        if settings.app_mode == "multi_user":
+            return
         out_dir = settings.data_dir / "backtest_results"
         out_dir.mkdir(parents=True, exist_ok=True)
         # 用 polars 写一份汇总

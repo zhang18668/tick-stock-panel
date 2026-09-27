@@ -5,7 +5,7 @@ import logging
 import math
 import time
 from datetime import UTC, date, datetime
-from typing import Callable
+from typing import Annotated, Callable
 
 import anyio
 import polars as pl
@@ -23,10 +23,12 @@ from app.services import watchlist
 from app.services.watchlist_csv import import_watchlist_codes, import_watchlist_csv
 from app.services.watchlist_ocr import import_watchlist_image
 from app.services.watchlist_ocr.provider import get_ocr_provider
+from app.services.watchlist_repository import FileWatchlistRepository, WatchlistStore
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/watchlist", tags=["watchlist"])
+UploadedImage = Annotated[UploadFile, File(...)]
 
 _MAX_IMPORT_IMAGE_BYTES = 12 * 1024 * 1024  # 12MB
 _IMPORT_IMAGE_TYPES = {
@@ -115,8 +117,8 @@ def _with_names(rows: list[dict], request: Request) -> list[dict]:
 
 
 @router.get("")
-def list_all(request: Request):
-    return {"symbols": _with_names(watchlist.list_symbols(), request)}
+async def list_all(request: Request, store: WatchlistStore):
+    return {"symbols": _with_names(await store.list(), request)}
 
 
 @router.post("")
@@ -203,8 +205,7 @@ def ocr_status():
     return {"provider": provider.name, "available": provider.available()}
 
 
-@router.post("/import-image")
-async def import_from_image(request: Request, file: UploadFile = File(...)):
+async def _import_from_image(request: Request, store, file: UploadFile):
     """从自选截图识别股票代码，返回候选列表（不自动写入自选）。"""
     content_type = (file.content_type or "").split(";")[0].strip().lower()
     filename = (file.filename or "").lower()
@@ -218,7 +219,7 @@ async def import_from_image(request: Request, file: UploadFile = File(...)):
     if not data:
         raise HTTPException(400, "空文件")
 
-    existing = {r["symbol"] for r in watchlist.list_symbols()}
+    existing = {r["symbol"] for r in await store.list()}
     data_dir = request.app.state.repo.store.data_dir
     try:
         # OCR 为同步 CPU/子进程；独立 limiter 限制并发，避免卡住事件循环（行情 SSE 等）
@@ -237,6 +238,20 @@ async def import_from_image(request: Request, file: UploadFile = File(...)):
     # 响应不回传整段 raw_text（可能很长）；调试时可开 query，这里默认省略
     result.pop("raw_text", None)
     return result
+
+
+async def import_from_image(request: Request, file: UploadFile = File(...)):
+    """Compatibility helper used by existing callers and tests."""
+    return await _import_from_image(request, FileWatchlistRepository(), file)
+
+
+@router.post("/import-image")
+async def import_from_image_route(
+    request: Request,
+    store: WatchlistStore,
+    file: UploadFile = File(...),
+):
+    return await _import_from_image(request, store, file)
 
 
 def _run_candidate_import(parse: Callable[[], dict], empty_msg: str) -> dict:
@@ -350,9 +365,9 @@ def remove_one(symbol: str, request: Request):
 
 
 @router.delete("")
-def clear_all():
+async def clear_all(store: WatchlistStore):
     """清空自选列表。"""
-    count = watchlist.clear()
+    count = await store.clear()
     return {"removed": count}
 
 

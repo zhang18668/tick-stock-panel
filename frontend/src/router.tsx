@@ -1,9 +1,11 @@
-import { lazy } from 'react'
-import { createBrowserRouter, Navigate, useSearchParams } from 'react-router-dom'
+import { lazy, useEffect } from 'react'
+import { createBrowserRouter, Navigate, useLocation, useSearchParams } from 'react-router-dom'
+import { useQuery } from '@tanstack/react-query'
 import { Layout } from './components/Layout'
 import { Onboarding } from './pages/Onboarding'
 import { Auth } from './pages/Auth'
 import { useSettings } from './lib/useSharedQueries'
+import { api } from './lib/api'
 import { Logo } from './components/Logo'
 import { ExtensionBoundary } from './extensions/ExtensionBoundary'
 import {
@@ -38,6 +40,8 @@ const Settings = lazy(() => import('./pages/Settings').then(m => ({ default: m.S
 const Regime = lazy(() => import('./pages/Regime').then(m => ({ default: m.Regime })))
 const AbnormalMoves = lazy(() => import('./pages/AbnormalMoves').then(m => ({ default: m.AbnormalMoves })))
 const Dev = lazy(() => import('./pages/Dev').then(m => ({ default: m.Dev })))
+const AdminUsers = lazy(() => import('./pages/AdminUsers').then(m => ({ default: m.AdminUsers })))
+const Subscription = lazy(() => import('./pages/Subscription').then(m => ({ default: m.Subscription })))
 
 const CORE_ROUTE_PATHS = new Set([
   '/',
@@ -88,12 +92,13 @@ function MiningRedirect() {
 // 只挂在根路由上;/onboarding 本身不被守卫,避免循环重定向。
 // settings 由 Layout 预取,守卫判定不产生额外请求。
 function OnboardingGuard({ children }: { children: React.ReactNode }) {
+  const mode = useQuery({ queryKey: ['auth-mode'], queryFn: api.authMode, staleTime: Infinity })
   const settings = useSettings()
 
   // 仅首次加载(本地无缓存)时显示占位。
   // 后台重取 (isFetching) 时本地已有上一份缓存可用, 直接放行, 避免切页时整屏 logo 闪烁。
   // 防误重定向已由 Onboarding/AI 等处 invalidate 前的 setQueryData 同步缓存兜底。
-  if (settings.isLoading) {
+  if (mode.isLoading || (mode.data?.mode !== 'multi_user' && settings.isLoading)) {
     return (
       <div className="min-h-screen bg-base grid place-items-center">
         <div className="flex flex-col items-center gap-3 text-muted">
@@ -104,6 +109,8 @@ function OnboardingGuard({ children }: { children: React.ReactNode }) {
     )
   }
 
+  if (mode.data?.mode === 'multi_user') return <>{children}</>
+
   // 查询出错或字段缺失时不拦截 —— 宁可放行,也不把用户卡在空白页
   if (settings.data && settings.data.onboarding_completed === false) {
     return <Navigate to="/onboarding" replace />
@@ -112,15 +119,57 @@ function OnboardingGuard({ children }: { children: React.ReactNode }) {
   return <>{children}</>
 }
 
+function SubscriptionGuard({ children }: { children: React.ReactNode }) {
+  const location = useLocation()
+  const mode = useQuery({ queryKey: ['auth-mode'], queryFn: api.authMode, staleTime: Infinity })
+  const account = useQuery({
+    queryKey: ['account-me'], queryFn: api.accountMe,
+    enabled: mode.data?.mode === 'multi_user', staleTime: 5_000,
+  })
+  const billing = useQuery({
+    queryKey: ['billing-me'], queryFn: api.billingMe,
+    enabled: mode.data?.mode === 'multi_user', staleTime: 5_000,
+  })
+  if (mode.isLoading || (mode.data?.mode === 'multi_user' && (billing.isLoading || account.isLoading))) {
+    return <div className="min-h-screen bg-base grid place-items-center"><Logo size={28} className="text-foreground" /></div>
+  }
+
+  if (mode.data?.mode === 'multi_user' && account.data?.role !== 'admin' && billing.data?.effective_plan === 'expired' && location.pathname !== '/subscription') {
+    return <Navigate to="/subscription" replace />
+  }
+  return <>{children}</>
+}
+
+function OnboardingRoute() {
+  const mode = useQuery({ queryKey: ['auth-mode'], queryFn: api.authMode, staleTime: Infinity })
+  if (mode.isLoading) return <div className="min-h-screen bg-base grid place-items-center"><Logo size={28} /></div>
+  return mode.data?.mode === 'multi_user' ? <Navigate to="/" replace /> : <Onboarding />
+}
+
+function PageUsageTracker() {
+  const location = useLocation()
+  const mode = useQuery({ queryKey: ['auth-mode'], queryFn: api.authMode, staleTime: Infinity })
+  useEffect(() => {
+    if (mode.data?.mode === 'multi_user') void api.recordPageView(location.pathname).catch(() => undefined)
+  }, [location.pathname, mode.data?.mode])
+  return null
+}
+
+function AppLayout() {
+  return <><PageUsageTracker /><Layout /></>
+}
+
 export const router = createBrowserRouter([
-  { path: '/onboarding', element: <Onboarding /> },
+  { path: '/onboarding', element: <OnboardingRoute /> },
   { path: '/login', element: <Auth /> },
   {
     path: '/',
     element: (
-      <OnboardingGuard>
-        <Layout />
-      </OnboardingGuard>
+      <SubscriptionGuard>
+        <OnboardingGuard>
+          <AppLayout />
+        </OnboardingGuard>
+      </SubscriptionGuard>
     ),
     children: [
       { index: true, element: <Dashboard /> },
@@ -150,6 +199,8 @@ export const router = createBrowserRouter([
       { path: 'settings', element: <Settings /> },
       // 隐藏路由：开发者工具（不暴露在菜单，仅供调试）
       { path: 'dev', element: <Dev /> },
+      { path: 'admin/users', element: <AdminUsers /> },
+      { path: 'subscription', element: <Subscription /> },
       // 旧路由兼容重定向
       { path: 'settings/keys', element: <Navigate to="/settings?tab=data-sources" replace /> },
       { path: 'settings/ai', element: <Navigate to="/settings?tab=ai" replace /> },

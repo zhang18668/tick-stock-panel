@@ -80,6 +80,24 @@ def _empty_entries() -> pl.DataFrame:
 
 
 def _read_entries() -> pl.DataFrame:
+    from app.user_system.settings_context import current
+
+    context = current()
+    if context is not None:
+        rows = context.preferences.get("watchlist_entries", [])
+        if not rows:
+            return _empty_entries()
+        normalized = [
+            {
+                "symbol": str(row.get("symbol", "")),
+                "added_at": str(row.get("added_at", "")),
+                "note": str(row.get("note") or ""),
+                "group_ids": [str(value) for value in row.get("group_ids", []) if value],
+            }
+            for row in rows
+            if isinstance(row, dict)
+        ]
+        return pl.DataFrame(normalized, schema=_ENTRY_SCHEMA)
     p = _path()
     if not p.exists():
         return _empty_entries()
@@ -101,6 +119,15 @@ def _read_entries() -> pl.DataFrame:
 
 def _write_entries(df: pl.DataFrame) -> None:
     global _REVISION
+    from app.user_system.settings_context import current
+
+    context = current()
+    if context is not None:
+        rows = df.select(list(_ENTRY_SCHEMA)).to_dicts()
+        context.preferences["watchlist_entries"] = rows
+        context.preference_updates["watchlist_entries"] = rows
+        _REVISION += 1
+        return
     p = _path()
     # 首次从旧 schema 迁移到 group_ids 前, 备份原文件(一次性)
     if p.exists():
@@ -116,6 +143,12 @@ def _write_entries(df: pl.DataFrame) -> None:
 
 
 def _read_groups() -> list[dict]:
+    from app.user_system.settings_context import current
+
+    context = current()
+    if context is not None:
+        raw = context.preferences.get("watchlist_groups", [])
+        return [dict(item) for item in raw if isinstance(item, dict)]
     p = _groups_path()
     if not p.exists():
         return []
@@ -140,6 +173,15 @@ def _read_groups() -> list[dict]:
 
 def _write_groups(groups: list[dict]) -> None:
     global _REVISION
+    from app.user_system.settings_context import current
+
+    context = current()
+    if context is not None:
+        value = [dict(group) for group in groups]
+        context.preferences["watchlist_groups"] = value
+        context.preference_updates["watchlist_groups"] = value
+        _REVISION += 1
+        return
     p = _groups_path()
     tmp = p.with_suffix(p.suffix + ".tmp")
     tmp.write_text(json.dumps(groups, ensure_ascii=False, indent=2), encoding="utf-8")

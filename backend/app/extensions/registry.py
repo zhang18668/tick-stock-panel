@@ -3,9 +3,13 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Generic, TypeVar
+from typing import Awaitable, Callable, Generic, TypeVar
 
 from fastapi import APIRouter
+from starlette.requests import Request
+from starlette.responses import Response
+
+RequestHandler = Callable[[Request, Callable[[Request], Awaitable[Response]]], Awaitable[Response]]
 
 from app.extensions.contracts import (
     BACKEND_EXTENSION_API_VERSION,
@@ -33,11 +37,20 @@ class BackendExtensionRegistrar:
         self.api_version = api_version
         self.routers: list[APIRouter] = []
         self.notification_formatters: list[tuple[str, NotificationFormatter, int]] = []
+        self.request_handler: RequestHandler | None = None
 
     def include_router(self, router: APIRouter) -> None:
         if not isinstance(router, APIRouter):
             raise TypeError("router must be fastapi.APIRouter")
         self.routers.append(router)
+
+    def register_request_handler(self, handler: RequestHandler) -> None:
+        """Register the extension's complete HTTP request wrapper."""
+        if not callable(handler):
+            raise TypeError("request handler must be callable")
+        if self.request_handler is not None:
+            raise ValueError("request handler already registered by this extension")
+        self.request_handler = handler
 
     def register_notification_formatter(
         self,
@@ -53,6 +66,7 @@ class BackendExtensionRegistry:
     def __init__(self) -> None:
         self._extension_ids: set[str] = set()
         self._notification_formatters: list[RegisteredImplementation[NotificationFormatter]] = []
+        self._request_handler: RequestHandler | None = None
         self._frozen = False
 
     @property
@@ -82,6 +96,8 @@ class BackendExtensionRegistry:
             )
         if extension_id in self._extension_ids:
             raise ValueError(f"duplicate extension id: {extension_id}")
+        if registrar.request_handler is not None and self._request_handler is not None:
+            raise ValueError("only one backend request handler may be registered")
 
         known_ids = {item.implementation_id for item in self._notification_formatters}
         staged_ids: set[str] = set()
@@ -104,6 +120,8 @@ class BackendExtensionRegistry:
 
         self._extension_ids.add(extension_id)
         self._notification_formatters.extend(staged)
+        if registrar.request_handler is not None:
+            self._request_handler = registrar.request_handler
 
     def freeze(self) -> None:
         self._notification_formatters.sort(
@@ -123,6 +141,12 @@ class BackendExtensionRegistry:
                 ),
             )
         return tuple(self._notification_formatters)
+
+    @property
+    def request_handler(self) -> RequestHandler | None:
+        if not self._frozen:
+            raise RuntimeError("backend extension registry must be frozen before use")
+        return self._request_handler
 
     def _ensure_mutable(self) -> None:
         if self._frozen:

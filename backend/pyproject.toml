@@ -40,6 +40,12 @@ dependencies = [
     # Watchlist screenshot OCR (Tesseract)
     "pytesseract>=0.3.10",
     "Pillow>=10.0",
+    # Optional multi-user plugin (activated with APP_MODE=multi_user)
+    "sqlalchemy[asyncio]>=2.0.36",
+    "asyncpg>=0.30.0",
+    "alembic>=1.14.0",
+    "argon2-cffi>=23.1.0",
+    "cryptography>=50.0.0",
 ]
 
 [project.optional-dependencies]

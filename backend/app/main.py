@@ -49,12 +49,14 @@ from app.extensions.loader import (
     configure_backend_extensions,
     current_extension_context,
     start_backend_extensions,
+    stop_backend_extensions,
 )
 from app.jobs import daily_pipeline
 from app.services.matrix_prewarm_owner import MatrixCachePrewarmOwner
 from app.services.mining_process_lock import MiningProcessLock
 from app.services.quote_service import QuoteService
 from app.tickflow import client as tf_client
+from app.tickflow.capabilities import CapabilityDenied
 from app.tickflow.policy import detect_capabilities
 from app.tickflow.repository import DataStore, KlineRepository
 
@@ -332,7 +334,7 @@ async def _application_lifespan(app: FastAPI):
 
     # 自动迁移: 把旧 strategy_monitor_ids 同步为 type=strategy 规则 (统一到监控页)
     try:
-        if preferences.get_strategy_monitor_enabled():
+        if settings.app_mode == "standalone" and preferences.get_strategy_monitor_enabled():
             ids = preferences.get_strategy_monitor_ids()
             if ids:
                 names = {s["id"]: s["name"] for s in strategy_engine.list_strategies()}
@@ -342,7 +344,14 @@ async def _application_lifespan(app: FastAPI):
         logger.warning("strategy monitor migration failed: %s", e)
 
     try:
-        rules = mr_store.load_all(store.data_dir)
+        if settings.app_mode == "multi_user":
+            from app.persistence.database import session_scope
+            from app.persistence.repositories.monitoring import PostgresMonitoringRepository
+
+            async with session_scope() as session:
+                rules = await PostgresMonitoringRepository(session).list_all_rules()
+        else:
+            rules = mr_store.load_all(store.data_dir)
         monitor_engine.set_rules(rules)
         logger.info("monitor engine loaded: %d rules", monitor_engine.rule_count)
     except Exception as e:  # noqa: BLE001
@@ -352,7 +361,7 @@ async def _application_lifespan(app: FastAPI):
 
     # 源码内二次开发启动钩子: 仅暴露稳定只读上下文, 单个扩展失败不影响核心启动。
     extension_registry = app.state.extension_registry
-    start_backend_extensions(
+    await start_backend_extensions(
         current_extension_context(data_dir=store.data_dir, repository=repo),
         extension_registry,
     )
@@ -360,6 +369,7 @@ async def _application_lifespan(app: FastAPI):
     try:
         yield
     finally:
+        await stop_backend_extensions(app.state.extension_registry)
         repo._on_refresh_done = None  # noqa: SLF001
         wd = getattr(app.state, "watchdog", None)
         if wd:
@@ -433,6 +443,28 @@ app.add_middleware(
 _AUTH_WHITELIST_PREFIX = ("/api/auth/",)
 _AUTH_WHITELIST_EXACT = ("/health", "/api/health", "/openapi.json", "/docs", "/redoc")
 
+_PERSONAL_SETTINGS_PATHS = {
+    "/api/settings",
+    "/api/settings/onboarding/complete",
+    "/api/settings/preferences",
+    "/api/settings/preferences/watchlist-columns",
+    "/api/settings/preferences/nav-order",
+    "/api/settings/preferences/nav-hidden",
+    "/api/settings/preferences/screener-result-columns",
+    "/api/settings/preferences/realtime-quote-scope",
+    "/api/settings/preferences/realtime-watchlist",
+    "/api/settings/preferences/indices-nav-pinned",
+    "/api/settings/preferences/realtime-monitor",
+    "/api/settings/preferences/system-notify",
+    "/api/settings/preferences/feishu-webhook",
+    "/api/settings/preferences/wecom-webhook",
+    "/api/settings/preferences/wecom-bot",
+    "/api/settings/preferences/wecom-bot-toggle",
+    "/api/settings/preferences/webhook-enabled-default",
+    "/api/settings/preferences/webhook-default-channels",
+    "/api/settings/preferences/review-push",
+}
+
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
@@ -440,7 +472,12 @@ async def auth_middleware(request: Request, call_next):
     # 仅 /api/ 走认证; 静态资源(前端页面/assets)放行, 由前端处理跳转
     if not path.startswith("/api/"):
         return await call_next(request)
-    # 白名单放行(设密码/登录/探活本身不拦)
+
+    extension_handler = app.state.extension_registry.request_handler
+    if extension_handler is not None:
+        return await extension_handler(request, call_next)
+
+    # Standalone whitelist: password setup/login and health checks.
     if path.startswith(_AUTH_WHITELIST_PREFIX) or path in _AUTH_WHITELIST_EXACT:
         return await call_next(request)
 
@@ -507,11 +544,6 @@ app.state.extension_load_errors = extension_load_errors
 # 能力门控异常 → 403(而非默认 500)
 # 业务代码用 capset.require(Cap.X) 断言能力,缺失时抛 CapabilityDenied;
 # 若不注册 handler 会冒泡成 500 Internal Server Error,对前端不友好且语义错误。
-from fastapi import Request
-from fastapi.responses import JSONResponse
-from app.tickflow.capabilities import CapabilityDenied
-
-
 @app.exception_handler(CapabilityDenied)
 async def capability_denied_handler(request: Request, exc: CapabilityDenied) -> JSONResponse:
     return JSONResponse(

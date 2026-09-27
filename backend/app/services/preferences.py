@@ -16,6 +16,18 @@ from app.services.fs_utils import atomic_write_text
 
 logger = logging.getLogger(__name__)
 
+_USER_PREFERENCE_KEYS = {
+    "onboarding_completed", "watchlist_columns", "screener_result_columns",
+    "nav_order", "nav_hidden", "indices_nav_pinned", "sse_refresh_pages",
+    "screener_auto_run", "minute_intraday_refresh",
+    "minute_intraday_refresh_interval", "sidebar_index_symbols",
+    "monitor_ext_fields", "system_notify_enabled", "webhook_enabled_default",
+    "webhook_default_channels", "review_push_channels",
+    "realtime_pull_stock", "realtime_pull_etf", "realtime_pull_index",
+    "realtime_index_mode", "realtime_index_symbols", "realtime_watchlist_symbols",
+    "watchlist_entries", "watchlist_groups",
+}
+
 # 进程内缓存: 行情轮询线程一轮会调用 8~12 次 getter, 每次读盘+parse 是纯重复;
 # 文件仅在用户改设置时变化, 以 (mtime_ns, size) 签名判断是否重读。
 _cache: dict | None = None
@@ -38,13 +50,24 @@ def _invalidate_cache() -> None:
 def load() -> dict:
     """读取 preferences.json (带 mtime 签名缓存)。返回深拷贝, 调用方可自由修改。"""
     global _cache, _cache_sig
+    from app.user_system.settings_context import current as request_context
+
+    context = request_context()
     p = _path()
     try:
         sig = (p.stat().st_mtime_ns, p.stat().st_size)
-    except OSError:
-        return {}
+    except (OSError, AttributeError):
+        data = {}
+        if context is not None:
+            data.update(context.preferences)
+        return data
     if _cache is not None and sig == _cache_sig:
-        return copy.deepcopy(_cache)
+        data = copy.deepcopy(_cache)
+        if context is not None:
+            for key in _USER_PREFERENCE_KEYS:
+                data.pop(key, None)
+            data.update(context.preferences)
+        return data
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -54,7 +77,12 @@ def load() -> dict:
         return {}
     _cache = data
     _cache_sig = sig
-    return copy.deepcopy(_cache)
+    result = copy.deepcopy(_cache)
+    if context is not None:
+        for key in _USER_PREFERENCE_KEYS:
+            result.pop(key, None)
+        result.update(context.preferences)
+    return result
 
 
 _SAVE_LOCK = threading.Lock()
@@ -66,6 +94,15 @@ def save(updates: dict) -> dict:
     锁内 read-modify-write: FastAPI 同步端点跑线程池, 并行 PUT 各自基于旧快照
     写盘会互相覆盖 (实测: 压缩总开关并行写分时/日K两键, 后写者把先写者覆盖)。
     """
+    from app.user_system.settings_context import current as request_context
+
+    context = request_context()
+    if context is not None:
+        current = load()
+        current.update(updates)
+        context.preferences.update(updates)
+        context.preference_updates.update(updates)
+        return current
     with _SAVE_LOCK:
         current = load()
         current.update(updates)
@@ -77,7 +114,12 @@ def save(updates: dict) -> dict:
 
 
 def get_realtime_quotes_enabled() -> bool:
-    return load().get("realtime_quotes_enabled", False)
+    """实时行情总开关。
+
+    从未设置过时默认开启；QuoteService 仍只在 A 股交易窗口实际拉取行情，
+    且无实时权限时 boot_check 会拒绝启动。用户明确关闭后保留 False。
+    """
+    return bool(load().get("realtime_quotes_enabled", True))
 
 
 def get_watchlist_groups_in_nav() -> bool:
@@ -787,23 +829,33 @@ def set_system_notify_enabled(enabled: bool) -> bool:
 
 def get_feishu_webhook_url() -> str:
     """飞书自定义机器人 Webhook 地址 — 全局共用一处, 所有启用推送的规则都推到这一个群。"""
-    return load().get("feishu_webhook_url", "")
+    from app import secrets_store
+    from app.user_system.settings_context import current
+    return secrets_store.load().get("feishu_webhook_url", "") if current() else load().get("feishu_webhook_url", "")
 
 
 def get_feishu_webhook_secret() -> str:
     """飞书自定义机器人签名密钥 — 机器人启用「签名校验」时必填, 留空表示不验签。"""
-    return load().get("feishu_webhook_secret", "")
+    from app import secrets_store
+    from app.user_system.settings_context import current
+    return secrets_store.load().get("feishu_webhook_secret", "") if current() else load().get("feishu_webhook_secret", "")
 
 
 def set_feishu_webhook_url(url: str) -> str:
     """保存飞书 Webhook 地址。传入空串表示清空配置。"""
-    save({"feishu_webhook_url": str(url or "").strip()})
+    from app import secrets_store
+    from app.user_system.settings_context import current
+    target = {"feishu_webhook_url": str(url or "").strip()}
+    secrets_store.save(target) if current() else save(target)
     return get_feishu_webhook_url()
 
 
 def set_feishu_webhook_secret(secret: str) -> str:
     """保存飞书签名密钥。传入空串表示不验签。"""
-    save({"feishu_webhook_secret": str(secret or "").strip()})
+    from app import secrets_store
+    from app.user_system.settings_context import current
+    target = {"feishu_webhook_secret": str(secret or "").strip()}
+    secrets_store.save(target) if current() else save(target)
     return get_feishu_webhook_secret()
 
 
@@ -813,7 +865,9 @@ def get_wecom_webhook_url() -> str:
     存储完整 URL (https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx);
     用户也可只填 key, 由 webhook_adapter.normalize_wecom_url 自动补全。
     """
-    return load().get("wecom_webhook_url", "")
+    from app import secrets_store
+    from app.user_system.settings_context import current
+    return secrets_store.load().get("wecom_webhook_url", "") if current() else load().get("wecom_webhook_url", "")
 
 
 def set_wecom_webhook_url(url: str) -> str:
@@ -822,7 +876,10 @@ def set_wecom_webhook_url(url: str) -> str:
     存储时统一补全为完整 URL, 避免后续每次推送都要再判一次。
     """
     from app.services.webhook_adapter import normalize_wecom_url
-    save({"wecom_webhook_url": normalize_wecom_url(url)})
+    from app import secrets_store
+    from app.user_system.settings_context import current
+    target = {"wecom_webhook_url": normalize_wecom_url(url)}
+    secrets_store.save(target) if current() else save(target)
     return get_wecom_webhook_url()
 
 
@@ -896,23 +953,33 @@ def set_email_smtp_config(config: dict) -> dict:
 
 def get_wecom_bot_id() -> str:
     """企业微信智能机器人 BotID — 机器人的唯一标识。"""
-    return load().get("wecom_bot_id", "")
+    from app import secrets_store
+    from app.user_system.settings_context import current
+    return secrets_store.load().get("wecom_bot_id", "") if current() else load().get("wecom_bot_id", "")
 
 
 def set_wecom_bot_id(bot_id: str) -> str:
     """保存智能机器人 BotID。传入空串表示清空。"""
-    save({"wecom_bot_id": (bot_id or "").strip()})
+    from app import secrets_store
+    from app.user_system.settings_context import current
+    target = {"wecom_bot_id": (bot_id or "").strip()}
+    secrets_store.save(target) if current() else save(target)
     return get_wecom_bot_id()
 
 
 def get_wecom_bot_secret() -> str:
     """企业微信智能机器人 Secret — 长连接专用密钥。"""
-    return load().get("wecom_bot_secret", "")
+    from app import secrets_store
+    from app.user_system.settings_context import current
+    return secrets_store.load().get("wecom_bot_secret", "") if current() else load().get("wecom_bot_secret", "")
 
 
 def set_wecom_bot_secret(secret: str) -> str:
     """保存智能机器人 Secret。传入空串表示清空。"""
-    save({"wecom_bot_secret": (secret or "").strip()})
+    from app import secrets_store
+    from app.user_system.settings_context import current
+    target = {"wecom_bot_secret": (secret or "").strip()}
+    secrets_store.save(target) if current() else save(target)
     return get_wecom_bot_secret()
 
 

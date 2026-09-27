@@ -140,6 +140,26 @@ class Settings(BaseSettings):
     # 公网服务器部署时免去 SSH 端口转发设密码的麻烦。写入 auth.json(哈希)后即不再读取。
     auth_password: str = ""
 
+    # Runtime mode. standalone preserves the existing single-user file storage;
+    # multi_user enables PostgreSQL-backed identity and private user data.
+    app_mode: str = "standalone"
+    database_url: str = ""
+    database_pool_size: int = 10
+    database_max_overflow: int = 20
+    auth_cookie_secure: bool = False
+
+    # Payment credentials are deployment secrets.
+    payment_public_base_url: str = ""
+    wechat_pay_app_id: str = ""
+    wechat_pay_mch_id: str = ""
+    wechat_pay_serial_no: str = ""
+    wechat_pay_private_key: str = ""
+    wechat_pay_api_v3_key: str = ""
+    wechat_pay_platform_public_key: str = ""
+    alipay_app_id: str = ""
+    alipay_private_key: str = ""
+    alipay_public_key: str = ""
+
     # Data — frozen: exe 同级 data/ 子目录; 非 frozen: 项目根 data/
     # (均可被环境变量 DATA_DIR 覆盖, pydantic-settings 自动注入)
     data_dir: Path = _user_data_root()
@@ -160,6 +180,14 @@ class Settings(BaseSettings):
             raise ValueError("backtest_matrix_cache_max_mb must be positive")
         if self.backtest_matrix_cache_prewarm_years <= 0:
             raise ValueError("backtest_matrix_cache_prewarm_years must be positive")
+        if self.app_mode not in {"standalone", "multi_user"}:
+            raise ValueError("app_mode must be standalone or multi_user")
+        if self.app_mode == "multi_user" and not self.database_url:
+            raise ValueError("database_url is required when app_mode=multi_user")
+        if self.database_pool_size <= 0:
+            raise ValueError("database_pool_size must be positive")
+        if self.database_max_overflow < 0:
+            raise ValueError("database_max_overflow must be non-negative")
         if self.ai_max_output_tokens <= 0:
             raise ValueError("ai_max_output_tokens must be positive")
         if self.ai_context_window <= 0:

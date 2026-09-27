@@ -20,6 +20,7 @@ from app.db_safe import is_valid_ext_ident, quote_ident
 from app.services import strategy_cache, strategy_run_queue
 from app.services.screener import ScreenerService
 from app.strategy import config as strategy_config
+from app.strategy.access import can_access_strategy
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,55 @@ class PresetRequest(BaseModel):
     ext_columns: Optional[str] = None
     asset_type: str = "stock"
     timeframe: str = "1d"
+
+
+def _strategy_overrides(request: Request) -> dict[str, dict]:
+    state = getattr(request, "state", None)
+    if getattr(state, "current_user", None) is not None:
+        return getattr(state, "strategy_overrides", {})
+    data_dir = request.app.state.repo.store.data_dir
+    return strategy_config.list_overrides(data_dir)
+
+
+def _strategy_override(request: Request, strategy_id: str) -> dict:
+    if getattr(getattr(request, "state", None), "current_user", None) is None:
+        data_dir = request.app.state.repo.store.data_dir
+        return strategy_config.load_override(data_dir, strategy_id)
+    return dict(_strategy_overrides(request).get(strategy_id, {}))
+
+
+def _strategy_accessible(request: Request, strategy_id: str, source: str) -> bool:
+    state = getattr(request, "state", None)
+    if getattr(state, "current_user", None) is None:
+        return True
+    engine = getattr(request.app.state, "strategy_engine", None)
+    if engine is None:
+        return False
+    try:
+        strategy = engine.get(strategy_id)
+    except ValueError:
+        return False
+    return can_access_strategy(
+        strategy,
+        getattr(state, "current_user", None),
+        getattr(state, "owned_strategy_ids", frozenset()),
+    )
+
+
+def _filter_cached_strategies(request: Request, cached: dict) -> dict:
+    filtered = dict(cached)
+    results = cached.get("results") or {}
+    allowed = {
+        sid for sid in results
+        if _strategy_accessible(request, sid, "")
+    }
+    filtered["results"] = {sid: value for sid, value in results.items() if sid in allowed}
+    ever_rows = cached.get("today_ever_rows")
+    if isinstance(ever_rows, dict):
+        filtered["today_ever_rows"] = {
+            sid: value for sid, value in ever_rows.items() if sid in allowed
+        }
+    return filtered
 
 
 def _safe(result_dict: dict) -> dict:
@@ -260,7 +310,6 @@ def strategies(
     timeframe: str = Query("1d"),
 ):
     """兼容策略清单端点；唯一数据源为 StrategyEngine。"""
-    data_dir = request.app.state.repo.store.data_dir
     engine = getattr(request.app.state, "strategy_engine", None)
     if engine is None:
         raise HTTPException(status_code=503, detail="策略引擎未初始化")
@@ -273,7 +322,9 @@ def strategies(
         if timeframe not in meta.get("timeframes", ["1d"]):
             continue
         sid = meta["id"]
-        overrides = strategy_config.load_override(data_dir, sid)
+        if not _strategy_accessible(request, sid, meta.get("source", "")):
+            continue
+        overrides = _strategy_override(request, sid)
         presets.append({
             **meta,
             "name": overrides.get("name") or meta["name"],
@@ -317,10 +368,18 @@ def run_preset(req: PresetRequest, request: Request):
     # 加载用户保存的策略配置
     data_dir = request.app.state.repo.store.data_dir
     ext_values = _load_ext_value_maps(repo, req.ext_columns)
-    overrides = strategy_config.load_override(data_dir, req.strategy_id)
+    overrides = _strategy_override(request, req.strategy_id)
     engine = getattr(request.app.state, "strategy_engine", None)
     if not engine:
         raise HTTPException(status_code=404, detail=f"策略引擎未初始化或策略 {req.strategy_id} 不存在")
+
+    if getattr(getattr(request, "state", None), "current_user", None) is not None:
+        try:
+            requested_strategy = engine.get(req.strategy_id)
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e)) from e
+        if not _strategy_accessible(request, req.strategy_id, requested_strategy.source):
+            raise HTTPException(status_code=404, detail=f"strategy {req.strategy_id} not found")
 
     try:
         if not engine.has(req.strategy_id):
@@ -399,7 +458,7 @@ def get_cached(
       不落盘 (避免与 read_cache 的 mtime 校验冲突), 在此直接叠加覆盖盘后结果。
       被监控的策略拿到新鲜数据, 非监控策略仍用盘后缓存。
     """
-    cached = _cached_with_realtime(request)
+    cached = _filter_cached_strategies(request, _cached_with_realtime(request))
 
     # 无任何数据 (盘后缓存空 + 无实时结果) → 返回空标记, 前端据此提示
     if not cached.get("results") and cached.get("as_of") is None:
@@ -412,7 +471,7 @@ def get_cached(
 @router.get("/cached-summary")
 def get_cached_summary(request: Request):
     """返回策略卡片所需的轻量摘要，不序列化股票明细。"""
-    cached = _cached_with_realtime(request)
+    cached = _filter_cached_strategies(request, _cached_with_realtime(request))
     results = cached.get("results") or {}
     summary = {
         sid: {
@@ -453,7 +512,9 @@ def get_cached_result(
     ext_columns: Optional[str] = Query(None, description="逗号分隔: config_id.field_name"),
 ):
     """按需返回单个策略的完整明细及其今日失效行。"""
-    cached = _cached_with_realtime(request)
+    if not _strategy_accessible(request, strategy_id, ""):
+        raise HTTPException(status_code=404, detail=f"strategy {strategy_id} not found")
+    cached = _filter_cached_strategies(request, _cached_with_realtime(request))
     raw_result = (cached.get("results") or {}).get(strategy_id)
     if not isinstance(raw_result, dict):
         return {
@@ -719,7 +780,7 @@ def run_all(request: Request, body: Optional[dict] = None):
 
     # 批量预加载所有 override 配置
     t0 = time.perf_counter()
-    all_overrides = strategy_config.list_overrides(data_dir)
+    all_overrides = _strategy_overrides(request)
     logger.info("run_all: list_overrides took %.1fms (%d overrides)", (time.perf_counter() - t0) * 1000, len(all_overrides))
 
     params_map = {
