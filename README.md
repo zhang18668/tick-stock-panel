@@ -410,7 +410,7 @@ docker run -d --name tsp -p 3018:3018 -v ${PWD}/data:/app/data ghcr.io/shy3130/t
 - 需要配置时:从 [.env.example](./.env.example) 复制出 `.env`,命令里加 `--env-file .env`。
 - 跑自己改过的代码:fork 后到仓库 **Actions** 页启用 workflow(fork 默认禁用),构建出的 `ghcr.io/<你的用户名>/tick-stock-panel` 用法相同。
 - 想用 compose 编排(挂载 `.env` / `tiers.yaml`):参考 [docker-compose.yml](./docker-compose.yml),把 `build:` 段换成 `image: ghcr.io/shy3130/tick-stock-panel:latest`。
-- 现成镜像默认不含 stock-sdk 插件与老 CPU 兼容内核(合规与体积考虑),有此需求请用方式 B 自构建,详见 [docs/deployment.md](./docs/deployment.md)。
+- 现成镜像默认预装 stock-sdk 依赖并包含 Node.js/npm；使用该数据源前请自行评估其合规风险，详见 [docs/deployment.md](./docs/deployment.md)。
 
 ### 方式 B:Docker Compose(本地构建,全套挂载)
 
@@ -437,7 +437,7 @@ CODEX_CLI_VERSION=0.144.3 docker compose up --build
 
 > Codex CLI 模式允许 TickFlow 容器读取本机 Codex 登录凭据，仅应在受信任的本机环境启用。凭据目录以只读方式挂载，不会写入镜像。
 
-镜像默认**不含** stock-sdk 插件(合规考虑);确需启用执行 `docker compose build --build-arg INCLUDE_STOCKSDK=1` 后再 `docker compose up -d`,详见 [docs/deployment.md](./docs/deployment.md)。
+镜像默认预装 stock-sdk 依赖并包含 Node.js/npm；如需关闭预装，可执行 `docker compose build --build-arg INCLUDE_STOCKSDK=0` 后再 `docker compose up -d`，详见 [docs/deployment.md](./docs/deployment.md)。
 
 </details>
 

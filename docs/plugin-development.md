@@ -60,8 +60,8 @@ TickFlow 的「先探后存」语义:
 | `node` | 需要 Node.js 运行时, `npm install` | stock-sdk |
 | `none` | 无额外依赖 | 纯 HTTP API 源 |
 
-> ⚠️ stock-sdk 在 Docker 中默认不打包(合规考虑:它抓取第三方财经网站接口,存在版权与
-> 反爬风险)。如需启用,构建时传 `--build-arg INCLUDE_STOCKSDK=1`,使用风险自负。
+> ⚠️ stock-sdk 在 Docker 中默认打包。它抓取第三方财经网站接口,存在版权与反爬风险,
+> 使用者需自行评估并承担相关风险。如需关闭,构建时传 `--build-arg INCLUDE_STOCKSDK=0`。
 > 详见 [deployment.md](./deployment.md)。
 
 `runtime` 字段当前仅用于 UI 展示, 实际依赖检测由 `check` 函数负责。
