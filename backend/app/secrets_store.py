@@ -16,6 +16,11 @@ from app.services.fs_utils import atomic_write_text
 
 logger = logging.getLogger(__name__)
 
+_USER_SECRET_KEYS = {
+    "feishu_webhook_url", "feishu_webhook_secret", "wecom_webhook_url",
+    "wecom_bot_id", "wecom_bot_secret",
+}
+
 
 def _path() -> Path:
     from app.config import settings
@@ -25,19 +30,38 @@ def _path() -> Path:
 
 
 def load() -> dict:
+    from app.user_system.settings_context import current
+
+    context = current()
     p = _path()
+    base: dict = {}
     if p.exists():
         try:
-            return json.loads(p.read_text(encoding="utf-8"))
+            base = json.loads(p.read_text(encoding="utf-8"))
         except Exception as e:  # noqa: BLE001
             logger.warning("secrets.json malformed: %s", e)
-    return {}
+    if context is not None:
+        # Multi-user deployments share platform TickFlow/AI credentials from
+        # the server. Only notification credentials remain user-scoped.
+        for key in _USER_SECRET_KEYS:
+            base.pop(key, None)
+        base.update({k: v for k, v in context.secrets.items() if k in _USER_SECRET_KEYS})
+    return base
 
 
 def save(updates: dict) -> dict:
     """合并写入(不会清掉未提及的字段)。返回新内容。"""
     current = load()
-    current.update({k: v for k, v in updates.items() if v is not None})
+    clean = {k: v for k, v in updates.items() if v is not None}
+    current.update(clean)
+    from app.user_system.settings_context import current as request_context
+
+    context = request_context()
+    if context is not None:
+        context.secrets.update(clean)
+        context.secret_updates.update(clean)
+        context.secret_deletes.difference_update(clean)
+        return current
     p = _path()
     atomic_write_text(
         p, json.dumps(current, indent=2, ensure_ascii=False), mode=0o600,
@@ -47,6 +71,17 @@ def save(updates: dict) -> dict:
 
 def clear(*keys: str) -> dict:
     """清掉指定字段(留空清全部)。"""
+    from app.user_system.settings_context import current as request_context
+
+    context = request_context()
+    if context is not None:
+        if not keys:
+            keys = tuple(context.secrets)
+        for k in keys:
+            context.secrets.pop(k, None)
+            context.secret_updates.pop(k, None)
+            context.secret_deletes.add(k)
+        return load()
     p = _path()
     if not p.exists():
         return {}

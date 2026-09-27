@@ -4,9 +4,11 @@
 """
 from __future__ import annotations
 
+import time as _time
 from datetime import date
 from pathlib import Path
 
+import anyio
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
@@ -18,6 +20,13 @@ router = APIRouter(prefix="/api/monitor-rules", tags=["monitor-rules"])
 
 def _data_dir(request: Request) -> Path:
     return request.app.state.repo.store.data_dir
+
+
+def _rule_visible(request: Request, rule: dict) -> bool:
+    current_user = getattr(getattr(request, "state", None), "current_user", None)
+    if current_user is None:
+        return not rule.get("user_id")
+    return rule.get("user_id") == str(current_user.id)
 
 
 def _reconcile_index_asset_type(rule: dict, repo) -> dict:
@@ -43,14 +52,48 @@ def _reconcile_index_asset_type(rule: dict, repo) -> dict:
     return rule
 
 
-def _sync_engine(request: Request) -> None:
+async def _load_rules(request: Request) -> list[dict]:
+    current_user = getattr(getattr(request, "state", None), "current_user", None)
+    if current_user is None:
+        return monitor_rules.load_all(_data_dir(request))
+    from app.persistence.database import session_scope
+    from app.persistence.repositories.monitoring import PostgresMonitoringRepository
+
+    async with session_scope() as session:
+        return await PostgresMonitoringRepository(session).list_rules(current_user.id)
+
+
+async def _load_all_runtime_rules(request: Request) -> list[dict]:
+    if getattr(getattr(request, "state", None), "current_user", None) is None:
+        return monitor_rules.load_all(_data_dir(request))
+    from app.persistence.database import session_scope
+    from app.persistence.repositories.monitoring import PostgresMonitoringRepository
+
+    async with session_scope() as session:
+        return await PostgresMonitoringRepository(session).list_all_rules()
+
+
+async def _store_rule(request: Request, rule: dict) -> dict:
+    current_user = getattr(getattr(request, "state", None), "current_user", None)
+    if current_user is None:
+        monitor_rules.save_one(_data_dir(request), rule)
+        return rule
+    from app.persistence.database import session_scope
+    from app.persistence.repositories.monitoring import PostgresMonitoringRepository
+
+    async with session_scope() as session:
+        await PostgresMonitoringRepository(session).save_rule(current_user.id, rule)
+    return {**rule, "user_id": str(current_user.id)}
+
+
+async def _sync_engine(request: Request) -> None:
     """保存/删除后,把最新规则集 reload 到引擎内存态。"""
     engine = getattr(request.app.state, "monitor_engine", None)
     if engine is not None:
         repo = request.app.state.repo
         rules = [
             _reconcile_index_asset_type(r, repo)
-            for r in monitor_rules.load_all(_data_dir(request))
+            for r in await _load_all_runtime_rules(request)
         ]
         engine.set_rules(rules)
 
@@ -203,11 +246,11 @@ def get_options(request: Request):
 
 # ── 列表 ───────────────────────────────────────────────
 @router.get("")
-def list_rules(request: Request):
+async def _list_rules_route(request: Request):
     repo = request.app.state.repo
     rules = [
         _reconcile_index_asset_type(r, repo)
-        for r in monitor_rules.load_all(_data_dir(request))
+        for r in await _load_rules(request)
     ]
     from app.services.kline_sync import intraday_monitor_support
 
@@ -260,9 +303,14 @@ def list_rules(request: Request):
     return {"rules": rules}
 
 
+def list_rules(request: Request):
+    """Backward-compatible synchronous entry used by service-level callers."""
+    return anyio.run(_list_rules_route, request)
+
+
 # ── 新建 / 更新 ────────────────────────────────────────
 @router.post("")
-def save_rule(req: RuleModel, request: Request):
+async def _save_rule_route(req: RuleModel, request: Request):
     rule = monitor_rules.normalize(req.model_dump())
     rule = _reconcile_index_asset_type(rule, request.app.state.repo)
     # 连板梯队封单监控 (type=ladder) 依赖五档盘口数据, 需 Pro+ (DEPTH5_BATCH 能力)。
@@ -283,6 +331,14 @@ def save_rule(req: RuleModel, request: Request):
             raise HTTPException(status_code=503, detail="策略引擎未初始化")
         try:
             strategy = strategy_engine.get(str(rule.get("strategy_id")))
+            from app.strategy.access import can_access_strategy
+
+            if not can_access_strategy(
+                strategy,
+                getattr(request.state, "current_user", None),
+                getattr(request.state, "owned_strategy_ids", frozenset()),
+            ):
+                raise ValueError(f"strategy {rule.get('strategy_id')} not found")
             strategy_engine.validate_context(
                 strategy,
                 StrategyDataContext(
@@ -331,7 +387,7 @@ def save_rule(req: RuleModel, request: Request):
         if not support["available"]:
             raise HTTPException(status_code=403, detail=str(support["reason"]))
         symbols = set(str(symbol) for symbol in rule.get("symbols", []) if symbol)
-        for saved in monitor_rules.load_all(_data_dir(request)):
+        for saved in await _load_rules(request):
             if (
                 saved.get("id") != rule.get("id")
                 and saved.get("enabled", True)
@@ -344,14 +400,19 @@ def save_rule(req: RuleModel, request: Request):
                 status_code=400,
                 detail=f"当前分时数据能力最多监听 {max_symbols} 只标的,当前规则合计 {len(symbols)} 只",
             )
-    monitor_rules.save_one(_data_dir(request), rule)
-    _sync_engine(request)
+    rule = await _store_rule(request, rule)
+    await _sync_engine(request)
     return {"ok": True, "rule": rule}
+
+
+def save_rule(req: RuleModel, request: Request):
+    """Backward-compatible synchronous entry used by service-level callers."""
+    return anyio.run(_save_rule_route, req, request)
 
 
 # ── 删除 ───────────────────────────────────────────────
 @router.delete("/{rule_id}")
-def delete_rule(rule_id: str, request: Request):
+async def delete_rule(rule_id: str, request: Request):
     if not monitor_rules.ID_RE.match(rule_id):
         raise HTTPException(status_code=400, detail="规则 id 非法")
     # 批次派生规则由「持仓提醒」页托管, 删除需在持仓页操作 (级联清理派生规则)
@@ -361,8 +422,48 @@ def delete_rule(rule_id: str, request: Request):
     deleted = monitor_rules.delete_one(_data_dir(request), rule_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="规则不存在")
-    _sync_engine(request)
+    await _sync_engine(request)
     return {"ok": True}
+
+
+@router.post("/{rule_id}/send-pool-now")
+async def send_strategy_pool_now(rule_id: str, request: Request):
+    """Send the latest cached strategy pool through this rule's webhook channels."""
+    if not monitor_rules.ID_RE.match(rule_id):
+        raise HTTPException(status_code=400, detail="规则 id 非法")
+    engine = getattr(request.app.state, "monitor_engine", None)
+    rule = engine.rules.get(rule_id) if engine is not None else None
+    if not rule or not _rule_visible(request, rule):
+        raise HTTPException(status_code=404, detail="规则不存在")
+    if rule.get("type") != "strategy":
+        raise HTTPException(status_code=400, detail="仅策略监控规则支持立即发送")
+    channels = list(rule.get("webhook_channels") or [])
+    if not channels:
+        raise HTTPException(status_code=400, detail="请先为规则勾选飞书或企业微信推送")
+    snapshot = engine.strategy_pool_snapshot(rule_id)
+    if snapshot is None:
+        raise HTTPException(status_code=409, detail="暂无策略结果，请等待实时监控完成一次扫描")
+
+    from app.services import preferences, webhook_adapter
+
+    config = rule.get("_notification_config") or {}
+    feishu_url = config.get("feishu_webhook_url") or preferences.get_feishu_webhook_url()
+    feishu_secret = config.get("feishu_webhook_secret") or preferences.get_feishu_webhook_secret()
+    wecom_url = config.get("wecom_webhook_url") or preferences.get_wecom_webhook_url()
+    delivered: list[str] = []
+    if "feishu" in channels:
+        if not feishu_url:
+            raise HTTPException(status_code=400, detail="飞书 Webhook 尚未配置")
+        if webhook_adapter.send_feishu(feishu_url, "策略拨测", snapshot["message"], feishu_secret):
+            delivered.append("feishu")
+    if "wecom" in channels:
+        if not wecom_url:
+            raise HTTPException(status_code=400, detail="企业微信 Webhook 尚未配置")
+        if webhook_adapter.send_wecom(wecom_url, "策略拨测", snapshot["message"]):
+            delivered.append("wecom")
+    if not delivered:
+        raise HTTPException(status_code=502, detail="Webhook 发送失败，请检查机器人配置")
+    return {"ok": True, "total": snapshot["total"], "channels": delivered}
 
 
 # ── 演示数据生成 (仅 Dev 页用) ─────────────────────────
@@ -421,7 +522,7 @@ _DEMO_STRATEGY_RULES: list[dict] = [
 
 
 @router.post("/seed")
-def seed_demo_rules(request: Request):
+async def seed_demo_rules(request: Request):
     """生成演示监控规则 (Dev 页用)。覆盖 signal/price/market/strategy 四类。"""
     ts = int(_time.time() * 1000)
     created = []
@@ -429,7 +530,7 @@ def seed_demo_rules(request: Request):
     for (name, rtype, scope, symbols, conditions, logic, severity, sev) in _DEMO_RULES_TEMPLATE:
         rule_id = f"demo_{ts}_{i}"
         rule = _demo_rule(rule_id, name, rtype, scope, symbols, conditions, logic, 3600, sev)
-        monitor_rules.save_one(_data_dir(request), rule)
+        await _store_rule(request, rule)
         created.append(rule_id)
         i += 1
     # 策略类型规则
@@ -439,10 +540,10 @@ def seed_demo_rules(request: Request):
             rule_id, sr["name"], "strategy", "all", [], [], "and", 3600, "info",
             strategy_id=sr["strategy_id"], direction=sr.get("direction", "entry"),
         )
-        monitor_rules.save_one(_data_dir(request), rule)
+        await _store_rule(request, rule)
         created.append(rule_id)
         i += 1
-    _sync_engine(request)
+    await _sync_engine(request)
     return {"ok": True, "generated": len(created), "ids": created}
 
 
@@ -496,7 +597,10 @@ def test_ladder(request: Request):
     mock = mock.join(sealed_df, on="symbol", how="inner")
 
     # 取所有 ladder 规则, 逐条纯条件判断 (绕过引擎 cooldown, 不污染 _last_fire)
-    ladder_rules = [r for r in engine.rules.values() if r.get("type") == "ladder" and r.get("enabled", True)]
+    ladder_rules = [
+        r for r in engine.rules.values()
+        if r.get("type") == "ladder" and r.get("enabled", True) and _rule_visible(request, r)
+    ]
     all_events = []
     not_triggered = []
 
@@ -562,7 +666,7 @@ def test_ladder(request: Request):
 
 
 @router.post("/trigger-ladder")
-def trigger_ladder(request: Request):
+async def trigger_ladder(request: Request):
     """真实触发一次 ladder 预警 (落盘 + 飞书推送 + SSE), 供 Dev 调试验证完整效果。
 
     与 test-ladder 区别: 本端点会真的把预警写入 alerts.jsonl、推送飞书、触发 SSE,
@@ -615,7 +719,11 @@ def trigger_ladder(request: Request):
         pass
 
     for rule in engine.rules.values():
-        if rule.get("type") != "ladder" or not rule.get("enabled", True):
+        if (
+            rule.get("type") != "ladder"
+            or not rule.get("enabled", True)
+            or not _rule_visible(request, rule)
+        ):
             continue
         sym = rule.get("symbols", [""])[0] if rule.get("symbols") else ""
         metric = rule.get("metric", "sealed_vol")
@@ -641,6 +749,7 @@ def trigger_ladder(request: Request):
 
         rule_events.append({
             "ts": int(now * 1000),
+            "user_id": rule.get("user_id"),
             "rule_id": rule["id"],
             "rule_name": rule.get("name", ""),
             "source": "ladder",
@@ -670,6 +779,7 @@ def trigger_ladder(request: Request):
     # 2. SSE 推送 (入 pending_alerts 队列)
     if quote_svc:
         sse_alerts = [{
+            "user_id": ev.get("user_id"),
             "source": ev["source"], "type": ev["type"], "rule_id": ev["rule_id"],
             "strategy_id": None, "symbol": ev["symbol"], "name": ev["name"],
             "message": ev["message"], "price": ev["price"], "change_pct": ev["change_pct"],

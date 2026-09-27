@@ -14,10 +14,17 @@ const _redirectToLogin = (() => {
     if (redirecting) return
     if (!(err instanceof Error)) return
     const msg = err.message || ''
+    const status = (err as Error & { status?: number }).status
     // 401 (未登录/会话过期) → 跳登录页
     // 403 未初始化 (面板未设密码, 公网访问) → 也跳登录页(显示设密码提示)
-    const is401 = msg.includes('未登录') || msg.includes('会话已过期') || msg.includes('401')
+    const is401 = status === 401 || msg.includes('未登录') || msg.includes('会话已过期') || msg.includes('not authenticated') || msg.includes('401')
     const isNotInit = msg.includes('尚未初始化访问密码') || msg.includes('NOT_INITIALIZED')
+    const code = (err as Error & { code?: string }).code
+    const isExpired = status === 402 || code === 'SUBSCRIPTION_EXPIRED' || msg.includes('SUBSCRIPTION_EXPIRED') || msg.includes('subscription expired')
+    if (isExpired) {
+      if (window.location.pathname !== '/subscription') window.location.href = '/subscription'
+      return
+    }
     if (!is401 && !isNotInit) return
     // 已在登录页则不跳(避免死循环)
     if (window.location.pathname === '/login') return

@@ -133,6 +133,14 @@ class ChangePasswordIn(BaseModel):
     new_password: str = Field(min_length=6, max_length=128)
 
 
+@router.get("/mode")
+def auth_mode() -> dict:
+    """Public bootstrap endpoint used before the frontend knows which login UI to show."""
+    from app.config import settings
+
+    return {"mode": settings.app_mode}
+
+
 @router.get("/status")
 def auth_status(request: Request) -> dict:
     """认证状态: 是否已设密码 + 当前请求是否已登录。"""

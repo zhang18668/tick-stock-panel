@@ -77,8 +77,10 @@ async function request<T>(path: string, init?: RequestOptions): Promise<T> {
   }
   if (!res.ok) {
     let detail = ''
+    let code = ''
     try {
       const j = JSON.parse(await res.text())
+      code = typeof j.code === 'string' ? j.code : ''
       const raw = j.detail ?? j.message ?? ''
       if (Array.isArray(raw)) {
         // FastAPI 422 校验错误: [{type, loc, msg, input}, ...] → 取 msg 拼接
@@ -90,8 +92,9 @@ async function request<T>(path: string, init?: RequestOptions): Promise<T> {
       }
     } catch { /* ignore */ }
     const msg = detail || `${res.status} ${res.statusText}`
+    const isSubscriptionExpired = res.status === 402 || code === 'SUBSCRIPTION_EXPIRED'
     // 401 (未登录/会话过期) 不弹 toast — 由全局认证拦截器统一跳登录页, 避免刷屏
-    if (res.status !== 401 && !quiet) toast(msg, 'error')
+    if (res.status !== 401 && !isSubscriptionExpired && !quiet) toast(msg, 'error')
     throw new ApiError(msg, res.status)
   }
   return res.json() as Promise<T>
@@ -512,6 +515,33 @@ export interface OverviewMarket {
   active_leaders: MarketSnapshotRow[]
   concept_rank: { leading: OverviewDimensionRankItem[]; lagging: OverviewDimensionRankItem[] }
   industry_rank: { leading: OverviewDimensionRankItem[]; lagging: OverviewDimensionRankItem[] }
+}
+
+export interface EmotionHistoryPoint {
+  time: string
+  score: number
+  label: string
+  index: number
+  profit: number
+  money: number
+  speculation: number
+  resilience: number
+  mainline: number
+}
+
+export interface EmotionHistory {
+  date: string
+  interval_minutes: number
+  points: EmotionHistoryPoint[]
+}
+
+export interface CreditSummary {
+  balance_cents: number
+  earned_cents: number
+  spent_cents: number
+  referral_code: string
+  referred_users: number
+  entries: Array<{ id: string; amount_cents: number; balance_after_cents: number; entry_type: string; description: string; created_at: string }>
 }
 
 // ===== 概念涨幅轮动矩阵 =====
@@ -2148,6 +2178,7 @@ export const api = {
   health: () => request<{ status: string; version: string; mode: string }>('/health'),
 
   // ===== Auth (访问认证) =====
+  authMode: () => request<{ mode: 'standalone' | 'multi_user' }>('/api/auth/mode'),
   authStatus: () =>
     request<{ configured: boolean; authenticated: boolean }>('/api/auth/status'),
   authSetup: (password: string) =>
@@ -2167,6 +2198,88 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ old_password: oldPassword, new_password: newPassword }),
     }),
+  accountStatus: () =>
+    request<{
+      mode: 'multi_user'
+      authenticated: boolean
+      user: { id: string; email: string; role: string } | null
+    }>('/api/account/status'),
+  accountRegister: (email: string, password: string, displayName = '', referralCode?: string, registrationCode?: string) =>
+    request<{ id: string; email: string; display_name: string | null }>('/api/account/register', {
+      method: 'POST',
+      body: JSON.stringify({ email, password, display_name: displayName, referral_code: referralCode || undefined, registration_code: registrationCode || undefined }),
+    }),
+  accountLogin: (email: string, password: string) =>
+    request<{ id: string; email: string; display_name: string | null }>('/api/account/login', {
+      method: 'POST',
+      body: JSON.stringify({ email, password }),
+    }),
+  accountMe: () =>
+    request<{ id: string; email: string; display_name: string | null; role: string }>('/api/account/me'),
+  accountLogout: () =>
+    request<{ ok: boolean }>('/api/account/logout', { method: 'POST' }),
+  billingMe: () =>
+    request<{
+      effective_plan: string
+      subscription: null | {
+        status: string
+        current_period_end: string | null
+        plan: { code: string; name: string; price_cents: number; entitlements: Record<string, number> }
+      }
+      credits: CreditSummary
+    }>('/api/billing/me'),
+  billingCredits: () => request<CreditSummary>('/api/billing/credits'),
+  redeemCreditCode: (code: string) =>
+    request<{ ok: boolean; points: number; credits: CreditSummary }>('/api/billing/credits/redeem', {
+      method: 'POST', body: JSON.stringify({ code }),
+    }),
+  redeemRegistrationCode: (registrationCode: string) =>
+    request<{ ok: boolean; subscription: { plan_code: string; current_period_end: string } }>('/api/billing/redeem', {
+      method: 'POST', body: JSON.stringify({ registration_code: registrationCode }),
+    }),
+  purchaseWithCredits: (planCode: 'pro_monthly' | 'pro_yearly') =>
+    request<{ ok: boolean; credits: CreditSummary }>('/api/billing/credits/purchase', {
+      method: 'POST', body: JSON.stringify({ plan_code: planCode }),
+    }),
+  billingPlans: () =>
+    request<{ plans: Array<{ code: string; name: string; price_cents: number; billing_period: string; entitlements: Record<string, number> }>; channels: Record<'wechat' | 'alipay', boolean> }>(
+      '/api/billing/plans',
+    ),
+  createPaymentOrder: (planCode: 'pro_monthly' | 'pro_yearly', provider: 'wechat' | 'alipay') =>
+    request<{ id: string; status: string; code_url: string; amount_cents: number; expires_at: string }>('/api/billing/orders', {
+      method: 'POST', body: JSON.stringify({ plan_code: planCode, provider }),
+    }),
+  paymentOrder: (orderId: string) =>
+    request<{ id: string; status: string; code_url: string; amount_cents: number; expires_at: string }>(`/api/billing/orders/${orderId}`),
+  adminUsers: (limit = 100, offset = 0) =>
+    request<{ users: Array<{ id: string; email: string; display_name: string | null; role: string; status: string; created_at: string; last_login_at: string | null; subscription: null | { plan_code: string; plan_name: string; status: string; current_period_end: string | null } }>; total: number }>(
+      `/api/admin/users?limit=${limit}&offset=${offset}`,
+    ),
+  adminUpdateUser: (userId: string, payload: { role?: 'user' | 'admin'; status?: 'active' | 'disabled' }) =>
+    request<{ ok: boolean }>(`/api/admin/users/${userId}`, {
+      method: 'PATCH',
+      body: JSON.stringify(payload),
+    }),
+  adminAssignPlan: (userId: string, planCode: string, days = 30) =>
+    request<{ ok: boolean }>('/api/billing/admin/assign', {
+      method: 'POST',
+      body: JSON.stringify({ user_id: userId, plan_code: planCode, days }),
+    }),
+  adminOverview: () => request<{
+    counts: { users: number; strategies: number; backtests: number }
+    timeline: Array<{ date: string; users: number; strategies: number; backtests: number }>
+    top_users: Array<{ id: string; email: string; display_name: string | null; page_views: number; strategies: number; backtests: number; last_active_at: string | null }>
+    pages: Array<{ path: string; views: number; users: number }>
+  }>('/api/admin/overview'),
+  adminStrategies: () => request<{ strategies: Array<{ id: string; strategy_id: string; source: string; meta: Record<string, unknown>; owner: { id: string; email: string }; created_at: string; updated_at: string }> }>('/api/admin/strategies'),
+  adminStrategyRanking: () => request<{ ranking: Array<{ run_id: string; run_type: string; strategy_id: string | null; return_ratio: number; params: Record<string, unknown>; result: Record<string, unknown>; owner: { id: string; email: string }; created_at: string }> }>('/api/admin/strategy-ranking'),
+  adminRegistrationCodes: () => request<{ codes: Array<{ id: string; code_prefix: string; status: string; plan_code: string; plan_name: string; valid_days: number; expires_at: string | null; redeemed_at: string | null; redeemed_by: string | null; created_at: string }> }>('/api/admin/registration-codes'),
+  adminCreateRegistrationCodes: (payload: { count: number; plan_code: string; valid_days: number; expires_in_days: number | null }) => request<{ codes: string[]; plan_code: string; valid_days: number; expires_at: string | null }>('/api/admin/registration-codes', { method: 'POST', body: JSON.stringify(payload) }),
+  adminRevokeRegistrationCode: (id: string) => request<{ ok: boolean }>(`/api/admin/registration-codes/${id}`, { method: 'DELETE' }),
+  adminCreditCodes: () => request<{ codes: Array<{ id: string; code_prefix: string; status: string; points: number; expires_at: string | null; redeemed_at: string | null; redeemed_by: string | null; created_at: string }> }>('/api/admin/credit-codes'),
+  adminCreateCreditCodes: (payload: { count: number; points: number; expires_in_days: number | null }) => request<{ codes: string[]; points: number; expires_at: string | null }>('/api/admin/credit-codes', { method: 'POST', body: JSON.stringify(payload) }),
+  adminRevokeCreditCode: (id: string) => request<{ ok: boolean }>(`/api/admin/credit-codes/${id}`, { method: 'DELETE' }),
+  recordPageView: (path: string) => request<{ ok: boolean }>('/api/usage/page', { method: 'POST', body: JSON.stringify({ path }) }),
 
   settings: () => request<SettingsState>('/api/settings'),
   saveTickflowKey: (api_key: string) =>
@@ -2410,10 +2523,10 @@ export const api = {
       method: 'PUT',
       body: JSON.stringify({ enabled }),
     }),
-  updateFeishuWebhook: (url: string, secret: string = '') =>
+  updateFeishuWebhook: (url: string, secret?: string) =>
     request<{ feishu_webhook_url: string; feishu_webhook_secret: string }>('/api/settings/preferences/feishu-webhook', {
       method: 'PUT',
-      body: JSON.stringify({ url, secret }),
+      body: JSON.stringify({ url, ...(secret === undefined ? {} : { secret }) }),
     }),
   updateWecomWebhook: (url: string) =>
     request<{ wecom_webhook_url: string }>('/api/settings/preferences/wecom-webhook', {
@@ -2810,6 +2923,8 @@ export const api = {
   marketSnapshot: () =>
     request<{ as_of: string | null; rows: MarketSnapshotRow[] }>('/api/screener/market-snapshot'),
   overviewMarket: (asOf?: string) => request<OverviewMarket>(`/api/overview/market${asOf ? `?as_of=${asOf}` : ''}`),
+  overviewEmotionHistory: (asOf: string) =>
+    request<EmotionHistory>(`/api/overview/emotion-history?as_of=${encodeURIComponent(asOf)}`),
 
   // 概念涨幅轮动矩阵: 每列(日期)各自把所有概念按当天涨幅从高到低排序
   rpsRotation: (days: number, kind?: 'concept' | 'industry', level?: number) =>

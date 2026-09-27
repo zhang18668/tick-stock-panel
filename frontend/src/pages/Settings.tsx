@@ -6,6 +6,7 @@
 import { useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { motion } from 'framer-motion'
+import { useQuery } from '@tanstack/react-query'
 import { BarChart3, Database, Radio, SlidersHorizontal, Sparkles, Settings2, PanelLeftClose, PanelLeftOpen, Clock3 } from 'lucide-react'
 import { SettingsAIPanel } from './settings/AI'
 import { SettingsMonitoringPanel } from './settings/Monitoring'
@@ -16,6 +17,7 @@ import { SettingsSystemPanel } from './settings/System'
 import { SettingsDataSourcesPanel } from './settings/DataSources'
 import { PageHeader } from '@/components/PageHeader'
 import { cn } from '@/lib/cn'
+import { api } from '@/lib/api'
 
 import type { ComponentType } from 'react'
 
@@ -27,6 +29,7 @@ type TabDef = {
   icon: ComponentType<{ className?: string }>
   panel: ComponentType<{ highlight?: string }>
   badge?: string
+  adminOnly?: boolean
 }
 
 const TABS: readonly TabDef[] = [
@@ -43,8 +46,14 @@ type TabKey = (typeof TABS)[number]['key']
 
 export function Settings() {
   const [searchParams, setSearchParams] = useSearchParams()
+  const mode = useQuery({ queryKey: ['auth-mode'], queryFn: api.authMode, staleTime: Infinity })
+  const account = useQuery({ queryKey: ['account-me'], queryFn: api.accountMe, enabled: mode.data?.mode === 'multi_user' })
+  const visibleTabs = TABS.filter(tab => (
+    mode.data?.mode !== 'multi_user'
+    || (!tab.adminOnly || account.data?.role === 'admin')
+  ))
   const tabParam = searchParams.get('tab') as TabKey | null
-  const activeTab = TABS.find((t) => t.key === tabParam) ?? TABS[0]
+  const activeTab = visibleTabs.find((t) => t.key === tabParam) ?? visibleTabs[0]
   const highlight = searchParams.get('highlight') ?? ''
 
   // 设置菜单收起状态 — 持久化到 localStorage

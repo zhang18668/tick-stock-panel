@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import threading
+import time
+import uuid
 from dataclasses import asdict
 from datetime import date, timedelta
 from typing import Literal
@@ -19,6 +22,7 @@ from app.services.backtest import (
     BacktestService,
     VectorbtUnavailable,
 )
+from app.strategy.access import can_access_strategy
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +46,63 @@ def _get_engine(request: Request):
         engine = BacktestEngine(request.app.state.repo)
         request.app.state.backtest_engine = engine
     return engine
+
+
+def _user_scope(request: Request) -> str:
+    current_user = getattr(getattr(request, "state", None), "current_user", None)
+    return str(current_user.id) if current_user is not None else "standalone"
+
+
+def _require_strategy_access(request: Request, strategy_id: str) -> None:
+    state = getattr(request, "state", None)
+    current_user = getattr(state, "current_user", None)
+    if current_user is None:
+        return
+    try:
+        strategy = request.app.state.strategy_engine.get(strategy_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=f"strategy {strategy_id} not found") from exc
+    if not can_access_strategy(
+        strategy,
+        current_user,
+        {
+            *getattr(state, "owned_strategy_ids", frozenset()),
+            *getattr(state, "installed_strategy_ids", frozenset()),
+        },
+    ):
+        raise HTTPException(status_code=404, detail=f"strategy {strategy_id} not found")
+
+
+def _scoped_job_key(request: Request, job_key: str) -> str:
+    raw = f"{_user_scope(request)}|{job_key}"
+    return hashlib.md5(raw.encode()).hexdigest()[:12]
+
+
+async def _persist_backtest_result(
+    request: Request,
+    run_type: str,
+    request_data: dict,
+    result_data: dict,
+    strategy_id: str | None = None,
+) -> None:
+    current_user = getattr(getattr(request, "state", None), "current_user", None)
+    if current_user is None:
+        return
+    from app.persistence.database import session_scope
+    from app.persistence.repositories.backtests import PostgresBacktestRepository
+
+    run_id = str(result_data.get("run_id") or result_data.get("job_key") or uuid.uuid4().hex)
+    status = "failed" if result_data.get("error") else "completed"
+    async with session_scope() as session:
+        await PostgresBacktestRepository(session).save(
+            current_user.id,
+            run_id,
+            run_type,
+            request_data,
+            _json_safe(result_data),
+            strategy_id=strategy_id,
+            status=status,
+        )
 
 
 def _resolve_start(req: BaseModel, end: date, default_days: int) -> date:
@@ -72,6 +133,51 @@ def status():
     return {"available": True}
 
 
+@router.get("/history")
+async def backtest_history(request: Request, limit: int = 100):
+    current_user = getattr(request.state, "current_user", None)
+    if current_user is None:
+        return {"runs": []}
+    from app.persistence.database import session_scope
+    from app.persistence.repositories.backtests import PostgresBacktestRepository
+
+    async with session_scope() as session:
+        runs = await PostgresBacktestRepository(session).list(
+            current_user.id, max(1, min(limit, 500))
+        )
+    return {"runs": runs}
+
+
+@router.get("/history/{run_id}")
+async def backtest_history_detail(run_id: str, request: Request):
+    current_user = getattr(request.state, "current_user", None)
+    if current_user is None:
+        raise HTTPException(status_code=404, detail="backtest run not found")
+    from app.persistence.database import session_scope
+    from app.persistence.repositories.backtests import PostgresBacktestRepository
+
+    async with session_scope() as session:
+        run_record = await PostgresBacktestRepository(session).get(current_user.id, run_id)
+    if run_record is None:
+        raise HTTPException(status_code=404, detail="backtest run not found")
+    return run_record
+
+
+@router.delete("/history/{run_id}")
+async def delete_backtest_history(run_id: str, request: Request):
+    current_user = getattr(request.state, "current_user", None)
+    if current_user is None:
+        raise HTTPException(status_code=404, detail="backtest run not found")
+    from app.persistence.database import session_scope
+    from app.persistence.repositories.backtests import PostgresBacktestRepository
+
+    async with session_scope() as session:
+        deleted = await PostgresBacktestRepository(session).delete(current_user.id, run_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="backtest run not found")
+    return {"ok": True}
+
+
 # ================================================================
 # 信号回测 (现有接口，保持不变)
 # ================================================================
@@ -91,7 +197,7 @@ class BacktestRequest(BaseModel):
 
 
 @router.post("/run")
-def run(req: BacktestRequest, request: Request):
+async def _run_route(req: BacktestRequest, request: Request):
     """信号回测 — 现有接口，向后兼容。"""
     repo = request.app.state.repo
     svc = BacktestService(repo)
@@ -115,7 +221,9 @@ def run(req: BacktestRequest, request: Request):
         result = svc.run(cfg)
     except VectorbtUnavailable as e:
         raise HTTPException(status_code=503, detail=str(e)) from e
-    return asdict(result)
+    payload = asdict(result)
+    await _persist_backtest_result(request, "signal", req.model_dump(mode="json"), payload)
+    return payload
 
 
 # ================================================================
@@ -147,7 +255,7 @@ class FactorBacktestRequest(BaseModel):
 
 
 @router.post("/factor/run")
-def factor_run(req: FactorBacktestRequest, request: Request):
+async def _factor_run_route(req: FactorBacktestRequest, request: Request):
     """因子回测 — IC/IR 分析 + 分层回测。"""
     from app.backtest.factor import FactorBacktestService, FactorConfig
     from app.factors.registry import factor_columns_view
@@ -181,7 +289,9 @@ def factor_run(req: FactorBacktestRequest, request: Request):
         asset_type=req.asset_type,
     )
     result = svc.run(cfg)
-    return asdict(result)
+    payload = asdict(result)
+    await _persist_backtest_result(request, "factor", req.model_dump(mode="json"), payload)
+    return payload
 
 
 class FactorBatchRequest(BaseModel):
@@ -375,7 +485,7 @@ def _guard_minute_strategy_backtest(
 
 
 @router.post("/strategy/run")
-def strategy_run(req: StrategyBacktestRequest, request: Request):
+async def _strategy_run_route(req: StrategyBacktestRequest, request: Request):
     """策略回测 — 复用 StrategyDef 体系做全周期回测。"""
     from app.backtest.strategy import StrategyBacktestConfig
     from app.backtest.worker import make_worker_task, run_worker_task
@@ -418,22 +528,20 @@ def strategy_run(req: StrategyBacktestRequest, request: Request):
 
 # ── SSE 流式回测 (实时进度 + 可取消 + 支持重连) ───────────────────
 
-import time
-import hashlib
-
-
 class _BacktestJob:
     """单个回测任务的状态, 存模块级供重连使用。"""
-    __slots__ = ("key", "cancel_event", "progress", "result", "error", "done", "finish_ts")
+    __slots__ = ("key", "owner_id", "cancel_event", "progress", "result", "error", "done", "finish_ts", "persisted")
 
-    def __init__(self, key: str):
+    def __init__(self, key: str, owner_id: str = "standalone"):
         self.key = key
+        self.owner_id = owner_id
         self.cancel_event = threading.Event()
         self.progress: list[dict] = []   # 进度历史 (新连接可回放)
         self.result = None               # 完成后的结果
         self.error: str | None = None
         self.done = False
         self.finish_ts: float = 0.0
+        self.persisted = False
 
 
 # 模块级任务表: key -> _BacktestJob
@@ -532,6 +640,7 @@ async def strategy_stream(
         start_date = date.fromisoformat(start) if start else None
     except ValueError as e:
         raise HTTPException(status_code=400, detail=f"日期格式错误: {e}") from e
+    _require_strategy_access(request, strategy_id)
     if start_date is None:
         # 空 start = 全部历史: 用本地最早日K日期, 查不到再回退到默认窗口
         earliest = request.app.state.repo.earliest_daily_date()
@@ -556,6 +665,7 @@ async def strategy_stream(
         minute_fill=minute_fill,
         regime_filter=regime_filter,
     )
+    job_key = _scoped_job_key(request, job_key)
 
     _cleanup_stale_jobs()
 
@@ -563,7 +673,7 @@ async def strategy_stream(
     with _jobs_lock:
         job = _running_jobs.get(job_key)
         if job is None:
-            job = _BacktestJob(job_key)
+            job = _BacktestJob(job_key, _user_scope(request))
             _running_jobs[job_key] = job
             is_new = True
         else:
@@ -663,6 +773,15 @@ async def strategy_stream(
                             yield f"event: error\ndata: {json.dumps({'message': error}, ensure_ascii=False)}\n\n"
                         else:
                             payload = r if isinstance(r, dict) else asdict(r)
+                            if not job.persisted:
+                                job.persisted = True
+                                await _persist_backtest_result(
+                                    request,
+                                    "strategy_stream",
+                                    {"job_key": job_key},
+                                    {**payload, "job_key": job_key},
+                                    strategy_id=strategy_id,
+                                )
                             yield f"event: done\ndata: {json.dumps(payload, ensure_ascii=False, default=str)}\n\n"
                     return
 
@@ -722,6 +841,7 @@ async def strategy_cancel(request: Request):
         stamp_tax_pct=_get_opt_float("stamp_tax_pct"),
         asset_type=_get("asset_type", "stock"),
     )
+    job_key = _scoped_job_key(request, job_key)
     # 持锁读任务表: 与 _cleanup_stale_jobs 的 pop、stream 的写入互斥
     with _jobs_lock:
         job = _running_jobs.get(job_key)
@@ -837,6 +957,7 @@ async def optimize_stream(
         start_date = date.fromisoformat(start) if start else None
     except ValueError as e:
         raise HTTPException(status_code=400, detail=f"日期格式错误: {e}") from e
+    _require_strategy_access(request, strategy_id)
     if start_date is None:
         earliest = request.app.state.repo.earliest_daily_date()
         start_date = earliest or (end_date - timedelta(days=FACTOR_DEFAULT_DAYS))
@@ -865,12 +986,13 @@ async def optimize_stream(
         overrides,
         matrix_cache_max_mb,
     )
+    job_key = _scoped_job_key(request, job_key)
 
     _cleanup_stale_jobs()
     with _jobs_lock:
         job = _running_jobs.get(job_key)
         if job is None:
-            job = _BacktestJob(job_key)
+            job = _BacktestJob(job_key, _user_scope(request))
             _running_jobs[job_key] = job
             is_new = True
         else:
@@ -960,6 +1082,15 @@ async def optimize_stream(
                         # 取消时优化器把每组记为 cancelled 并正常返回, 需在此分流为取消提示而非"完成"。
                         yield f"event: error\ndata: {json.dumps({'message': '优化已取消'}, ensure_ascii=False)}\n\n"
                     elif job.result is not None:
+                        if not job.persisted:
+                            job.persisted = True
+                            await _persist_backtest_result(
+                                request,
+                                "optimize",
+                                {"job_key": job_key},
+                                {**_json_safe(job.result), "job_key": job_key},
+                                strategy_id=strategy_id,
+                            )
                         yield f"event: done\ndata: {json.dumps(_json_safe(job.result), ensure_ascii=False, default=str)}\n\n"
                     return
                 tick += 1
@@ -987,7 +1118,7 @@ async def optimize_cancel(request: Request):
     body = await request.json()
     job_key = body.get("job_key", "")
     job = _running_jobs.get(job_key)
-    if job and not job.done:
+    if job and job.owner_id == _user_scope(request) and not job.done:
         job.cancel_event.set()
         return {"ok": True}
     return {"ok": False, "message": "任务不存在或已完成"}
@@ -1061,6 +1192,7 @@ async def walkforward_stream(
         start_date = date.fromisoformat(start) if start else None
     except ValueError as e:
         raise HTTPException(status_code=400, detail=f"日期格式错误: {e}") from e
+    _require_strategy_access(request, strategy_id)
     if start_date is None:
         earliest = request.app.state.repo.earliest_daily_date()
         start_date = earliest or (end_date - timedelta(days=STRATEGY_DEFAULT_DAYS))
@@ -1085,6 +1217,7 @@ async def walkforward_stream(
         overrides,
         matrix_cache_max_mb,
     )
+    job_key = _scoped_job_key(request, job_key)
 
     # guard 作用于单折窗口 (每折训练/测试各是一次回测), 而非总区间 —— WF 总区间可长达数年,
     # 按总区间拦会误杀; 真正的 OOM 风险在单折窗口过大。
@@ -1097,7 +1230,7 @@ async def walkforward_stream(
     with _jobs_lock:
         job = _running_jobs.get(job_key)
         if job is None:
-            job = _BacktestJob(job_key)
+            job = _BacktestJob(job_key, _user_scope(request))
             _running_jobs[job_key] = job
             is_new = True
         else:
@@ -1187,6 +1320,15 @@ async def walkforward_stream(
                     elif job.cancel_event.is_set():
                         yield f"event: error\ndata: {json.dumps({'message': 'walk-forward 已取消'}, ensure_ascii=False)}\n\n"
                     elif job.result is not None:
+                        if not job.persisted:
+                            job.persisted = True
+                            await _persist_backtest_result(
+                                request,
+                                "walkforward",
+                                {"job_key": job_key},
+                                {**_json_safe(job.result), "job_key": job_key},
+                                strategy_id=strategy_id,
+                            )
                         yield f"event: done\ndata: {json.dumps(_json_safe(job.result), ensure_ascii=False, default=str)}\n\n"
                     return
                 tick += 1
@@ -1209,7 +1351,22 @@ async def walkforward_cancel(request: Request):
     body = await request.json()
     job_key = body.get("job_key", "")
     job = _running_jobs.get(job_key)
-    if job and not job.done:
+    if job and job.owner_id == _user_scope(request) and not job.done:
         job.cancel_event.set()
         return {"ok": True}
     return {"ok": False, "message": "任务不存在或已完成"}
+
+
+# Service-level callers historically invoke these endpoint functions directly.
+# Keep that synchronous surface while FastAPI uses the async route implementations
+# above, which can persist per-user history without blocking the request contract.
+def run(req: BacktestRequest, request: Request):
+    return asyncio.run(_run_route(req, request))
+
+
+def factor_run(req: FactorBacktestRequest, request: Request):
+    return asyncio.run(_factor_run_route(req, request))
+
+
+def strategy_run(req: StrategyBacktestRequest, request: Request):
+    return asyncio.run(_strategy_run_route(req, request))

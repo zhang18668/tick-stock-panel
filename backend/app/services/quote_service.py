@@ -24,6 +24,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
 import time
@@ -87,7 +88,12 @@ class QuoteSubscriber:
     改为每连接独立订阅者后, 事件对所有客户端广播。
     """
 
-    def __init__(self, max_alerts: int = 1000, max_reviews: int = 200) -> None:
+    def __init__(
+        self,
+        max_alerts: int = 1000,
+        max_reviews: int = 200,
+        user_id: str | None = None,
+    ) -> None:
         self._event = threading.Event()
         self._lock = threading.Lock()
         self._max_alerts = max_alerts
@@ -97,6 +103,7 @@ class QuoteSubscriber:
         self._depth_updated = False
         self._alerts: list[dict] = []
         self._reviews: list[str] = []
+        self.user_id = user_id
 
     # ── 消费侧 (SSE generator 线程) ──────────────────────
     def wait(self, timeout: float = 5.0) -> bool:
@@ -361,7 +368,7 @@ class QuoteService:
             self.resume()
 
     def boot_check(self) -> None:
-        """启动时检查 preferences，若 enabled 则自动启动。
+        """启动时在能力允许的情况下自动启动实时行情。
 
         none 档无实时行情权限:即使 preferences 标记为 enabled,
         也不启动,并同步 preferences 为关闭(避免 UI 误显示已开启)。
@@ -372,8 +379,9 @@ class QuoteService:
                 self._save_enabled(False)
             logger.info("实时行情未启动:当前档位(none)无实时行情权限")
             return
-        if preferences.get_realtime_quotes_enabled():
-            self.start()
+        # 实时行情是常驻服务。兼容历史版本保存的关闭值, 进程启动后统一恢复;
+        # 实际取数仍由交易时段判断及 pause()/resume() 安全边界控制。
+        self.start()
 
     def set_repo(self, repo) -> None:
         """注入 KlineRepository, 用于实时落盘。"""
@@ -400,9 +408,9 @@ class QuoteService:
     # SSE 订阅管理 — 每个 /stream 连接一个订阅者, 事件广播
     # ================================================================
 
-    def subscribe(self) -> QuoteSubscriber:
+    def subscribe(self, user_id: str | None = None) -> QuoteSubscriber:
         """注册一个 SSE 订阅者 (连接建立时调用)。"""
-        sub = QuoteSubscriber()
+        sub = QuoteSubscriber(user_id=user_id)
         with self._lock:
             self._subscribers.add(sub)
         return sub
@@ -422,6 +430,24 @@ class QuoteService:
         # (无缓存, 直读实时缓存) 行为对齐, 避免看板落后于侧栏。
         # 延迟导入规避 services <-> api 层循环依赖。
         from app.api.overview import invalidate_overview_cache
+        from app.services.emotion_intraday import needs_capture, record_snapshot, release_capture
+        from app.services.market_overview_builder import build_market_overview
+
+        if self._repo:
+            data_dir = self._repo.store.data_dir
+            captured_at = cn_now()
+            if needs_capture(data_dir, captured_at):
+                try:
+                    overview = build_market_overview(
+                        repo=self._repo,
+                        quote_service=self,
+                        depth_service=getattr(self._app_state, "depth_service", None) if self._app_state else None,
+                    )
+                    record_snapshot(data_dir, overview, captured_at)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("盘中情绪快照保存失败: %s", exc)
+                finally:
+                    release_capture(data_dir, captured_at)
 
         invalidate_overview_cache()
         for sub in self._snapshot_subscribers():
@@ -442,7 +468,13 @@ class QuoteService:
 
     def _broadcast_alerts(self, alerts: list[dict]) -> None:
         for sub in self._snapshot_subscribers():
-            sub.push_alerts(alerts)
+            scoped = [
+                alert
+                for alert in alerts
+                if not alert.get("user_id") or alert.get("user_id") == sub.user_id
+            ]
+            if scoped:
+                sub.push_alerts(scoped)
 
     def push_alerts(self, alerts: list[dict]) -> None:
         self._broadcast_alerts(alerts)
@@ -450,6 +482,51 @@ class QuoteService:
     def clear_pending_alerts(self) -> None:
         for sub in self._snapshot_subscribers():
             sub.clear_alerts()
+
+    def _persist_monitor_alerts(self, events: list[dict]) -> None:
+        """Persist alerts without blocking the shared quote polling thread."""
+        if not self._app_state or not events:
+            return
+        from app.config import settings
+
+        if settings.app_mode == "standalone":
+            from app.services import alert_store
+
+            alert_store.append_many(self._app_state.repo.store.data_dir, events)
+            return
+
+        grouped: dict[str, list[dict]] = {}
+        for event in events:
+            user_id = event.get("user_id")
+            if user_id:
+                grouped.setdefault(str(user_id), []).append(event)
+        if not grouped:
+            return
+
+        async def persist() -> None:
+            from uuid import UUID
+
+            from app.persistence.database import session_scope
+            from app.persistence.repositories.monitoring import PostgresMonitoringRepository
+
+            async with session_scope() as session:
+                repository = PostgresMonitoringRepository(session)
+                for user_id, user_events in grouped.items():
+                    await repository.append_alerts(UUID(user_id), user_events)
+
+        loop = getattr(self._app_state, "main_loop", None)
+        if loop is None or loop.is_closed():
+            logger.warning("alert persistence skipped: application loop unavailable")
+            return
+        future = asyncio.run_coroutine_threadsafe(persist(), loop)
+
+        def log_failure(done) -> None:
+            try:
+                done.result()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("alert persistence failed: %s", exc)
+
+        future.add_done_callback(log_failure)
 
     def push_review_event(self, event_json: str) -> None:
         """广播一条复盘进度事件(JSON 字符串), 唤醒所有 SSE generator。
@@ -1272,6 +1349,7 @@ class QuoteService:
                         # 转为 SSE 推送格式 (兼容旧 alert schema)
                         for ev in rule_events:
                             alert = {
+                                "user_id": ev.get("user_id"),
                                 "source": ev["source"],
                                 "type": ev["type"],
                                 "rule_id": ev.get("rule_id"),
@@ -1655,6 +1733,16 @@ class QuoteService:
                 channels = rule.get("webhook_channels") if rule else None
                 if not channels:
                     continue
+                config = rule.get("_notification_config", {}) if rule else {}
+                if config:
+                    feishu_url = config.get("feishu_webhook_url", "")
+                    feishu_secret = config.get("feishu_webhook_secret", "")
+                    wecom_url = config.get("wecom_webhook_url", "")
+                else:
+                    # Standalone compatibility keeps using the shared file.
+                    feishu_url = preferences.get_feishu_webhook_url()
+                    feishu_secret = preferences.get_feishu_webhook_secret()
+                    wecom_url = preferences.get_wecom_webhook_url()
                 source = ev.get("source", "")
                 source_label = SOURCE_LABELS.get(source, source or "通知")
                 symbol = ev.get("symbol") or ""
@@ -1744,6 +1832,11 @@ class QuoteService:
         - 去重: 复用 MonitorRuleEngine 的 cooldown, 此处不重复去重
         - 批量策略事件 (symbol="") 聚合为一条通知, 避免刷屏
         """
+        from app.config import settings
+        if settings.app_mode == "multi_user":
+            # Browser/SSE notifications are already user-targeted; a server OS
+            # notification cannot be safely attributed in multi-user mode.
+            return
         try:
             from app.services import preferences
             from app.services import notify_adapter

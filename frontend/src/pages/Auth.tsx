@@ -1,73 +1,101 @@
-/**
- * 访问认证页 — 复用同一组件处理「首次设密码」和「登录」两种状态。
- *
- * 根据后端 /api/auth/status 的 configured 字段决定显示:
- *   - configured=false → 显示「设置访问密码」(首次)
- *   - configured=true  → 显示「登录」
- *
- * 安全:
- *   - 设密码接口后端限本机/内网; 公网用户设密码会被 403 拒绝, 页面据此提示。
- *   - 登录失败由后端限流(5次锁5分钟), 429 时前端显示等待提示。
- */
 import { useEffect, useState, type FormEvent } from 'react'
-import { useNavigate } from 'react-router-dom'
 import { useMutation } from '@tanstack/react-query'
 import { motion } from 'framer-motion'
-import { Eye, EyeOff, Loader2, Lock, ShieldCheck, ShieldAlert, Sparkles } from 'lucide-react'
-import { api } from '@/lib/api'
+import { Eye, EyeOff, Loader2, Lock, ShieldAlert, ShieldCheck, Sparkles } from 'lucide-react'
+import { useNavigate } from 'react-router-dom'
+
 import { Logo } from '@/components/Logo'
+import { api } from '@/lib/api'
 import { cn } from '@/lib/cn'
+
+type AuthMode = 'standalone' | 'multi_user'
+
+interface BootstrapState {
+  mode: AuthMode
+  configured: boolean
+}
 
 export function Auth() {
   const navigate = useNavigate()
+  const [bootstrap, setBootstrap] = useState<BootstrapState | null>(null)
+  const [registering, setRegistering] = useState(false)
+  const [email, setEmail] = useState('')
+  const [displayName, setDisplayName] = useState('')
   const [password, setPassword] = useState('')
-  const [confirmPassword, setConfirmPassword] = useState('')  // 仅设密码时用
-  const [showPwd, setShowPwd] = useState(false)
+  const [confirmPassword, setConfirmPassword] = useState('')
+  const [registrationCode, setRegistrationCode] = useState('')
+  const [showPassword, setShowPassword] = useState(false)
   const [localError, setLocalError] = useState('')
+  const referralCode = new URLSearchParams(window.location.search).get('ref') || ''
 
-  // 取认证状态(是否已设密码)
-  const [status, setStatus] = useState<{ configured: boolean } | null>(null)
   useEffect(() => {
-    api.authStatus().then(s => {
-      setStatus(s)
-      // 已登录的话直接进面板(避免登录页死循环)
-      if (s.authenticated) navigate('/', { replace: true })
-    }).catch(() => setStatus({ configured: false }))
+    let active = true
+    void api.authMode()
+      .then(async ({ mode }) => {
+        if (mode === 'multi_user') {
+          const status = await api.accountStatus()
+          if (!active) return
+          if (status.authenticated) {
+            navigateRedirect(navigate)
+            return
+          }
+          setBootstrap({ mode, configured: true })
+          return
+        }
+        const status = await api.authStatus()
+        if (!active) return
+        if (status.authenticated) {
+          navigateRedirect(navigate)
+          return
+        }
+        setBootstrap({ mode, configured: status.configured })
+      })
+      .catch((error: Error) => {
+        if (active) setLocalError(error.message || '无法获取认证状态')
+      })
+    return () => { active = false }
   }, [navigate])
 
-  const isSetup = !status?.configured  // configured=false → 设密码模式
+  const isMultiUser = bootstrap?.mode === 'multi_user'
+  const isStandaloneSetup = bootstrap?.mode === 'standalone' && !bootstrap.configured
 
-  // 登录 / 设密码 共用一个 mutation(按 isSetup 调不同接口)
-  const submitMut = useMutation({
+  const submitMutation = useMutation({
     mutationFn: async () => {
-      if (isSetup) {
-        return api.authSetup(password)
+      if (isMultiUser) {
+        return registering
+          ? api.accountRegister(email.trim(), password, displayName.trim(), referralCode, registrationCode.trim())
+          : api.accountLogin(email.trim(), password)
       }
-      return api.authLogin(password)
+      return isStandaloneSetup ? api.authSetup(password) : api.authLogin(password)
     },
-    onSuccess: () => {
-      // 成功: 跳回原页面(或首页)
-      const redirect = new URLSearchParams(window.location.search).get('redirect') || '/'
-      navigate(redirect, { replace: true })
-    },
-    onError: (err: any) => {
-      const msg = err?.message || (isSetup ? '设置失败' : '登录失败')
-      // 设密码/登录失败必须显示: 401(密码错)/403(公网设密码被拒)/429(限流) 都要提示
-      setLocalError(msg)
-    },
+    onSuccess: () => navigateRedirect(navigate),
+    onError: (error: Error) => setLocalError(error.message || '认证失败'),
   })
 
-  const handleSubmit = (e: FormEvent) => {
-    e.preventDefault()
+  const handleSubmit = (event: FormEvent) => {
+    event.preventDefault()
     setLocalError('')
-    if (isSetup) {
-      if (password.length < 6) { setLocalError('密码至少 6 位'); return }
-      if (password !== confirmPassword) { setLocalError('两次密码不一致'); return }
+    if (isMultiUser && !email.trim()) {
+      setLocalError('请输入邮箱')
+      return
     }
-    submitMut.mutate()
+    if (isMultiUser && registering && !displayName.trim()) {
+      setLocalError('请输入昵称')
+      return
+    }
+    const minimum = isMultiUser ? 8 : 6
+    if (password.length < minimum) {
+      setLocalError(`密码至少 ${minimum} 位`)
+      return
+    }
+    if ((registering || isStandaloneSetup) && password !== confirmPassword) {
+      setLocalError('两次输入的密码不一致')
+      return
+    }
+    submitMutation.mutate()
   }
 
-  if (!status) {
+  if (!bootstrap && !localError) {
     return (
       <div className="flex min-h-screen items-center justify-center bg-base">
         <Loader2 className="h-6 w-6 animate-spin text-muted" />
@@ -75,76 +103,109 @@ export function Auth() {
     )
   }
 
+  const title = isMultiUser
+    ? (registering ? '创建账号' : '登录晨风复盘工作台')
+    : (isStandaloneSetup ? '设置访问密码' : '登录访问')
+  const subtitle = isMultiUser
+    ? (registering ? '创建你的个人量化工作空间' : '使用邮箱和密码继续')
+    : (isStandaloneSetup ? '首次使用，请为面板设置访问密码' : '请输入访问密码以继续')
+
   return (
     <div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-base px-4">
-      {/* 背景辉光(与 Onboarding 风格一致) */}
       <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_30%_20%,rgba(139,92,246,0.15),transparent_40%),radial-gradient(circle_at_70%_80%,rgba(59,130,246,0.12),transparent_40%)]" />
-
       <motion.div
         initial={{ opacity: 0, y: 16 }}
         animate={{ opacity: 1, y: 0 }}
         transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
         className="relative w-full max-w-sm"
       >
-        {/* Logo */}
-        <div className="mb-6 flex flex-col items-center gap-2">
-          <Logo className="h-10 w-10" />
-          <h1 className="text-lg font-semibold text-foreground">Tick Stock Panel</h1>
+        <div className="mb-6 flex flex-col items-center">
+          <div className="grid h-14 w-14 place-items-center rounded-2xl border border-purple-400/20 bg-purple-500/10 shadow-[0_0_32px_rgba(139,92,246,0.16)]">
+            <Logo className="h-9 w-9 text-purple-400" />
+          </div>
+          <h1 className="mt-3 text-lg font-semibold tracking-[0.12em] text-foreground">晨风复盘工作台</h1>
+          <p className="mt-1 font-mono text-[9px] uppercase tracking-[0.24em] text-muted">Quant Terminal</p>
         </div>
 
         <div className="rounded-card border border-border bg-surface/90 p-6 shadow-2xl backdrop-blur">
-          {/* 标题区: 图标 + 文案随模式切换 */}
           <div className="mb-5 flex items-center gap-2.5">
             <div className={cn(
               'grid h-9 w-9 place-items-center rounded-lg',
-              isSetup ? 'bg-accent/15 text-accent' : 'bg-purple-500/15 text-purple-400',
+              registering || isStandaloneSetup
+                ? 'bg-accent/15 text-accent'
+                : 'bg-purple-500/15 text-purple-400',
             )}>
-              {isSetup ? <ShieldCheck className="h-5 w-5" /> : <Lock className="h-5 w-5" />}
+              {registering || isStandaloneSetup
+                ? <ShieldCheck className="h-5 w-5" />
+                : <Lock className="h-5 w-5" />}
             </div>
             <div>
-              <div className="text-sm font-medium text-foreground">
-                {isSetup ? '设置访问密码' : '登录访问'}
-              </div>
-              <div className="text-[11px] text-muted">
-                {isSetup ? '首次使用, 请为面板设置访问密码' : '请输入访问密码以继续'}
-              </div>
+              <div className="text-sm font-medium text-foreground">{title}</div>
+              <div className="text-[11px] text-muted">{subtitle}</div>
             </div>
           </div>
 
           <form onSubmit={handleSubmit} className="space-y-3">
-            {/* 密码输入 */}
+            {isMultiUser && (
+              <input
+                type="email"
+                value={email}
+                onChange={event => setEmail(event.target.value)}
+                placeholder="邮箱"
+                autoComplete="email"
+                autoFocus
+                className={inputClass}
+              />
+            )}
+            {isMultiUser && registering && (
+              <><input
+                value={displayName}
+                onChange={event => setDisplayName(event.target.value)}
+                placeholder="昵称（必填）"
+                autoComplete="name"
+                className={inputClass}
+              />{referralCode && <div className="rounded-btn bg-accent/10 px-3 py-2 text-xs text-accent">推荐码 {referralCode} 已应用。</div>}
+              <input
+                value={registrationCode}
+                onChange={event => setRegistrationCode(event.target.value.toUpperCase())}
+                placeholder="群内兑换码（必填）"
+                autoComplete="off"
+                className={inputClass}
+              />
+              <div className="text-[11px] leading-relaxed text-muted">新用户加入晨风复盘工作台飞书群，可免费领取注册码和积分兑换码。</div></>
+            )}
             <div className="relative">
               <input
-                type={showPwd ? 'text' : 'password'}
+                type={showPassword ? 'text' : 'password'}
                 value={password}
-                onChange={e => setPassword(e.target.value)}
-                placeholder="访问密码"
-                autoFocus
-                className="h-10 w-full rounded-btn border border-border bg-base px-3 pr-9 text-sm text-foreground outline-none transition-colors focus:border-accent/50"
+                onChange={event => setPassword(event.target.value)}
+                placeholder={isMultiUser ? '密码（至少 8 位）' : '访问密码'}
+                autoComplete={registering || isStandaloneSetup ? 'new-password' : 'current-password'}
+                autoFocus={!isMultiUser}
+                className={`${inputClass} pr-9`}
               />
               <button
                 type="button"
-                onClick={() => setShowPwd(s => !s)}
+                onClick={() => setShowPassword(value => !value)}
                 className="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-muted hover:text-foreground"
                 tabIndex={-1}
+                aria-label={showPassword ? '隐藏密码' : '显示密码'}
               >
-                {showPwd ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                {showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
               </button>
             </div>
-
-            {/* 确认密码(仅设密码模式) */}
-            {isSetup && (
+            {(registering || isStandaloneSetup) && (
               <input
-                type={showPwd ? 'text' : 'password'}
+                type={showPassword ? 'text' : 'password'}
                 value={confirmPassword}
-                onChange={e => setConfirmPassword(e.target.value)}
+                onChange={event => setConfirmPassword(event.target.value)}
                 placeholder="再次输入密码"
-                className="h-10 w-full rounded-btn border border-border bg-base px-3 text-sm text-foreground outline-none transition-colors focus:border-accent/50"
+                autoComplete="new-password"
+                className={inputClass}
               />
             )}
 
-            {/* 错误提示 */}
-            {(localError || submitMut.error) && (
+            {localError && (
               <div className="flex items-start gap-1.5 rounded-btn bg-danger/10 px-3 py-2 text-[11px] text-danger">
                 <ShieldAlert className="mt-px h-3.5 w-3.5 shrink-0" />
                 <span>{localError}</span>
@@ -153,43 +214,42 @@ export function Auth() {
 
             <button
               type="submit"
-              disabled={submitMut.isPending || !password}
+              disabled={submitMutation.isPending || !password || (isMultiUser && !email.trim())}
               className="inline-flex h-10 w-full items-center justify-center gap-1.5 rounded-btn bg-accent text-sm font-medium text-white transition-colors hover:bg-accent/90 disabled:opacity-50"
             >
-              {submitMut.isPending ? (
-                <><Loader2 className="h-4 w-4 animate-spin" />处理中…</>
-              ) : (
-                <>{isSetup ? '设置并进入' : '登录'}</>
-              )}
+              {submitMutation.isPending
+                ? <><Loader2 className="h-4 w-4 animate-spin" />处理中…</>
+                : (registering ? '注册并进入' : isStandaloneSetup ? '设置并进入' : '登录')}
             </button>
           </form>
 
-          {/* 提示: 设密码模式告知本机限制 */}
-          {isSetup && (
-            <div className="mt-3 space-y-1.5 text-[10px] leading-relaxed text-muted/70">
-              <p>
-                出于安全考虑, 首次设置密码需在服务器本机或内网访问时操作。公网环境下仅可登录。
-              </p>
-              <p>
-                详细配置说明见{' '}
-                <a
-                  href="https://github.com/shy3130/tickflow-stock-panel/blob/main/docs/deploy-password.md"
-                  target="_blank"
-                  rel="noreferrer"
-                  className="text-accent underline-offset-2 hover:underline"
-                >
-                  访问密码部署文档
-                </a>
-              </p>
-            </div>
+          {isMultiUser && (
+            <button
+              type="button"
+              onClick={() => {
+                setRegistering(value => !value)
+                setConfirmPassword('')
+                setLocalError('')
+              }}
+              className="mt-4 w-full text-center text-xs text-accent hover:underline"
+            >
+              {registering ? '已有账号？返回登录' : '没有账号？立即注册'}
+            </button>
           )}
         </div>
 
         <div className="mt-4 flex items-center justify-center gap-1.5 text-[10px] text-muted/60">
           <Sparkles className="h-3 w-3" />
-          自托管量化工作台 · 数据完全掌握在自己手里
+          行情全平台共享 · 用户数据独立保存
         </div>
       </motion.div>
     </div>
   )
+}
+
+const inputClass = 'h-10 w-full rounded-btn border border-border bg-base px-3 text-sm text-foreground outline-none transition-colors focus:border-accent/50'
+
+function navigateRedirect(navigate: ReturnType<typeof useNavigate>) {
+  const redirect = new URLSearchParams(window.location.search).get('redirect') || '/'
+  navigate(redirect, { replace: true })
 }

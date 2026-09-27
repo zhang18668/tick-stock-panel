@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import json
 import logging
 import math
@@ -20,6 +21,7 @@ from pydantic import BaseModel, Field
 
 from app.backtest.minute_trigger import MINUTE_EXIT_TRIGGER_SIGNALS
 from app.strategy import config as strategy_config
+from app.strategy.access import can_access_strategy
 from app.strategy.ai_generator import AIStrategyGenerator, find_meta_assignment
 from app.strategy.engine import StrategyDef, StrategyEngine
 from app.strategy.monitor import StrategyMonitorService
@@ -44,6 +46,58 @@ def _get_engine(request: Request) -> StrategyEngine:
     return engine
 
 
+def _is_user_request(request: Request) -> bool:
+    state = getattr(request, "state", None)
+    return getattr(state, "current_user", None) is not None
+
+
+def _can_access_strategy(request: Request, strategy: StrategyDef) -> bool:
+    state = getattr(request, "state", None)
+    accessible_ids = {
+        *getattr(state, "owned_strategy_ids", frozenset()),
+        *getattr(state, "installed_strategy_ids", frozenset()),
+    }
+    return can_access_strategy(
+        strategy,
+        getattr(state, "current_user", None),
+        accessible_ids,
+    )
+
+
+def _get_accessible_strategy(request: Request, strategy_id: str) -> StrategyDef:
+    engine = _get_engine(request)
+    try:
+        strategy = engine.get(strategy_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    if not _can_access_strategy(request, strategy):
+        raise HTTPException(status_code=404, detail=f"strategy {strategy_id} not found")
+    return strategy
+
+
+async def _persist_user_strategy(request: Request, result: dict) -> None:
+    current_user = getattr(request.state, "current_user", None)
+    if current_user is None:
+        return
+    from app.persistence.database import session_scope
+    from app.persistence.repositories.strategies import PostgresStrategyRepository
+
+    path = Path(result["path"])
+    code = path.read_text(encoding="utf-8")
+    strategy = _get_engine(request).get(result["strategy_id"])
+    async with session_scope() as session:
+        await PostgresStrategyRepository(session).save(
+            current_user.id,
+            result["strategy_id"],
+            result["source"],
+            code,
+            dict(strategy.meta),
+        )
+    request.state.owned_strategy_ids = frozenset(
+        {*getattr(request.state, "owned_strategy_ids", frozenset()), result["strategy_id"]}
+    )
+
+
 def _get_public_strategy(engine: StrategyEngine, strategy_id: str) -> StrategyDef:
     try:
         strategy = engine.get(strategy_id)
@@ -63,6 +117,18 @@ def _get_monitor(request: Request) -> StrategyMonitorService:
 
 def _data_dir(request: Request) -> Path:
     return request.app.state.repo.store.data_dir
+
+
+def _all_overrides(request: Request) -> dict[str, dict]:
+    if _is_user_request(request):
+        return getattr(request.state, "strategy_overrides", {})
+    return strategy_config.list_overrides(_data_dir(request))
+
+
+def _load_override(request: Request, strategy_id: str) -> dict:
+    if _is_user_request(request):
+        return dict(_all_overrides(request).get(strategy_id, {}))
+    return strategy_config.load_override(_data_dir(request), strategy_id)
 
 
 def _invalidate_strategy_runtime(request: Request) -> None:
@@ -99,7 +165,8 @@ def _cleanup_deleted_strategy(request: Request, strategy_id: str) -> list[str]:
     warnings: list[str] = []
 
     try:
-        strategy_config.delete_override(data_dir, strategy_id)
+        if not _is_user_request(request):
+            strategy_config.delete_override(data_dir, strategy_id)
     except Exception as e:
         warnings.append(f"覆盖配置清理失败: {e}")
 
@@ -311,6 +378,174 @@ class MonitorStartRequest(BaseModel):
     strategy_id: str
 
 
+class StrategyPoolRequest(BaseModel):
+    strategy_ids: list[str]
+
+
+class StrategyPublishRequest(BaseModel):
+    strategy_id: str
+    title: str = ""
+    description: str = ""
+    points_price: int
+    sale_points_price: int | None = None
+    sale_label: str = ""
+
+
+@router.get("/marketplace/listings")
+async def marketplace_list(request: Request):
+    current_user = getattr(request.state, "current_user", None)
+    if current_user is None:
+        return {"listings": []}
+    from app.persistence.database import session_scope
+    from app.persistence.repositories.strategy_marketplace import (
+        PostgresStrategyMarketplaceRepository,
+    )
+
+    async with session_scope() as session:
+        repo = PostgresStrategyMarketplaceRepository(session)
+        listings = await repo.list_published()
+        purchased = await repo.purchased_ids(current_user.id)
+        installed = await repo.installed_ids(current_user.id)
+    return {"listings": [{
+        "strategy_id": item.strategy_id, "title": item.title,
+        "description": item.description, "points_price": item.points_price,
+        "sale_points_price": item.sale_points_price, "sale_label": item.sale_label,
+        "purchased": item.strategy_id in purchased,
+        "installed": item.strategy_id in installed,
+    } for item in listings]}
+
+
+@router.put("/marketplace/listings")
+async def marketplace_publish(req: StrategyPublishRequest, request: Request):
+    current_user = getattr(request.state, "current_user", None)
+    if current_user is None or not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="administrator access required")
+    if req.points_price < 0:
+        raise HTTPException(status_code=400, detail="价格不能为负数")
+    if req.sale_points_price is not None and req.sale_points_price < 0:
+        raise HTTPException(status_code=400, detail="活动价不能为负数")
+    if req.sale_points_price is not None and req.sale_points_price >= req.points_price:
+        raise HTTPException(status_code=400, detail="活动价必须低于原价")
+    strategy = _get_engine(request).get(req.strategy_id)
+    from app.persistence.database import session_scope
+    from app.persistence.repositories.strategy_marketplace import (
+        PostgresStrategyMarketplaceRepository,
+    )
+    async with session_scope() as session:
+        item = await PostgresStrategyMarketplaceRepository(session).publish(
+            req.strategy_id, req.title or strategy.meta.get("name", req.strategy_id),
+            req.description or strategy.meta.get("description", ""), req.points_price,
+            req.sale_points_price, req.sale_label.strip() or None,
+        )
+    return {"ok": True, "strategy_id": item.strategy_id}
+
+
+@router.post("/marketplace/{strategy_id}/purchase")
+async def marketplace_purchase(strategy_id: str, request: Request):
+    current_user = getattr(request.state, "current_user", None)
+    if current_user is None:
+        raise HTTPException(status_code=401, detail="not authenticated")
+    from app.persistence.database import session_scope
+    from app.persistence.repositories.credits import (
+        InsufficientCreditsError,
+        PostgresCreditRepository,
+    )
+    from app.persistence.repositories.strategy_marketplace import (
+        PostgresStrategyMarketplaceRepository,
+    )
+    async with session_scope() as session:
+        repo = PostgresStrategyMarketplaceRepository(session)
+        listing = await repo.get(strategy_id, lock=True)
+        if listing is None or listing.status != "published":
+            raise HTTPException(status_code=404, detail="策略未上架")
+        if strategy_id in await repo.purchased_ids(current_user.id):
+            return {"ok": True, "already_purchased": True}
+        effective_price = listing.sale_points_price if listing.sale_points_price is not None else listing.points_price
+        try:
+            if effective_price > 0:
+                await PostgresCreditRepository(session).spend(
+                    current_user.id, effective_price * 100,
+                    f"strategy:{current_user.id}:{strategy_id}", f"兑换策略 {listing.title}",
+                )
+        except InsufficientCreditsError as exc:
+            raise HTTPException(status_code=409, detail="积分不足") from exc
+        await repo.record_purchase(current_user.id, strategy_id, effective_price)
+    request.state.purchased_strategy_ids = frozenset({*getattr(request.state, "purchased_strategy_ids", ()), strategy_id})
+    return {"ok": True, "already_purchased": False}
+
+
+@router.put("/marketplace/{strategy_id}/installation")
+async def marketplace_install(strategy_id: str, request: Request):
+    current_user = getattr(request.state, "current_user", None)
+    if current_user is None:
+        raise HTTPException(status_code=401, detail="not authenticated")
+    from app.persistence.database import session_scope
+    from app.persistence.repositories.strategy_marketplace import (
+        PostgresStrategyMarketplaceRepository,
+    )
+    async with session_scope() as session:
+        repo = PostgresStrategyMarketplaceRepository(session)
+        if strategy_id not in await repo.purchased_ids(current_user.id):
+            raise HTTPException(status_code=403, detail="请先购买或兑换该策略")
+        await repo.install(current_user.id, strategy_id)
+    request.state.installed_strategy_ids = frozenset({*getattr(request.state, "installed_strategy_ids", ()), strategy_id})
+    return {"ok": True}
+
+
+@router.delete("/marketplace/{strategy_id}/installation")
+async def marketplace_uninstall(strategy_id: str, request: Request):
+    current_user = getattr(request.state, "current_user", None)
+    if current_user is None:
+        raise HTTPException(status_code=401, detail="not authenticated")
+    from app.persistence.database import session_scope
+    from app.persistence.repositories.strategy_marketplace import (
+        PostgresStrategyMarketplaceRepository,
+    )
+    async with session_scope() as session:
+        await PostgresStrategyMarketplaceRepository(session).uninstall(current_user.id, strategy_id)
+    request.state.installed_strategy_ids = frozenset(
+        sid for sid in getattr(request.state, "installed_strategy_ids", ()) if sid != strategy_id
+    )
+    return {"ok": True}
+
+
+@router.get("/pool/selection")
+def get_strategy_pool(request: Request):
+    """Return the current account's ordered screener strategy selection."""
+    from app.services import preferences
+
+    raw = preferences.load().get("strategy_pool", [])
+    strategy_ids = raw if isinstance(raw, list) else []
+    engine = _get_engine(request)
+    accessible = {
+        meta["id"]
+        for meta in engine.list_strategies()
+        if _can_access_strategy(request, engine.get(meta["id"]))
+    }
+    return {"strategy_ids": [sid for sid in strategy_ids if sid in accessible]}
+
+
+@router.put("/pool/selection")
+def save_strategy_pool(req: StrategyPoolRequest, request: Request):
+    """Persist an ordered strategy selection in the request's account context."""
+    from app.services import preferences
+
+    engine = _get_engine(request)
+    normalized: list[str] = []
+    for sid in req.strategy_ids:
+        if sid in normalized:
+            continue
+        try:
+            strategy = engine.get(sid)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f"策略不存在: {sid}") from exc
+        if not _can_access_strategy(request, strategy):
+            raise HTTPException(status_code=403, detail=f"无权使用策略: {sid}")
+        normalized.append(sid)
+    preferences.save({"strategy_pool": normalized})
+    return {"strategy_ids": normalized}
+
+
 # ── 列表 / 详情 ─────────────────────────────────────────────────────
 
 
@@ -322,8 +557,7 @@ def list_strategies(
     include_research: bool = False,
 ):
     engine = _get_engine(request)
-    data_dir = _data_dir(request)
-    all_overrides = strategy_config.list_overrides(data_dir)
+    all_overrides = _all_overrides(request)
 
     result = []
     # include_research=True 时返回 research_only 草稿(供前端「草稿」分区展示/发布)。
@@ -337,6 +571,8 @@ def list_strategies(
             continue
         sid = meta["id"]
         s = engine.get(sid)
+        if not _can_access_strategy(request, s):
+            continue
         overrides = all_overrides.get(sid)
         result.append(_strategy_detail(s, overrides, engine))
     return {"strategies": result, "load_errors": engine.load_errors()}
@@ -360,7 +596,7 @@ def run_strategy(req: RunRequest, request: Request):
     data_dir = _data_dir(request)
 
     # 读取用户覆盖配置
-    overrides = strategy_config.load_override(data_dir, req.strategy_id)
+    overrides = _load_override(request, req.strategy_id)
     params = req.params or {}
     # 合并用户保存的策略参数
     if overrides.get("params"):
@@ -404,7 +640,6 @@ def run_strategy(req: RunRequest, request: Request):
 @router.post("/run-all")
 def run_all(req: RunAllRequest, request: Request):
     engine = _get_engine(request)
-    data_dir = _data_dir(request)
 
     as_of = req.as_of
     if not as_of:
@@ -414,7 +649,7 @@ def run_all(req: RunAllRequest, request: Request):
     if not as_of:
         return {"as_of": None, "results": {}}
 
-    all_overrides = strategy_config.list_overrides(data_dir)
+    all_overrides = _all_overrides(request)
     strategy_ids = [
         meta["id"]
         for meta in engine.list_strategies()
@@ -452,7 +687,7 @@ def run_all(req: RunAllRequest, request: Request):
 
 
 @router.post("/config")
-def save_config(req: SaveConfigRequest, request: Request):
+async def _save_config_route(req: SaveConfigRequest, request: Request):
     engine = _get_engine(request)
     _get_public_strategy(engine, req.strategy_id)
 
@@ -460,23 +695,50 @@ def save_config(req: SaveConfigRequest, request: Request):
     # 剥离与策略默认值相同的字段，只保存用户真正修改过的值
     overrides = _strip_defaults(req.strategy_id, req.overrides, engine)
 
-    strategy_config.save_override(_data_dir(request), req.strategy_id, overrides)
+    current_user = getattr(request.state, "current_user", None)
+    if current_user is None:
+        strategy_config.save_override(_data_dir(request), req.strategy_id, overrides)
+    else:
+        from app.persistence.database import session_scope
+        from app.persistence.repositories.strategies import PostgresStrategyRepository
+
+        async with session_scope() as session:
+            await PostgresStrategyRepository(session).save_config(
+                current_user.id, req.strategy_id, overrides
+            )
+        request.state.strategy_overrides = {
+            **_all_overrides(request),
+            req.strategy_id: overrides,
+        }
     return {"ok": True}
 
 
 @router.patch("/config")
-def patch_config(req: SaveConfigRequest, request: Request):
+async def _patch_config_route(req: SaveConfigRequest, request: Request):
     engine = _get_engine(request)
     _get_public_strategy(engine, req.strategy_id)
-    data_dir = _data_dir(request)
-    overrides = strategy_config.load_override(data_dir, req.strategy_id)
+    current_user = getattr(getattr(request, "state", None), "current_user", None)
+    if current_user is None:
+        overrides = strategy_config.load_override(_data_dir(request), req.strategy_id)
+    else:
+        overrides = dict(_all_overrides(request).get(req.strategy_id, {}))
     overrides.update(req.overrides)
     _validate_scoring_config(overrides)
-    strategy_config.save_override(
-        data_dir,
-        req.strategy_id,
-        _strip_defaults(req.strategy_id, overrides, engine),
-    )
+    overrides = _strip_defaults(req.strategy_id, overrides, engine)
+    if current_user is None:
+        strategy_config.save_override(_data_dir(request), req.strategy_id, overrides)
+    else:
+        from app.persistence.database import session_scope
+        from app.persistence.repositories.strategies import PostgresStrategyRepository
+
+        async with session_scope() as session:
+            await PostgresStrategyRepository(session).save_config(
+                current_user.id, req.strategy_id, overrides
+            )
+        request.state.strategy_overrides = {
+            **_all_overrides(request),
+            req.strategy_id: overrides,
+        }
     return {"ok": True}
 
 
@@ -530,10 +792,37 @@ def _strip_defaults(strategy_id: str, overrides: dict, engine) -> dict:
 
 
 @router.delete("/config/{strategy_id}")
-def reset_config(strategy_id: str, request: Request):
+async def _reset_config_route(strategy_id: str, request: Request):
     _get_public_strategy(_get_engine(request), strategy_id)
-    strategy_config.delete_override(_data_dir(request), strategy_id)
+    current_user = getattr(getattr(request, "state", None), "current_user", None)
+    if current_user is None:
+        strategy_config.delete_override(_data_dir(request), strategy_id)
+    else:
+        from app.persistence.database import session_scope
+        from app.persistence.repositories.strategies import PostgresStrategyRepository
+
+        async with session_scope() as session:
+            await PostgresStrategyRepository(session).delete_config(
+                current_user.id, strategy_id
+            )
+        request.state.strategy_overrides = {
+            sid: value
+            for sid, value in _all_overrides(request).items()
+            if sid != strategy_id
+        }
     return {"ok": True}
+
+
+def save_config(req: SaveConfigRequest, request: Request):
+    return asyncio.run(_save_config_route(req, request))
+
+
+def patch_config(req: SaveConfigRequest, request: Request):
+    return asyncio.run(_patch_config_route(req, request))
+
+
+def reset_config(strategy_id: str, request: Request):
+    return asyncio.run(_reset_config_route(strategy_id, request))
 
 
 # ── AI 生成 ───────────────────────────────────────────────────────────
@@ -746,6 +1035,13 @@ def _save_strategy_code(req: StrategyCodeSaveRequest, request: Request, *, legac
         existing = engine.get(sid)
     except ValueError:
         existing = None
+    if existing is not None and not _can_access_strategy(request, existing):
+        raise ValueError(f"strategy {sid} not found")
+
+    if _is_user_request(request) and existing is None:
+        limit = int(getattr(request.state, "entitlements", {}).get("max_strategies", 3))
+        if len(getattr(request.state, "owned_strategy_ids", frozenset())) >= limit:
+            raise ValueError(f"strategy limit reached ({limit})")
 
     if not legacy_ai_path and req.mode == "create":
         if req.target_source == "ai" and not sid.startswith("ai_"):
@@ -1007,9 +1303,11 @@ def validate_strategy_code(req: StrategyCodeValidateRequest, request: Request):
 
 
 @router.post("/code/save")
-def save_strategy_code(req: StrategyCodeSaveRequest, request: Request):
+async def save_strategy_code(req: StrategyCodeSaveRequest, request: Request):
     try:
-        return _save_strategy_code(req, request)
+        result = _save_strategy_code(req, request)
+        await _persist_user_strategy(request, result)
+        return result
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
@@ -1074,6 +1372,14 @@ def _save_composite_strategy(req: StrategyCompositeSaveRequest, request: Request
     except ValueError:
         existing = None
 
+    if existing is not None and not _can_access_strategy(request, existing):
+        raise ValueError(f"strategy {sid} not found")
+
+    if _is_user_request(request) and existing is None:
+        limit = int(getattr(request.state, "entitlements", {}).get("max_strategies", 3))
+        if len(getattr(request.state, "owned_strategy_ids", frozenset())) >= limit:
+            raise ValueError(f"strategy limit reached ({limit})")
+
     if req.mode == "create":
         if existing is not None:
             raise ValueError(f"策略 {sid} 已存在，请改用修改模式或换一个策略 ID")
@@ -1134,9 +1440,11 @@ def _save_composite_strategy(req: StrategyCompositeSaveRequest, request: Request
 
 
 @router.post("/composite/save")
-def save_composite_strategy(req: StrategyCompositeSaveRequest, request: Request):
+async def save_composite_strategy(req: StrategyCompositeSaveRequest, request: Request):
     try:
-        return _save_composite_strategy(req, request)
+        result = _save_composite_strategy(req, request)
+        await _persist_user_strategy(request, result)
+        return result
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
@@ -1154,6 +1462,7 @@ async def ai_save(req: AISaveRequest, request: Request):
             strict=True,
         )
         result = _save_strategy_code(save_req, request, legacy_ai_path=True)
+        await _persist_user_strategy(request, result)
         return {"ok": True, "path": result["path"]}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
@@ -1203,10 +1512,7 @@ def delete_strategy(strategy_id: str, request: Request):
     """删除自定义策略 — 清除源文件、运行时注册和关联状态。内置策略不可删除。"""
 
     engine = _get_engine(request)
-    try:
-        s = engine.get(strategy_id)
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=f"策略 {strategy_id} 不存在") from e
+    s = _get_accessible_strategy(request, strategy_id)
 
     if s.source == "builtin":
         raise HTTPException(status_code=403, detail="内置策略不可删除")
@@ -1248,6 +1554,30 @@ def delete_strategy(strategy_id: str, request: Request):
     engine.unregister(strategy_id)
     warnings = _cleanup_deleted_strategy(request, strategy_id)
     return {"ok": True, "warnings": warnings}
+
+
+@router.delete("/{strategy_id}")
+async def delete_strategy_route(strategy_id: str, request: Request):
+    result = delete_strategy(strategy_id, request)
+    current_user = getattr(request.state, "current_user", None)
+    if current_user is not None:
+        from app.persistence.database import session_scope
+        from app.persistence.repositories.monitoring import PostgresMonitoringRepository
+        from app.persistence.repositories.strategies import PostgresStrategyRepository
+
+        async with session_scope() as session:
+            repository = PostgresStrategyRepository(session)
+            await repository.delete(current_user.id, strategy_id)
+            await repository.delete_config(current_user.id, strategy_id)
+            monitoring = PostgresMonitoringRepository(session)
+            for rule in await monitoring.list_rules(current_user.id):
+                if rule.get("strategy_id") == strategy_id:
+                    await monitoring.delete_rule(current_user.id, str(rule["id"]))
+            runtime_rules = await monitoring.list_all_rules()
+        monitor_engine = getattr(request.app.state, "monitor_engine", None)
+        if monitor_engine is not None:
+            monitor_engine.set_rules(runtime_rules)
+    return result
 
 
 # ── 监控 ─────────────────────────────────────────────────────────────
