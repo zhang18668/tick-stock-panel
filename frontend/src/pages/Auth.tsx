@@ -5,6 +5,7 @@ import { Eye, EyeOff, Loader2, Lock, ShieldAlert, ShieldCheck, Sparkles } from '
 import { useNavigate } from 'react-router-dom'
 
 import { Logo } from '@/components/Logo'
+import feishuGroup from '@/assets/feishu-group.png'
 import { api } from '@/lib/api'
 import { cn } from '@/lib/cn'
 
@@ -111,7 +112,7 @@ export function Auth() {
     : (isStandaloneSetup ? '首次使用，请为面板设置访问密码' : '请输入访问密码以继续')
 
   return (
-    <div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-base px-4">
+    <div className="relative flex min-h-screen items-center justify-center overflow-x-hidden bg-base px-4 py-6">
       <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_30%_20%,rgba(139,92,246,0.15),transparent_40%),radial-gradient(circle_at_70%_80%,rgba(59,130,246,0.12),transparent_40%)]" />
       <motion.div
         initial={{ opacity: 0, y: 16 }}
@@ -165,6 +166,24 @@ export function Auth() {
                 autoComplete="name"
                 className={inputClass}
               />{referralCode && <div className="rounded-btn bg-accent/10 px-3 py-2 text-xs text-accent">推荐码 {referralCode} 已应用。</div>}
+              <details className="group rounded-btn border border-accent/30 bg-accent/5 px-3 py-2.5">
+                <summary className="cursor-pointer list-none text-xs font-medium text-accent marker:content-none">
+                  还没有兑换码？先扫码加入飞书群
+                  <span className="float-right transition-transform group-open:rotate-180">⌄</span>
+                </summary>
+                <div className="pt-3 text-center">
+                  <img
+                    src={feishuGroup}
+                    alt="晨风复盘工作台飞书群二维码"
+                    className="mx-auto w-full max-w-[220px] rounded-btn bg-white object-contain p-2"
+                  />
+                  <ol className="mt-3 space-y-1 text-left text-[11px] leading-relaxed text-muted">
+                    <li>1. 使用飞书扫描上方二维码加入群聊</li>
+                    <li>2. 进群后领取注册兑换码</li>
+                    <li>3. 返回此页，将兑换码填入下方输入框</li>
+                  </ol>
+                </div>
+              </details>
               <input
                 value={registrationCode}
                 onChange={event => setRegistrationCode(event.target.value.toUpperCase())}
@@ -172,7 +191,7 @@ export function Auth() {
                 autoComplete="off"
                 className={inputClass}
               />
-              <div className="text-[11px] leading-relaxed text-muted">新用户加入晨风复盘工作台飞书群，可免费领取注册码和积分兑换码。</div></>
+              <div className="text-[11px] leading-relaxed text-muted">注册码需先加入飞书群领取；注册成功后还可在群内领取积分兑换码。</div></>
             )}
             <div className="relative">
               <input
