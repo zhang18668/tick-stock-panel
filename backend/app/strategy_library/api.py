@@ -146,7 +146,12 @@ def build_router() -> APIRouter:
             }
         try:
             manager = await _manager_for_request(request)
-            task = manager.start(_user_scope(request), strategy_ids, configs)
+            task = await asyncio.to_thread(
+                manager.start,
+                _user_scope(request),
+                strategy_ids,
+                configs,
+            )
         except StrategyLibraryTaskConflict as exc:
             raise HTTPException(409, detail={"code": "job_already_running", "message": str(exc)}) from exc
         except ValueError as exc:
@@ -165,7 +170,11 @@ def build_router() -> APIRouter:
     async def cancel_job(task_id: str, request: Request):
         manager = await _manager_for_request(request)
         try:
-            accepted = manager.cancel(_user_scope(request), task_id)
+            accepted = await asyncio.to_thread(
+                manager.cancel,
+                _user_scope(request),
+                task_id,
+            )
         except KeyError as exc:
             raise HTTPException(404, detail="strategy library task not found") from exc
         task = manager.get_task(_user_scope(request), task_id)
@@ -179,7 +188,12 @@ def build_router() -> APIRouter:
             if payload.items is not None else None
         )
         try:
-            task = manager.retry_failed(_user_scope(request), task_id, items)
+            task = await asyncio.to_thread(
+                manager.retry_failed,
+                _user_scope(request),
+                task_id,
+                items,
+            )
         except KeyError as exc:
             raise HTTPException(404, detail="strategy library task not found") from exc
         except StrategyLibraryTaskConflict as exc:
@@ -222,11 +236,19 @@ def _earliest_daily_date(repo) -> date | None:
 
 async def _manager_for_request(request: Request) -> StrategyLibraryManager:
     managers = getattr(request.app.state, "strategy_library_managers", None)
-    if managers is None:
-        managers = {}
-        request.app.state.strategy_library_managers = managers
+    manager_locks = getattr(request.app.state, "strategy_library_manager_locks", None)
+    with _MANAGERS_LOCK:
+        if managers is None:
+            managers = {}
+            request.app.state.strategy_library_managers = managers
+        if manager_locks is None:
+            manager_locks = {}
+            request.app.state.strategy_library_manager_locks = manager_locks
     scope = _user_scope(request)
     with _MANAGERS_LOCK:
+        manager_lock = manager_locks.setdefault(scope, asyncio.Lock())
+
+    async with manager_lock:
         existing = managers.get(scope)
         if existing is not None:
             return existing
@@ -273,7 +295,8 @@ async def _manager_for_request(request: Request) -> StrategyLibraryManager:
 
         # Job creation validates and passes the request's accessible strategy IDs directly.
         # Do not retain Request (and its per-request auth state) in a background manager.
-        manager = StrategyLibraryManager(
+        manager = await asyncio.to_thread(
+            StrategyLibraryManager,
             runner=runner,
             store=store,
             strategy_ids=lambda: [],

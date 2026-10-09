@@ -1,15 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import uuid4
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.strategy.engine import StrategyDef
-from app.strategy_library.api import build_router
-from app.strategy_library.api import _resolve_window
+from app.strategy_library.api import _resolve_window, build_router
 from app.strategy_library.contracts import BacktestPeriod, BacktestWindow
 from app.strategy_library.manager import StrategyLibraryManager
 
@@ -65,7 +66,7 @@ class FakeRepo:
         return []
 
 
-def _client(*, user_id="alice", owned_ids=frozenset()):
+def _client(*, user_id="alice", owned_ids=frozenset(), raise_server_exceptions=True):
     import app.strategy_library.api as library_api
 
     app = FastAPI()
@@ -82,7 +83,7 @@ def _client(*, user_id="alice", owned_ids=frozenset()):
     app.state.strategy_engine = FakeEngine()
     app.state.repo = FakeRepo()
     app.include_router(build_router())
-    return TestClient(app), library_api, app
+    return TestClient(app, raise_server_exceptions=raise_server_exceptions), library_api, app
 
 
 def test_library_endpoint_returns_strategy_rules_and_execution_details():
@@ -107,6 +108,71 @@ def test_job_rejects_unknown_strategy_with_structured_error():
 
     assert response.status_code == 422
     assert response.json()["detail"]["code"] == "invalid_strategy_id"
+
+
+def test_start_job_persists_without_blocking_the_request_event_loop(monkeypatch):
+    client, library_api, _ = _client(
+        user_id=str(uuid4()),
+        raise_server_exceptions=False,
+    )
+    monkeypatch.setattr(library_api.settings, "app_mode", "multi_user")
+    monkeypatch.setattr(library_api.preferences, "load", lambda: {})
+
+    def loop_backed_persister(loop, _user_id):
+        async def apply(_updates):
+            await asyncio.sleep(0)
+
+        def persist(updates):
+            asyncio.run_coroutine_threadsafe(apply(updates), loop).result(timeout=0.2)
+
+        return persist
+
+    monkeypatch.setattr(library_api, "_user_settings_persister", loop_backed_persister)
+    monkeypatch.setattr(StrategyLibraryManager, "_start_thread", lambda *_args: None)
+
+    response = client.post("/api/strategy-library/jobs", json={"strategy_ids": ["demo"]})
+
+    assert response.status_code == 202
+    assert response.json()["state"] == "queued"
+
+
+def test_loading_an_interrupted_task_persists_without_blocking_the_event_loop(monkeypatch):
+    user_id = str(uuid4())
+    client, library_api, _ = _client(user_id=user_id, raise_server_exceptions=False)
+    monkeypatch.setattr(library_api.settings, "app_mode", "multi_user")
+    monkeypatch.setattr(library_api.preferences, "load", lambda: stored_preferences)
+
+    def loop_backed_persister(loop, _user_id):
+        async def apply(_updates):
+            await asyncio.sleep(0)
+
+        def persist(updates):
+            asyncio.run_coroutine_threadsafe(apply(updates), loop).result(timeout=0.2)
+
+        return persist
+
+    monkeypatch.setattr(library_api, "_user_settings_persister", loop_backed_persister)
+    monkeypatch.setattr(StrategyLibraryManager, "_start_thread", lambda *_args: None)
+
+    saved_tasks = []
+    persisted_store = SimpleNamespace(
+        get_tasks=lambda: [],
+        save_task=saved_tasks.append,
+        save_result=lambda *_args: None,
+    )
+    original_manager = StrategyLibraryManager(
+        runner=lambda *_args: {"stats": {"total_return": 0.1}},
+        store=persisted_store,
+        strategy_ids=lambda: ["demo"],
+        latest_trading_day=lambda: date(2026, 10, 8),
+    )
+    stale_task = original_manager.start(user_id, ["demo"])
+    stored_preferences = {"strategy_library_tasks": {stale_task.id: stale_task.to_dict()}}
+
+    response = client.get(f"/api/strategy-library/jobs/{stale_task.id}")
+
+    assert response.status_code == 200
+    assert response.json()["state"] == "interrupted"
 
 
 def test_user_cannot_read_or_cancel_another_users_task():
@@ -158,9 +224,14 @@ def test_minute_coverage_query_failure_returns_unavailable(monkeypatch):
     engine.strategy.execution_backend = "minute_filter"
 
     class Repo:
-        earliest_minute_date = lambda self: date(2026, 1, 1)
-        latest_minute_date_global = lambda self: date(2026, 10, 8)
-        list_minute_dates = lambda self, *_args: []
+        def earliest_minute_date(self):
+            return date(2026, 1, 1)
+
+        def latest_minute_date_global(self):
+            return date(2026, 10, 8)
+
+        def list_minute_dates(self, *_args):
+            return []
 
         def execute_all(self, *_args):
             raise RuntimeError("storage unavailable")
