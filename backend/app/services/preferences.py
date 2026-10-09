@@ -26,6 +26,7 @@ _USER_PREFERENCE_KEYS = {
     "realtime_pull_stock", "realtime_pull_etf", "realtime_pull_index",
     "realtime_index_mode", "realtime_index_symbols", "realtime_watchlist_symbols",
     "watchlist_entries", "watchlist_groups",
+    "strategy_library_groups", "strategy_library_results", "strategy_library_tasks",
 }
 
 # 进程内缓存: 行情轮询线程一轮会调用 8~12 次 getter, 每次读盘+parse 是纯重复;

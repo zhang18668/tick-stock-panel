@@ -431,6 +431,9 @@ class StrategyEngine:
                     pass
 
         meta = dict(getattr(mod, "META", {}) or {})
+        module_rules = getattr(mod, "RULES", None)
+        if "rules" not in meta and "RULES" not in meta and isinstance(module_rules, (list, tuple)):
+            meta["rules"] = module_rules
         meta.setdefault("id", path.stem)
         meta.setdefault("name", path.stem)
         meta.setdefault("description", "")

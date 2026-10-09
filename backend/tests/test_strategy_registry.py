@@ -132,3 +132,18 @@ def test_legacy_alerts_global_is_ignored(tmp_path):
 
     assert engine.has("legacy_alerts")
     assert not hasattr(engine.get("legacy_alerts"), "alerts")
+
+
+def test_top_level_rules_metadata_is_exposed_in_strategy_details(tmp_path):
+    from app.api.strategy import _strategy_detail
+
+    path = tmp_path / "documented.py"
+    path.write_text(
+        _strategy_code("documented") + '\nRULES = ["收盘突破 20 日高点", "成交量高于 5 日均量"]\n',
+        encoding="utf-8",
+    )
+    engine = StrategyEngine(strategy_dirs=[tmp_path])
+
+    detail = _strategy_detail(engine.get("documented"))
+
+    assert detail["rules"] == ["收盘突破 20 日高点", "成交量高于 5 日均量"]

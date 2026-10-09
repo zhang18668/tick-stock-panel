@@ -249,11 +249,42 @@ def _strategy_detail(
     # 名称/描述可被用户覆盖
     name = overrides.get("name", s.meta.get("name", "")) if overrides else s.meta.get("name", "")
     description = overrides.get("description", s.meta.get("description", "")) if overrides else s.meta.get("description", "")
+    declared_rules = s.meta.get("rules", s.meta.get("RULES", []))
+    if not isinstance(declared_rules, (list, tuple)):
+        declared_rules = []
+
+    execution = {
+        "backend": s.execution_backend,
+        "asset_types": s.meta.get("asset_types", ["stock"]),
+        "timeframes": s.meta.get("timeframes", ["1d"]),
+        "entry_signals": overrides.get("entry_signals", s.entry_signals) if overrides else s.entry_signals,
+        "exit_signals": overrides.get("exit_signals", s.exit_signals) if overrides else s.exit_signals,
+        "matching": s.meta.get("matching"),
+        "entry_fill": s.meta.get("entry_fill"),
+        "exit_fill": s.meta.get("exit_fill"),
+        "minute_fill": bool(
+            s.meta.get("minute_fill")
+            or s.meta.get("requires_minute_execution")
+            or s.execution_backend == "minute_filter"
+        ),
+        "stop_loss": overrides.get("stop_loss", s.stop_loss) if overrides else s.stop_loss,
+        "take_profit": overrides.get("take_profit", s.take_profit) if overrides else s.take_profit,
+        "trailing_stop": overrides.get("trailing_stop", s.trailing_stop) if overrides else s.trailing_stop,
+        "trailing_take_profit_activate": overrides.get(
+            "trailing_take_profit_activate", s.trailing_take_profit_activate
+        ) if overrides else s.trailing_take_profit_activate,
+        "trailing_take_profit_drawdown": overrides.get(
+            "trailing_take_profit_drawdown", s.trailing_take_profit_drawdown
+        ) if overrides else s.trailing_take_profit_drawdown,
+        "max_hold_days": overrides.get("max_hold_days", s.max_hold_days) if overrides else s.max_hold_days,
+    }
 
     return {
         "id": s.meta["id"],
         "name": name or s.meta.get("name", ""),
         "description": description or s.meta.get("description", ""),
+        "rules": _safe_strategy_metadata(list(declared_rules)),
+        "execution": _safe_strategy_metadata(execution),
         "tags": s.meta.get("tags", []),
         "source": s.source,
         "research_only": s.meta.get("research_only", False),
@@ -297,6 +328,23 @@ def _strategy_detail(
             else None
         ),
     }
+
+
+def _safe_strategy_metadata(value: Any) -> Any:
+    """Keep optional strategy metadata JSON-safe without failing the list endpoint."""
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, (list, tuple)):
+        return [_safe_strategy_metadata(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            str(key): _safe_strategy_metadata(item)
+            for key, item in value.items()
+            if isinstance(key, (str, int, float, bool))
+        }
+    return None
 
 
 # ── Request Models ───────────────────────────────────────────────────
