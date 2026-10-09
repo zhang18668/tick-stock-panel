@@ -146,6 +146,10 @@ def make_worker_task(kind: str, data_dir: Path, config) -> dict[str, Any]:
         if not isinstance(config, dict):
             raise TypeError("mining worker config must be a dict")
         encoded = dict(config)
+    elif kind == "strategy_optimizer":
+        if not isinstance(config, dict):
+            raise TypeError("strategy optimizer worker config must be a dict")
+        encoded = dict(config)
     else:
         raise ValueError(f"unsupported worker task kind: {kind}")
     return {
@@ -238,6 +242,11 @@ def _worker_entry(task: dict[str, Any], event_queue, cancel_event) -> None:
                 cancel_check=cancel_event,
                 rss_sampler=sampler,
             )
+        elif kind == "strategy_optimizer":
+            from app.strategy_optimizer.gateway import StrategyOptimizationGateway
+
+            gateway = StrategyOptimizationGateway(service, strategy_engine, repository=repo)
+            result = gateway.run_optimization(task["config"], _progress, cancel_event)
         else:
             raise ValueError(f"unsupported worker task kind: {kind}")
 

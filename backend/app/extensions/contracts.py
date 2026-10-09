@@ -1,4 +1,5 @@
 """Stable, small-grained contracts for in-repository secondary development."""
+
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
@@ -15,11 +16,28 @@ class RepositoryAccess(Protocol):
     def get_name_map(self, symbols: list[str] | None = None) -> dict[str, str]: ...
 
 
+class StrategyOptimizationAccess(Protocol):
+    api_version: int
+
+    def list_optimizable_strategies(self) -> list[dict[str, Any]]: ...
+
+    def get_optimization_contract(self, strategy_id: str) -> Any: ...
+
+    def evaluate_candidates(
+        self, request: dict[str, Any], candidates: list[dict[str, Any]], progress_cb, cancel_event
+    ) -> Any: ...
+
+    def validate_oos(
+        self, request: dict[str, Any], candidates: list[dict[str, Any]], progress_cb, cancel_event
+    ) -> Any: ...
+
+
 @dataclass(frozen=True)
 class ExtensionContext:
     api_version: int
     data_dir: Path
     repository: RepositoryAccess
+    strategy_optimization: StrategyOptimizationAccess | None = None
 
 
 @dataclass(frozen=True)

@@ -362,8 +362,18 @@ async def _application_lifespan(app: FastAPI):
 
     # 源码内二次开发启动钩子: 仅暴露稳定只读上下文, 单个扩展失败不影响核心启动。
     extension_registry = app.state.extension_registry
+    from app.backtest.engine import BacktestEngine
+    from app.backtest.strategy import StrategyBacktestService
+    from app.strategy_optimizer.gateway import StrategyOptimizationGateway
+    optimization_gateway = StrategyOptimizationGateway(
+        StrategyBacktestService(BacktestEngine(repo), strategy_engine),
+        strategy_engine,
+        repository=repo,
+    )
     await start_backend_extensions(
-        current_extension_context(data_dir=store.data_dir, repository=repo),
+        current_extension_context(
+            data_dir=store.data_dir, repository=repo, strategy_optimization=optimization_gateway
+        ),
         extension_registry,
     )
 

@@ -3,6 +3,7 @@ from app.extensions.contracts import (
     ExtensionContext,
     NotificationFormatContext,
     NotificationFormatter,
+    StrategyOptimizationAccess,
 )
 from app.extensions.registry import BackendExtensionRegistrar, BackendExtensionRegistry
 
@@ -13,4 +14,5 @@ __all__ = [
     "ExtensionContext",
     "NotificationFormatContext",
     "NotificationFormatter",
+    "StrategyOptimizationAccess",
 ]

@@ -1,4 +1,5 @@
 """Discover in-repository backend customizations without touching user data."""
+
 from __future__ import annotations
 
 import importlib
@@ -122,9 +123,12 @@ async def stop_backend_extensions(registry: BackendExtensionRegistry) -> None:
             logger.warning("backend extension shutdown failed %s: %s", module_name, exc)
 
 
-def current_extension_context(*, data_dir, repository) -> ExtensionContext:
+def current_extension_context(
+    *, data_dir, repository, strategy_optimization=None
+) -> ExtensionContext:
     return ExtensionContext(
         api_version=BACKEND_EXTENSION_API_VERSION,
         data_dir=data_dir,
         repository=repository,
+        strategy_optimization=strategy_optimization,
     )
