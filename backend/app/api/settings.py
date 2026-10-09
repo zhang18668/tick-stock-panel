@@ -99,6 +99,7 @@ def get_settings(request: Request) -> dict:
         "ai_context_window": current_ai_context_window(),
         "ai_round_checkpoint": current_ai_round_checkpoint(),
     }
+    return result
 
 
 class SwitchEndpointIn(BaseModel):

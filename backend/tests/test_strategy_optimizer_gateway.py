@@ -24,10 +24,9 @@ class FakeService:
 
 
 class FakeStrategy:
-    strategy_id = "demo"
-
     def __init__(self):
         self.meta = {
+            "id": "demo",
             "name": "Demo",
             "asset_type": "stock",
             "params": [
@@ -43,10 +42,27 @@ class FakeEngine:
         assert strategy_id == "demo"
         return FakeStrategy()
 
+    def strategy_definitions(self):
+        return (FakeStrategy(),)
+
 
 class FakeRepo:
     def get_matrix_data_generation(self, asset_type):
         return f"g-{asset_type}"
+
+
+def test_lists_optimizable_strategies_from_real_strategy_definition_shape():
+    gateway = StrategyOptimizationGateway(FakeService(), FakeEngine(), repository=FakeRepo())
+
+    assert gateway.list_optimizable_strategies() == [
+        {
+            "strategy_id": "demo",
+            "name": "Demo",
+            "asset_type": "stock",
+            "optimizable": True,
+            "reason": None,
+        }
+    ]
 
 
 def test_gateway_evaluates_candidates_and_oos_with_shared_backtest_service():

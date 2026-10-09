@@ -10,7 +10,6 @@ from app.strategy_optimizer.store import OptimizationRunStore
 
 class FakeStrategy:
     def __init__(self):
-        self.strategy_id = "demo"
         self.meta = {
             "id": "demo",
             "name": "Demo",

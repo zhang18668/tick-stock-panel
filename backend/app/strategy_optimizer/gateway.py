@@ -34,11 +34,12 @@ class StrategyOptimizationGateway:
     def list_optimizable_strategies(self):
         result = []
         for strategy in self.strategy_engine.strategy_definitions():
+            strategy_id = strategy.meta["id"]
             try:
-                contract = self.get_optimization_contract(strategy.strategy_id)
+                contract = self.get_optimization_contract(strategy_id)
                 result.append(
                     {
-                        "strategy_id": strategy.strategy_id,
+                        "strategy_id": strategy_id,
                         "name": contract.name,
                         "asset_type": contract.asset_type,
                         "optimizable": bool(contract.parameters),
@@ -48,8 +49,8 @@ class StrategyOptimizationGateway:
             except (ValueError, TypeError) as exc:
                 result.append(
                     {
-                        "strategy_id": strategy.strategy_id,
-                        "name": strategy.meta.get("name", strategy.strategy_id),
+                        "strategy_id": strategy_id,
+                        "name": strategy.meta.get("name", strategy_id),
                         "asset_type": strategy.meta.get("asset_type", "stock"),
                         "optimizable": False,
                         "reason": str(exc),
@@ -82,8 +83,8 @@ class StrategyOptimizationGateway:
         if not params:
             raise ValueError("strategy has no complete optimizable parameter contract")
         return StrategyOptimizationContract(
-            strategy.strategy_id,
-            strategy.meta.get("name", strategy.strategy_id),
+            strategy.meta["id"],
+            strategy.meta.get("name", strategy.meta["id"]),
             strategy.meta.get("asset_type", "stock"),
             tuple(params),
             tuple(strategy.entry_signals),

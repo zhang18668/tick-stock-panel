@@ -83,6 +83,7 @@ class RunRequest(BaseModel):
 
 
 def _contract(strategy) -> StrategyOptimizationContract:
+    strategy_id = strategy.meta["id"]
     params = []
     for raw in strategy.meta.get("params", []):
         if not all(key in raw for key in ("id", "type", "default")):
@@ -102,8 +103,8 @@ def _contract(strategy) -> StrategyOptimizationContract:
             )
         )
     return StrategyOptimizationContract(
-        strategy.strategy_id,
-        strategy.meta.get("name", strategy.strategy_id),
+        strategy_id,
+        strategy.meta.get("name", strategy_id),
         strategy.meta.get("asset_type", "stock"),
         tuple(params),
         tuple(strategy.entry_signals),
@@ -179,9 +180,10 @@ def build_router() -> APIRouter:
                 result.append(item)
                 continue
             try:
-                item = strategy_for(request, item.strategy_id)
+                item = strategy_for(request, item.meta["id"])
             except HTTPException:
                 continue
+            strategy_id = item.meta["id"]
             reason = "missing parameter contract"
             try:
                 contract = _contract(item)
@@ -190,8 +192,8 @@ def build_router() -> APIRouter:
                 ok, reason = False, str(exc)
             result.append(
                 {
-                    "strategy_id": item.strategy_id,
-                    "name": item.meta.get("name", item.strategy_id),
+                    "strategy_id": strategy_id,
+                    "name": item.meta.get("name", strategy_id),
                     "optimizable": ok,
                     "reason": None if ok else reason,
                 }
