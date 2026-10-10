@@ -19,19 +19,25 @@ export function StrategyCard({ strategy, groups, results, groupId, onGroup, onDe
         <p className="mt-1 text-sm leading-6 text-secondary">{strategy.description || '暂无策略说明'}</p></div>
       <div className="flex shrink-0 gap-2"><button type="button" onClick={onDetails} className="rounded-lg border px-3 py-2 text-sm hover:bg-muted">详细说明</button><button type="button" onClick={onRun} className="rounded-lg bg-primary px-3 py-2 text-sm text-white">更新回测</button></div>
     </div>
-    <div className="mt-4 grid grid-cols-1 gap-2 sm:grid-cols-3">{periods.map(([key, label]) => {
-      const result = results[key]
-      const unavailable = result && result.status !== 'completed'
-      return <div key={key} className="rounded-lg bg-base p-3"><div className="flex items-center justify-between"><span className="text-xs text-secondary">{label}</span><span className="text-xs text-secondary">{result?.actual_end ?? '尚未回测'}</span></div>
-        {unavailable ? <div className="mt-2 text-sm font-medium text-amber-600">不可用 · {result.reason || result.status}</div> : <div className="mt-2 grid grid-cols-3 gap-2">
-          <Metric label="收益" value={percent(result?.total_return)} positive={result?.total_return != null && result.total_return >= 0} />
-          <Metric label="最大回撤" value={percent(result?.max_drawdown)} />
-          <Metric label="夏普" value={result?.sharpe == null ? '—' : result.sharpe.toFixed(2)} />
-        </div>}
-      </div>
-    })}</div>
+    <div className="mt-4 overflow-x-auto">
+      <table aria-label="回测表现" className="w-full min-w-[360px] table-fixed border-collapse text-xs">
+        <thead><tr className="border-b border-border text-secondary"><th scope="col" className="w-[25%] px-2 py-1.5 text-left font-medium">周期</th><th scope="col" className="w-[23%] px-2 py-1.5 text-left font-medium">数据日期</th><th scope="col" className="w-[17%] px-2 py-1.5 text-right font-medium">收益</th><th scope="col" className="w-[19%] px-2 py-1.5 text-right font-medium">最大回撤</th><th scope="col" className="w-[16%] px-2 py-1.5 text-right font-medium">夏普</th></tr></thead>
+        <tbody>{periods.map(([key, label]) => {
+          const result = results[key]
+          const unavailable = result && result.status !== 'completed'
+          return <tr key={key} className="border-b border-border/60 last:border-0">
+            <th scope="row" className="whitespace-nowrap px-2 py-2 text-left font-medium text-foreground">{label}</th>
+            <td className="whitespace-nowrap px-2 py-2 text-secondary">{result?.actual_end ?? '尚未回测'}</td>
+            {unavailable ? <td colSpan={3} className="px-2 py-2 text-right font-medium text-amber-600">不可用 · {result.reason || result.status}</td> : <>
+              <td className={`whitespace-nowrap px-2 py-2 text-right font-semibold tabular-nums ${result?.total_return == null ? 'text-secondary' : result.total_return >= 0 ? 'text-bull' : 'text-bear'}`}>{percent(result?.total_return)}</td>
+              <td className="whitespace-nowrap px-2 py-2 text-right font-semibold tabular-nums text-foreground">{percent(result?.max_drawdown)}</td>
+              <td className="whitespace-nowrap px-2 py-2 text-right font-semibold tabular-nums text-foreground">{result?.sharpe == null ? '—' : result.sharpe.toFixed(2)}</td>
+            </>}
+          </tr>
+        })}</tbody>
+      </table>
+    </div>
     <div className="mt-4 flex flex-wrap items-center justify-between gap-2 border-t border-border pt-3"><div className="flex flex-wrap gap-1.5">{(strategy.tags ?? []).slice(0, 5).map(tag => <span key={tag} className="rounded bg-elevated px-2 py-1 text-xs text-secondary">{tag}</span>)}<span className="text-xs text-secondary">{strategy.asset_types?.join(' / ') || '—'} · {strategy.timeframes?.join(' / ') || '—'}</span></div>
       <label className="flex items-center gap-2 text-xs text-secondary">手动分组<select aria-label={`放入分组 ${strategy.name}`} value={groupId} onChange={event => onGroup(event.target.value)} className="max-w-40 rounded-lg border bg-base px-2 py-1.5 text-sm text-foreground"><option className="bg-card text-foreground" value="">未分组</option>{groups.map(group => <option className="bg-card text-foreground" key={group.id} value={group.id}>{group.name}</option>)}</select></label></div>
   </article>
 }
-function Metric({ label, value, positive }: { label: string; value: string; positive?: boolean }) { return <div><div className="text-[10px] text-secondary">{label}</div><div className={`mt-0.5 text-sm font-semibold tabular-nums ${positive === undefined ? '' : positive ? 'text-bull' : 'text-bear'}`}>{value}</div></div> }

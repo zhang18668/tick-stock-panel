@@ -69,6 +69,7 @@ it('shows unavailable windows and explains why the backtest is missing', async (
   expect(host.textContent).toContain('近一年')
   expect(host.textContent).toContain('不可用')
   expect(host.textContent).toContain('回测区间超过当前限制')
+  expect(host.querySelector('table[aria-label="回测表现"] tbody tr:last-child')?.textContent ?? '').toContain('回测区间超过当前限制')
 })
 
 it('renders the strategy name as a visible heading instead of a placeholder-shaped chip', async () => {
@@ -98,9 +99,16 @@ it('uses readable source and tag chips and A-share colors for returns', async ()
   const chips = [...host.querySelectorAll('span')]
   expect(chips.find(node => node.textContent === 'builtin')?.className).toContain('bg-elevated')
   expect(chips.find(node => node.textContent === '趋势策略')?.className).toContain('bg-elevated')
-  const returnMetrics = [...host.querySelectorAll('div')].filter(node => node.children.length === 2 && node.children[0]?.textContent === '收益')
-  expect(returnMetrics.find(node => node.textContent?.includes('-3.00%'))?.lastElementChild?.className).toContain('text-bear')
-  expect(returnMetrics.find(node => node.textContent?.includes('+3.00%'))?.lastElementChild?.className).toContain('text-bull')
+  const table = host.querySelector<HTMLTableElement>('table[aria-label="回测表现"]')
+  expect([...table!.querySelectorAll('thead th')].map(node => node.textContent)).toEqual(['周期', '数据日期', '收益', '最大回撤', '夏普'])
+  const rows = [...table!.querySelectorAll('tbody tr')]
+  expect(rows).toHaveLength(3)
+  expect(rows[0]?.textContent).toContain('近 3 个月')
+  expect(rows[0]?.children[2]?.className).toContain('text-bear')
+  expect(rows[0]?.textContent).toContain('-3.00%')
+  expect(rows[1]?.children[2]?.className).toContain('text-bull')
+  expect(rows[1]?.textContent).toContain('+3.00%')
+  expect(rows[2]?.textContent).toContain('尚未回测')
 })
 
 it('keeps strategy detail content inside a viewport-sized scrollable dialog', async () => {
