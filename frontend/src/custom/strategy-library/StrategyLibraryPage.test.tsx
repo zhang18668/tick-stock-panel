@@ -4,17 +4,28 @@ import { createRoot, type Root } from 'react-dom/client'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { StrategyLibraryPage } from './StrategyLibraryPage'
+import type { StrategyLibrary } from './api'
 import { StrategyCard } from './components/StrategyCard'
 import { StrategyDetail } from './components/StrategyDetail'
 import { BacktestJobPanel } from './components/BacktestJobPanel'
 
-const { library, saveGroups } = vi.hoisted(() => ({
+const { library, saveGroups, optimizerStrategies, navigateMock } = vi.hoisted(() => ({
   library: vi.fn(),
   saveGroups: vi.fn(),
+  optimizerStrategies: vi.fn(),
+  navigateMock: vi.fn(),
 }))
 vi.mock('./api', async importOriginal => ({
   ...await importOriginal<typeof import('./api')>(),
   strategyLibraryApi: { library, saveGroups, startJob: vi.fn(), getJob: vi.fn(), cancelJob: vi.fn(), retryJob: vi.fn() },
+}))
+vi.mock('../strategy-optimizer/api', async importOriginal => ({
+  ...await importOriginal<typeof import('../strategy-optimizer/api')>(),
+  optimizerApi: { strategies: optimizerStrategies },
+}))
+vi.mock('react-router-dom', async importOriginal => ({
+  ...await importOriginal<typeof import('react-router-dom')>(),
+  useNavigate: () => navigateMock,
 }))
 
 let host: HTMLDivElement
@@ -30,6 +41,7 @@ beforeEach(() => {
   vi.clearAllMocks()
   Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true })
   library.mockResolvedValue(sampleLibrary())
+  optimizerStrategies.mockResolvedValue([{ strategy_id: 'builtin_x', name: 'X 策略', optimizable: true, reason: null }])
   saveGroups.mockResolvedValue({ groups: sampleLibrary().groups })
   host = document.createElement('div')
   document.body.append(host)
@@ -58,6 +70,31 @@ it('moves a strategy only after the user selects a group', async () => {
     await Promise.resolve()
   })
   expect(saveGroups.mock.calls[0]?.[0]).toEqual([{ id: 'g1', name: '强势', order: 0, strategy_ids: ['builtin_x'] }])
+})
+
+it('selects groups before selecting only optimizer-capable strategies', async () => {
+  const data = sampleLibrary() as unknown as StrategyLibrary
+  data.strategies.push({ ...data.strategies[0]!, id: 'builtin_y', name: 'Y 策略' })
+  data.groups[0]!.strategy_ids = ['builtin_x', 'builtin_y']
+  library.mockResolvedValue(data)
+  optimizerStrategies.mockResolvedValue([
+    { strategy_id: 'builtin_x', name: 'X 策略', optimizable: true, reason: null },
+    { strategy_id: 'builtin_y', name: 'Y 策略', optimizable: false, reason: 'missing contract' },
+  ])
+  await act(async () => root.render(<QueryClientProvider client={client}><StrategyLibraryPage /></QueryClientProvider>))
+  await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)) })
+  const action = [...host.querySelectorAll('button')].find(button => button.textContent?.includes('优化所选策略'))!
+  expect(action.disabled).toBe(true)
+  const group = host.querySelector<HTMLInputElement>('input[aria-label="选择优化分组 强势"]')!
+  await act(async () => { group.click(); await Promise.resolve() })
+  const eligible = host.querySelector<HTMLInputElement>('input[aria-label="选择优化策略 X 策略"]')!
+  const ineligible = host.querySelector<HTMLInputElement>('input[aria-label="选择优化策略 Y 策略"]')!
+  expect(ineligible.disabled).toBe(true)
+  await act(async () => { eligible.click(); await Promise.resolve() })
+  expect(action.disabled).toBe(false)
+  expect(action.textContent).toContain('（1）')
+  await act(async () => action.click())
+  expect(navigateMock).toHaveBeenCalledWith('/strategy-optimizer', { state: { strategyIds: ['builtin_x'] } })
 })
 
 it('shows unavailable windows and explains why the backtest is missing', async () => {

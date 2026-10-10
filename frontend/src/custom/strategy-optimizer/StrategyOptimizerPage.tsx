@@ -1,9 +1,18 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
+import { useMutation, useQueryClient } from '@tanstack/react-query'
+import { useLocation } from 'react-router-dom'
+import { QK } from '../../lib/queryKeys'
 import { optimizerApi, type OptimizerContract, type OptimizerRun, type OptimizerStrategy } from './api'
 
 const activeStates = ['queued', 'running', 'cancelling']
 
 export function StrategyOptimizerPage() {
+  const location = useLocation()
+  const queryClient = useQueryClient()
+  const requestedIds = useMemo(() => {
+    const ids = (location.state as { strategyIds?: unknown } | null)?.strategyIds
+    return Array.isArray(ids) ? ids.filter((id): id is string => typeof id === 'string') : []
+  }, [location.state])
   const [strategies, setStrategies] = useState<OptimizerStrategy[]>([])
   const [contract, setContract] = useState<OptimizerContract | null>(null)
   const [selected, setSelected] = useState('')
@@ -34,11 +43,32 @@ export function StrategyOptimizerPage() {
   const [mode, setMode] = useState<'position' | 'full'>('position')
   const [holdingDays, setHoldingDays] = useState(5)
   const [runs, setRuns] = useState<OptimizerRun[]>([])
+  const saveMutation = useMutation({
+    mutationFn: () => optimizerApi.saveRecommendations(run!.run_id),
+    onSuccess: async result => {
+      setError(result.errors.length ? `部分推荐未保存：${result.errors.map(item => `top${item.rank} ${item.error}`).join('；')}` : '')
+      await queryClient.invalidateQueries({ queryKey: QK.strategyLibrary })
+      await queryClient.invalidateQueries({ queryKey: QK.strategyOptimizerStrategies })
+    },
+    onError: reason => setError(String(reason)),
+  })
 
   useEffect(() => {
     optimizerApi.strategies().then(setStrategies).catch(e => setError(String(e)))
-    optimizerApi.list().then(items => { setRuns(items); const active = items.find(item => activeStates.includes(item.state)); if (active) setRun(active) }).catch(e => setError(String(e)))
-  }, [])
+    optimizerApi.list().then(items => {
+      setRuns(items)
+      const scopedRuns = requestedIds.length ? items.filter(item => requestedIds.includes(String(item.config.strategy_id))) : items
+      const latest = scopedRuns.find(item => activeStates.includes(item.state)) ?? scopedRuns[0]
+      if (latest) {
+        setRun(latest)
+        if (latest.config.strategy_id) setSelected(String(latest.config.strategy_id))
+      }
+    }).catch(e => setError(String(e)))
+  }, [requestedIds])
+  useEffect(() => {
+    const preferred = requestedIds.find(id => strategies.some(item => item.strategy_id === id && item.optimizable))
+    if (preferred && (!selected || !requestedIds.includes(selected))) setSelected(preferred)
+  }, [strategies, selected, requestedIds])
   useEffect(() => {
     if (!selected) { setContract(null); return }
     optimizerApi.contract(selected).then(value => {
@@ -58,6 +88,7 @@ export function StrategyOptimizerPage() {
   }, [run?.run_id, run?.state])
 
   const strategy = strategies.find(item => item.strategy_id === selected)
+  const visibleStrategies = requestedIds.length ? strategies.filter(item => requestedIds.includes(item.strategy_id)) : strategies
   const weightTotal = Object.values(weights).reduce((sum, value) => sum + value, 0)
   const setRange = (id: string, key: 'min' | 'max' | 'step', value: number) => setRanges(current => ({ ...current, [id]: { ...current[id], [key]: value } }))
   const toggle = (values: string[], setter: (values: string[]) => void, id: string) => setter(values.includes(id) ? values.filter(value => value !== id) : [...values, id])
@@ -68,6 +99,7 @@ export function StrategyOptimizerPage() {
 
   const submit = () => {
     setError(''); setProgress(null)
+    saveMutation.reset()
     const parameters = Object.fromEntries([
       ...Object.entries(ranges).map(([id, range]) => [id, range]),
       ...Object.entries(discreteValues).filter(([, values]) => values.length > 0).map(([id, values]) => [id, { values }]),
@@ -89,8 +121,8 @@ export function StrategyOptimizerPage() {
     <header><h1 className="text-2xl font-semibold">策略优化</h1><p className="mt-1 text-sm text-muted">只生成推荐，不会修改原策略。</p></header>
     {error && <div role="alert" className="rounded border border-red-500 p-3 text-red-500">{error}</div>}
     <section className="grid gap-5 rounded border p-4 sm:p-6">
-      <label className="flex flex-col gap-2">策略<select value={selected} onChange={e => { setSelected(e.target.value); setRun(null) }} className="rounded border bg-base p-2">
-        <option value="">请选择策略</option>{strategies.map(item => <option key={item.strategy_id} value={item.strategy_id}>{item.name}{item.optimizable ? '' : '（不可优化）'}</option>)}
+      <label className="flex flex-col gap-2">策略<select value={selected} onChange={e => { setSelected(e.target.value); setRun(null); saveMutation.reset() }} className="rounded border bg-base p-2">
+        <option value="">请选择策略</option>{visibleStrategies.map(item => <option key={item.strategy_id} value={item.strategy_id}>{item.name}{item.optimizable ? '' : '（不可优化）'}</option>)}
       </select></label>
       {strategy && !strategy.optimizable && <p className="text-sm text-muted">{strategy.reason}</p>}
       {contract && strategy?.optimizable && <>
@@ -134,9 +166,10 @@ export function StrategyOptimizerPage() {
         <button className="w-fit rounded bg-primary px-4 py-2 text-white disabled:opacity-50" disabled={!start || !end || start >= end || Math.abs(weightTotal - 1) > 1e-9 || Object.values(discreteValues).some(values => values.length === 0) || !!run} onClick={submit}>启动优化</button>
       </>}
     </section>
-    {runs.length > 0 && <section className="rounded border p-4"><h2 className="mb-3 font-medium">最近优化任务</h2><ul className="grid gap-2">{runs.slice(0, 10).map(item => <li key={item.run_id}><button className="flex w-full items-center justify-between rounded border p-3 text-left" onClick={() => optimizerApi.get(item.run_id).then(setRun)}><span>{String(item.config.strategy_id ?? '策略')} · {item.run_id.slice(0, 8)}</span><span>{item.state}</span></button></li>)}</ul></section>}
+    {runs.length > 0 && <section className="rounded border p-4"><h2 className="mb-3 font-medium">最近优化任务</h2><ul className="grid gap-2">{runs.slice(0, 10).map(item => <li key={item.run_id}><button className="flex w-full items-center justify-between rounded border p-3 text-left" onClick={() => optimizerApi.get(item.run_id).then(value => { setRun(value); saveMutation.reset(); if (value.config.strategy_id) setSelected(String(value.config.strategy_id)) })}><span>{String(item.config.strategy_id ?? '策略')} · {item.run_id.slice(0, 8)}</span><span>{item.state}</span></button></li>)}</ul></section>}
     {run && <section className="rounded border p-4 sm:p-6">
       <h2 className="font-medium">任务状态：{run.state}</h2>
+      {run.state === 'succeeded' && ((run.result?.top3 as unknown[]) ?? []).length > 0 && <div className="mt-4 flex flex-wrap items-center gap-3 border-t pt-4"><button type="button" onClick={() => saveMutation.mutate()} disabled={saveMutation.isPending} className="rounded bg-primary px-4 py-2 text-sm text-white disabled:opacity-50">{saveMutation.isPending ? '正在保存…' : '将合格推荐保存到策略库'}</button>{saveMutation.data && <span role="status" className="text-sm text-emerald-700">已保存 {saveMutation.data.saved.length} 个策略{saveMutation.data.saved.length ? `：${saveMutation.data.saved.map(item => item.name).join('、')}` : ''}</span>}</div>}
       {progress && <p className="mt-2 text-sm text-muted">进度：{JSON.stringify(progress)}</p>}
       {run.error && <p className="mt-2 text-red-500">{run.error}</p>}
       {activeStates.includes(run.state) && <button className="mt-3 rounded border px-4 py-2" onClick={() => optimizerApi.cancel(run.run_id).then(setRun)}>取消</button>}

@@ -33,13 +33,16 @@ class FakeStrategy:
 
 
 class FakeEngine:
+    def __init__(self):
+        self.strategy = FakeStrategy()
+
     def get(self, strategy_id):
         if strategy_id != "demo":
             raise ValueError("unknown strategy")
-        return FakeStrategy()
+        return self.strategy
 
     def strategy_definitions(self):
-        return (FakeStrategy(),)
+        return (self.strategy,)
 
 
 class FakeRepo:
@@ -118,3 +121,45 @@ def test_create_run_uses_manager_and_persists_owner_scope(tmp_path):
     assert record["run_id"] in {
         item["run_id"] for item in client.get("/api/custom/strategy-optimizer/runs").json()
     }
+
+
+def test_save_recommendations_creates_independent_strategies_from_passed_candidates(tmp_path, monkeypatch):
+    from app.api import strategy as strategy_api
+
+    saved = []
+
+    def save_strategy(req, request):
+        saved.append(req)
+        return {"ok": True, "strategy_id": req.strategy_id, "meta": {"name": req.name}}
+
+    async def persist_strategy(_request, _result):
+        return None
+
+    monkeypatch.setattr(strategy_api, "_save_strategy_code", save_strategy)
+    monkeypatch.setattr(strategy_api, "_persist_user_strategy", persist_strategy)
+    client = make_client(tmp_path)
+    source = tmp_path / "demo.py"
+    source.write_text('META = {"id": "demo", "name": "Demo", "params": [{"id": "window", "type": "int", "default": 10, "min": 2, "max": 30, "step": 1}]}\nENTRY_SIGNALS = ["buy_a"]\nEXIT_SIGNALS = ["sell_a"]\n', encoding="utf-8")
+    client.app.state.strategy_engine.get("demo").file_path = source
+    run_id = "a1b2c3d4e5f6"
+    client.app.state.strategy_optimizer_manager = SimpleNamespace(get=lambda _run_id: {
+        "run_id": run_id, "state": "succeeded",
+        "config": {"strategy_id": "demo", "owner_scope": "standalone"},
+        "result": {"top3": [
+            {"parameters": {"window": 12}, "buy_signals": ["buy_a"], "sell_signals": ["sell_a"]},
+            {"parameters": {"window": 15}, "buy_signals": ["buy_a"], "sell_signals": ["sell_a"]},
+        ]},
+    })
+
+    response = client.post(f"/api/custom/strategy-optimizer/runs/{run_id}/save")
+
+    assert response.status_code == 200
+    assert [item.strategy_id for item in saved] == [
+        f"custom_opt_{run_id[:12]}_top1",
+        f"custom_opt_{run_id[:12]}_top2",
+    ]
+    assert [item.name for item in saved] == ["Demo-top1", "Demo-top2"]
+    assert [item.mode for item in saved] == ["create", "create"]
+    assert "'default': 12" in saved[0].code
+    assert 'ENTRY_SIGNALS = [\'buy_a\']' in saved[0].code
+    assert "'default': 15" in saved[1].code

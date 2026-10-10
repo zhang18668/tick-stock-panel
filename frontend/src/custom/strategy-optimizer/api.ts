@@ -16,5 +16,6 @@ export const optimizerApi = {
   list: () => json('/api/custom/strategy-optimizer/runs') as Promise<OptimizerRun[]>,
   cancel: (id: string) => json(`/api/custom/strategy-optimizer/runs/${id}/cancel`, { method: 'POST' }) as Promise<OptimizerRun>,
   resume: (id: string) => json(`/api/custom/strategy-optimizer/runs/${id}/resume`, { method: 'POST' }) as Promise<OptimizerRun>,
+  saveRecommendations: (id: string) => json(`/api/custom/strategy-optimizer/runs/${id}/save`, { method: 'POST' }) as Promise<{ saved: Array<{ strategy_id: string; name: string; already_saved: boolean }>; errors: Array<{ rank: number; error: string }> }>,
   eventsUrl: (id: string) => `/api/custom/strategy-optimizer/runs/${id}/events`,
 }

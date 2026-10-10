@@ -67,6 +67,7 @@ export const QK = {
     : ['strategy-link-options'] as const,
   strategyDetail:       (id: string) => ['strategy-detail', id] as const,
   strategyLibrary:      ['strategy-library'] as const,
+  strategyOptimizerStrategies: ['strategy-optimizer', 'strategies'] as const,
   strategyLibraryJob:   (id: string) => ['strategy-library-job', id] as const,
 
   // Data / Pipeline

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useNavigate } from 'react-router-dom'
 import { AlertCircle, BookOpenCheck, RefreshCw, Search } from 'lucide-react'
 import { QK } from '../../lib/queryKeys'
 import { strategyLibraryApi, type StrategyGroup, type StrategyJob, type StrategyLibrary, type StrategySummary } from './api'
@@ -7,19 +8,27 @@ import { BacktestJobPanel } from './components/BacktestJobPanel'
 import { StrategyCard } from './components/StrategyCard'
 import { StrategyDetail } from './components/StrategyDetail'
 import { StrategyGroups } from './components/StrategyGroups'
+import { optimizerApi } from '../strategy-optimizer/api'
 
 const active = (state?: string) => state === 'queued' || state === 'running'
 export function StrategyLibraryPage() {
+  const navigate = useNavigate()
   const client = useQueryClient()
   const query = useQuery({ queryKey: QK.strategyLibrary, queryFn: strategyLibraryApi.library, staleTime: 30_000 })
+  const optimizableQuery = useQuery({ queryKey: QK.strategyOptimizerStrategies, queryFn: optimizerApi.strategies, staleTime: 30_000 })
   const [job, setJob] = useState<StrategyJob | null>(null)
   const [selected, setSelected] = useState<StrategySummary | null>(null)
   const [search, setSearch] = useState('')
   const [filterGroup, setFilterGroup] = useState('all')
+  const [selectedGroupIds, setSelectedGroupIds] = useState<string[]>([])
+  const [selectedStrategyIds, setSelectedStrategyIds] = useState<string[]>([])
   const [error, setError] = useState('')
   useEffect(() => { if (!job?.id) return; let cancelled = false; const poll = async () => { try { const next = await strategyLibraryApi.getJob(job.id); if (cancelled) return; setJob(next); if (!active(next.state)) void client.invalidateQueries({ queryKey: QK.strategyLibrary }) } catch (reason) { if (!cancelled) setError(String(reason)) } }; if (active(job.state)) { const timer = window.setInterval(poll, 1800); return () => { cancelled = true; window.clearInterval(timer) } } }, [job?.id, job?.state, client])
   useEffect(() => { if (!job && query.data?.tasks.length) setJob(query.data.tasks.find(item => active(item.state)) ?? query.data.tasks[0]) }, [query.data, job])
   const groups = query.data?.groups ?? []
+  const optimizableIds = new Set((optimizableQuery.data ?? []).filter(item => item.optimizable).map(item => item.strategy_id))
+  const selectedGroupStrategyIds = new Set(groups.filter(group => selectedGroupIds.includes(group.id)).flatMap(group => group.strategy_ids))
+  const chosenStrategyIds = selectedStrategyIds.filter(id => selectedGroupStrategyIds.has(id) && optimizableIds.has(id))
   const save = useMutation({ mutationFn: strategyLibraryApi.saveGroups, onSuccess: async () => { setError(''); await client.invalidateQueries({ queryKey: QK.strategyLibrary }) }, onError: reason => setError(String(reason)) })
   const run = async (strategyIds?: string[]) => { setError(''); try { const next = await strategyLibraryApi.startJob(strategyIds); setJob(next) } catch (reason) { setError(String(reason)) } }
   const filtered = useMemo(() => (query.data?.strategies ?? []).filter(strategy => {
@@ -46,6 +55,23 @@ export function StrategyLibraryPage() {
     <header className="flex flex-wrap items-end justify-between gap-4"><div><div className="flex items-center gap-2 text-primary"><BookOpenCheck size={18} /><span className="text-xs font-semibold uppercase tracking-widest">Strategy library</span></div><h1 className="mt-1 text-2xl font-semibold tracking-tight">策略库与回测对比</h1><p className="mt-1 text-sm text-muted">浏览内置策略、自己定义档位，并在统一截止日比较近期回测表现。</p></div><div className="rounded-lg border bg-card px-3 py-2 text-xs text-muted">最近交易日 <span className="ml-1 font-medium text-foreground">{data.latest_trading_day ?? '暂无数据'}</span></div></header>
     {error && <div role="alert" className="flex items-start gap-2 rounded-lg border border-red-300 bg-card p-3 text-sm text-red-600"><AlertCircle size={16} className="mt-0.5 shrink-0" />{error}<button type="button" className="ml-auto" onClick={() => setError('')} aria-label="关闭错误提示">×</button></div>}
     <StrategyGroups groups={groups} onChange={moveGroups} />
+    <section className="rounded-xl border border-border bg-card p-4 sm:p-5">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div><h2 className="font-semibold">按分组选策略优化</h2><p className="mt-1 text-xs text-muted">先选分组，再从其中选择有参数优化契约的策略。</p></div>
+        <button type="button" disabled={!chosenStrategyIds.length || optimizableQuery.isPending} onClick={() => navigate('/strategy-optimizer', { state: { strategyIds: chosenStrategyIds } })} className="rounded-lg bg-primary px-3 py-2 text-sm text-white disabled:opacity-40">优化所选策略（{chosenStrategyIds.length}）</button>
+      </div>
+      {optimizableQuery.isError && <p role="alert" className="mt-3 text-sm text-red-600">无法读取可优化策略列表：{optimizableQuery.error.message}</p>}
+      {groups.length > 0 ? <div className="mt-4 flex flex-wrap gap-3">{groups.map(group => <label key={group.id} className="inline-flex items-center gap-2 rounded-lg border px-3 py-2 text-sm"><input type="checkbox" aria-label={`选择优化分组 ${group.name}`} checked={selectedGroupIds.includes(group.id)} onChange={event => {
+        const next = event.target.checked ? [...selectedGroupIds, group.id] : selectedGroupIds.filter(id => id !== group.id)
+        setSelectedGroupIds(next)
+        const allowed = new Set(groups.filter(item => next.includes(item.id)).flatMap(item => item.strategy_ids))
+        setSelectedStrategyIds(current => current.filter(id => allowed.has(id)))
+      }} />{group.name} <span className="text-xs text-muted">{group.strategy_ids.filter(id => optimizableIds.has(id)).length} 个可优化</span></label>)}</div> : <p className="mt-4 text-sm text-muted">请先创建并分配策略分组。</p>}
+      {selectedGroupIds.length > 0 && <div className="mt-4 grid gap-2 sm:grid-cols-2">{data.strategies.filter(item => selectedGroupStrategyIds.has(item.id)).map(item => {
+        const canOptimize = optimizableIds.has(item.id)
+        return <label key={item.id} className={`inline-flex items-start gap-2 rounded-lg border p-3 text-sm ${canOptimize ? '' : 'opacity-55'}`}><input type="checkbox" aria-label={`选择优化策略 ${item.name}`} disabled={!canOptimize || optimizableQuery.isPending} checked={canOptimize && chosenStrategyIds.includes(item.id)} onChange={event => setSelectedStrategyIds(current => event.target.checked ? [...new Set([...current, item.id])] : current.filter(id => id !== item.id))} /><span><span className="font-medium">{item.name}</span><span className="block text-xs text-muted">{canOptimize ? '可优化' : '暂无优化参数契约'}</span></span></label>
+      })}{!data.strategies.some(item => selectedGroupStrategyIds.has(item.id)) && <p className="text-sm text-muted">所选分组中没有策略。</p>}</div>}
+    </section>
     <BacktestJobPanel job={job} strategies={data.strategies} onRunAll={() => void run()} onCancel={cancel} onRetry={() => void retry()} onRefresh={refresh} busy={active(job?.state)} />
     <section><div className="flex flex-wrap items-end justify-between gap-3"><div><h2 className="font-semibold">策略表现</h2><p className="mt-1 text-xs text-muted">收益、回撤和夏普比率按后端回测结果展示；缺失数据保留为空。</p></div><div className="flex w-full flex-wrap gap-2 sm:w-auto"><label className="relative min-w-48 flex-1 sm:flex-none"><Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-muted" /><input aria-label="搜索策略" value={search} onChange={event => setSearch(event.target.value)} placeholder="搜索策略" className="w-full rounded-lg border bg-card py-2 pl-9 pr-3 text-sm" /></label><select aria-label="筛选分组" value={filterGroup} onChange={event => setFilterGroup(event.target.value)} className="rounded-lg border bg-card px-3 py-2 text-sm text-foreground"><option className="bg-card text-foreground" value="all">全部分组</option><option className="bg-card text-foreground" value="ungrouped">未分组</option>{groups.map(group => <option className="bg-card text-foreground" key={group.id} value={group.id}>{group.name}</option>)}</select><button type="button" onClick={() => void query.refetch()} className="inline-flex items-center gap-2 rounded-lg border bg-card px-3 py-2 text-sm text-foreground hover:bg-elevated"><RefreshCw size={14} />刷新</button></div></div>
       {filtered.length ? <div className="mt-4 grid gap-3 xl:grid-cols-2">{filtered.map(strategy => <StrategyCard key={strategy.id} strategy={strategy} groups={groups} groupId={groups.find(group => group.strategy_ids.includes(strategy.id))?.id ?? ''} results={data.results[strategy.id] ?? {}} onGroup={groupId => assign(strategy.id, groupId)} onDetails={() => setSelected(strategy)} onRun={() => void run([strategy.id])} />)}</div> : <div className="mt-4 rounded-xl border border-dashed p-10 text-center"><p className="font-medium">{data.strategies.length ? '没有匹配的策略' : '暂未发现可用策略'}</p><p className="mt-1 text-sm text-muted">{data.strategies.length ? '试试其他搜索词或分组。' : '检查服务器上的策略源码和策略访问权限。'}</p></div>}</section>

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import asyncio
 import hashlib
 import json
@@ -16,6 +17,49 @@ from app.strategy_optimizer.contracts import ParameterSpec, StrategyOptimization
 from app.strategy_optimizer.manager import OptimizationJobManager
 from app.strategy_optimizer.store import OptimizationRunStore
 from app.strategy_optimizer.validation import validate_run_config
+
+
+def _set_literal_assignment(code: str, name: str, value) -> str:
+    tree = ast.parse(code)
+    node = next((item for item in tree.body if isinstance(item, ast.Assign) and any(
+        isinstance(target, ast.Name) and target.id == name for target in item.targets
+    )), None)
+    if node is None or not isinstance(node.value, (ast.Dict, ast.List, ast.Tuple)):
+        raise ValueError(f"策略源码缺少可编辑的 {name} 字面量")
+    lines = code.splitlines(keepends=True)
+    def offset(lineno, col):
+        return sum(len(line.encode("utf-8")) for line in lines[:lineno - 1]) + col
+    raw = code.encode("utf-8")
+    start = offset(node.value.lineno, node.value.col_offset)
+    end = offset(node.value.end_lineno, node.value.end_col_offset)
+    return (raw[:start] + repr(value).encode("utf-8") + raw[end:]).decode("utf-8")
+
+
+def _optimized_strategy_code(code: str, parameters: dict, buy_signals: list, sell_signals: list) -> str:
+    tree = ast.parse(code)
+    meta_node = next((item.value for item in tree.body if isinstance(item, ast.Assign) and any(
+        isinstance(target, ast.Name) and target.id == "META" for target in item.targets
+    )), None)
+    if not isinstance(meta_node, ast.Dict):
+        raise ValueError("策略 META 必须是字面量字典")
+    meta = ast.literal_eval(meta_node)
+    if not isinstance(meta, dict) or not isinstance(meta.get("params"), list):
+        raise ValueError("策略 META.params 必须是列表")
+    known = {item.get("id") for item in meta["params"] if isinstance(item, dict)}
+    if set(parameters) - known:
+        raise ValueError("推荐参数包含策略未声明的参数")
+    for item in meta["params"]:
+        if isinstance(item, dict) and item.get("id") in parameters:
+            item["default"] = parameters[item["id"]]
+    code = _set_literal_assignment(code, "META", meta)
+    # The saved strategy must keep the signal combination that produced its recommendation.
+    tree = ast.parse(code)
+    for name, value in (("ENTRY_SIGNALS", buy_signals), ("EXIT_SIGNALS", sell_signals)):
+        if any(isinstance(target, ast.Name) and target.id == name
+               for item in tree.body if isinstance(item, ast.Assign) for target in item.targets):
+            code = _set_literal_assignment(code, name, value)
+            tree = ast.parse(code)
+    return code
 
 EXTENSION_ID = "strategy.optimizer"
 EXTENSION_API_VERSION = BACKEND_EXTENSION_API_VERSION
@@ -238,6 +282,77 @@ def build_router() -> APIRouter:
             return owned_run(request, run_id)
         except KeyError as exc:
             raise HTTPException(404, "run not found") from exc
+
+    @router.post("/runs/{run_id}/save")
+    async def save_recommendations(run_id: str, request: Request):
+        try:
+            record = owned_run(request, run_id)
+        except KeyError as exc:
+            raise HTTPException(404, "run not found") from exc
+        if record.get("state") != "succeeded":
+            raise HTTPException(409, "优化任务尚未成功完成")
+        config = record.get("config", {})
+        strategy = strategy_for(request, str(config.get("strategy_id", "")))
+        contract_obj = _contract(strategy)
+        source_path = getattr(strategy, "file_path", None)
+        if not source_path or not source_path.is_file():
+            raise HTTPException(409, "策略源文件不可用, 无法另存优化结果")
+        source_code = source_path.read_text(encoding="utf-8")
+        candidates = (record.get("result") or {}).get("top3")
+        if not isinstance(candidates, list) or not candidates:
+            raise HTTPException(409, "没有通过筛选的推荐参数可保存")
+        from app.api.strategy import (
+            StrategyCodeSaveRequest,
+            _persist_user_strategy,
+            _save_strategy_code,
+        )
+
+        saved = []
+        errors = []
+        for rank, candidate in enumerate(candidates[:3], start=1):
+            if not isinstance(candidate, dict) or not isinstance(candidate.get("parameters"), dict):
+                errors.append({"rank": rank, "error": "推荐参数格式无效"})
+                continue
+            parameters = candidate["parameters"]
+            specs = {spec.id: spec for spec in contract_obj.parameters}
+            if any(key not in specs or not specs[key].validate_value(value)
+                   for key, value in parameters.items()):
+                errors.append({"rank": rank, "error": "推荐参数不符合策略契约"})
+                continue
+            buy_signals = candidate.get("buy_signals", config.get("buy_signals", []))
+            sell_signals = candidate.get("sell_signals", config.get("sell_signals", []))
+            if (not isinstance(buy_signals, list) or not isinstance(sell_signals, list)
+                    or any(not isinstance(signal, str) for signal in [*buy_signals, *sell_signals])
+                    or not set(buy_signals).issubset(contract_obj.buy_signals)
+                    or not set(sell_signals).issubset(contract_obj.sell_signals)):
+                errors.append({"rank": rank, "error": "推荐信号不符合策略契约"})
+                continue
+            strategy_id = f"custom_opt_{run_id[:12]}_top{rank}"
+            name = f"{contract_obj.name}-top{rank}"
+            try:
+                existing = request.app.state.strategy_engine.get(strategy_id)
+            except (KeyError, ValueError):
+                existing = None
+            if existing is not None:
+                saved.append({"strategy_id": strategy_id, "name": name, "already_saved": True})
+                continue
+            try:
+                derived = _optimized_strategy_code(
+                    source_code, parameters, buy_signals, sell_signals
+                )
+                result = _save_strategy_code(StrategyCodeSaveRequest(
+                    code=derived,
+                    strategy_id=strategy_id,
+                    target_source="custom",
+                    mode="create",
+                    name=name,
+                    description=f"由策略优化任务 {run_id[:8]} 生成。",
+                ), request)
+                await _persist_user_strategy(request, result)
+                saved.append({"strategy_id": strategy_id, "name": name, "already_saved": False})
+            except Exception as exc:
+                errors.append({"rank": rank, "error": str(exc)})
+        return {"saved": saved, "errors": errors}
 
     @router.get("/runs")
     def list_runs(request: Request):
