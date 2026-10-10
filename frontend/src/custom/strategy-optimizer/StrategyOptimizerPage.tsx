@@ -36,6 +36,7 @@ export function StrategyOptimizerPage() {
     return Array.isArray(ids) ? ids.filter((id): id is string => typeof id === 'string') : []
   }, [location.state])
   const [strategies, setStrategies] = useState<OptimizerStrategy[]>([])
+  const [strategyNames, setStrategyNames] = useState<Record<string, string>>({})
   const [groups, setGroups] = useState<StrategyGroup[]>([])
   const [selectedGroup, setSelectedGroup] = useState('')
   const [contract, setContract] = useState<OptimizerContract | null>(null)
@@ -81,7 +82,10 @@ export function StrategyOptimizerPage() {
 
   useEffect(() => {
     optimizerApi.strategies().then(setStrategies).catch(e => setError(String(e)))
-    strategyLibraryApi.library().then(value => setGroups(value.groups)).catch(e => setError(String(e)))
+    strategyLibraryApi.library().then(value => {
+      setGroups(value.groups)
+      setStrategyNames(Object.fromEntries(value.strategies.map(item => [item.id, item.name])))
+    }).catch(e => setError(String(e)))
     optimizerApi.list().then(items => {
       setRuns(items)
       const scopedRuns = requestedIds.length ? items.filter(item => requestedIds.includes(String(item.config.strategy_id))) : items
@@ -223,7 +227,11 @@ export function StrategyOptimizerPage() {
         <button className="w-fit rounded bg-primary px-4 py-2 text-white disabled:opacity-50" disabled={!start || !end || start >= end || Math.abs(weightTotal - 1) > 1e-9 || Object.values(discreteValues).some(values => values.length === 0) || !!run} onClick={submit}>启动优化</button>
       </>}
     </section>
-    {runs.length > 0 && <section className="rounded border p-4"><h2 className="mb-3 font-medium">最近优化任务</h2><ul className="grid gap-2">{runs.slice(0, 10).map(item => <li key={item.run_id}><button className="flex w-full items-center justify-between rounded border p-3 text-left" onClick={() => optimizerApi.get(item.run_id).then(value => { setRun(value); saveMutation.reset(); if (value.config.strategy_id) setSelected(String(value.config.strategy_id)) })}><span>{String(item.config.strategy_id ?? '策略')} · {item.run_id.slice(0, 8)}</span><span>{item.state}</span></button></li>)}</ul></section>}
+    {runs.length > 0 && <section className="rounded border p-4"><h2 className="mb-3 font-medium">最近优化任务</h2><ul className="grid gap-2">{runs.slice(0, 10).map(item => {
+      const strategyId = String(item.config.strategy_id ?? '')
+      const strategyName = (strategyNames[strategyId] ?? strategyId) || '策略'
+      return <li key={item.run_id}><button className="flex w-full items-center justify-between rounded border p-3 text-left" onClick={() => optimizerApi.get(item.run_id).then(value => { setRun(value); saveMutation.reset(); if (value.config.strategy_id) setSelected(String(value.config.strategy_id)) })}><span>{strategyName} · {item.run_id.slice(0, 8)}</span><span>{item.state}</span></button></li>
+    })}</ul></section>}
     {run && <section className="rounded border p-4 sm:p-6">
       <h2 className="font-medium">任务状态：{run.state}</h2>
       {progress && <p className="mt-2 text-sm text-muted">进度：{JSON.stringify(progress)}</p>}
