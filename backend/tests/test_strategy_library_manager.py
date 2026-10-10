@@ -3,8 +3,6 @@ from __future__ import annotations
 import threading
 from datetime import date
 
-import pytest
-
 from app.strategy_library.contracts import (
     BacktestPeriod,
     BacktestWindow,
@@ -12,10 +10,7 @@ from app.strategy_library.contracts import (
     StrategyLibraryTaskItem,
     StrategyLibraryTaskStatus,
 )
-from app.strategy_library.manager import (
-    StrategyLibraryManager,
-    StrategyLibraryTaskConflict,
-)
+from app.strategy_library.manager import StrategyLibraryManager
 
 
 class MemoryStore:
@@ -85,23 +80,34 @@ def test_cancel_stops_after_current_backtest():
     assert all(item.status == "cancelled" for item in finished.items[1:])
 
 
-def test_active_task_is_scoped_and_duplicate_run_is_rejected():
-    entered = threading.Event()
+def test_same_user_can_run_two_tasks_concurrently():
+    first_entered = threading.Event()
+    second_entered = threading.Event()
     release = threading.Event()
+    calls_lock = threading.Lock()
+    entered_count = 0
 
     def runner(_strategy_id, _window, _cancel_event, _progress_cb, _config):
-        entered.set()
+        nonlocal entered_count
+        with calls_lock:
+            entered_count += 1
+            current = entered_count
+        (first_entered if current == 1 else second_entered).set()
         release.wait(10)
         return _result()
 
     manager = _manager(runner, ("builtin_a",))
-    task = manager.start("user-a", ["builtin_a"])
-    assert entered.wait(5)
-    assert manager.get_task("user-b", task.id) is None
-    with pytest.raises(StrategyLibraryTaskConflict):
-        manager.start("user-a", ["builtin_a"])
+    first = manager.start("user-a", ["builtin_a"])
+    assert first_entered.wait(5)
+    second = manager.start("user-a", ["builtin_a"])
+    assert manager.get_task("user-b", first.id) is None
+    assert second_entered.wait(5)
     release.set()
-    manager.wait(task.id, timeout=10)
+    manager.wait(first.id, timeout=10)
+    manager.wait(second.id, timeout=10)
+
+    assert manager.get_task("user-a", first.id).state == StrategyLibraryTaskStatus.COMPLETED
+    assert manager.get_task("user-a", second.id).state == StrategyLibraryTaskStatus.COMPLETED
 
 
 def test_failed_period_can_be_retried_without_rerunning_successes():

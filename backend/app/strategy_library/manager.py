@@ -25,7 +25,7 @@ from app.strategy_library.windows import build_rolling_windows
 
 
 class StrategyLibraryTaskConflict(RuntimeError):
-    """The user already has a running strategy-library job."""
+    """A strategy-library task cannot be retried in its current state."""
 
 
 class StrategyLibraryManager:
@@ -90,12 +90,6 @@ class StrategyLibraryManager:
         windows = build_rolling_windows(latest)
 
         with self._lock:
-            if any(
-                task.user_id == user_id
-                and task.state in {StrategyLibraryTaskStatus.QUEUED, StrategyLibraryTaskStatus.RUNNING}
-                for task in self._tasks.values()
-            ):
-                raise StrategyLibraryTaskConflict("该用户已有策略库回测任务正在运行")
             items = []
             for strategy_id in selected_ids:
                 for window in windows:
