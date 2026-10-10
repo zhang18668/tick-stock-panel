@@ -15,7 +15,7 @@ export function BacktestJobPanel({ job, strategies, onRunAll, onCancel, onRetry,
   const [action, setAction] = useState<'cancel' | 'refresh' | null>(null)
   const [feedback, setFeedback] = useState('')
   useEffect(() => {
-    if (!active(job?.state)) return
+    if (!job || !active(job.state)) return
     const timer = window.setInterval(() => setNow(Date.now()), 1000)
     return () => window.clearInterval(timer)
   }, [job?.state])

@@ -134,8 +134,8 @@ it('keeps strategy detail content inside a viewport-sized scrollable dialog', as
 
 it('shows partial task progress and offers retry for failed periods', async () => {
   const retry = vi.fn()
-  const item = { strategy_id: 'builtin_x', period: '3m' as const, window: { requested_start: '2026-07-08', requested_end: '2026-10-08', actual_start: null, actual_end: null, availability: 'available', reason: null }, attempts: 1, progress: null, reason: 'worker error', status: 'failed' }
-  const job = { id: 'job-1', state: 'completed_with_errors', items: Array.from({ length: 6 }, (_, index) => ({ ...item, strategy_id: index < 5 ? `s${index}` : 'builtin_x', status: index < 5 ? 'completed' : 'failed' })), counts: { completed: 5, failed: 1 }, current_strategy_id: null, current_period: null, error: null }
+  const item = { strategy_id: 'builtin_x', period: '3m' as const, window: { requested_start: '2026-07-08', requested_end: '2026-10-08', actual_start: null, actual_end: null, availability: 'available', reason: null }, attempts: 1, progress: null, reason: 'worker error', started_at: null, status: 'failed' }
+  const job = { id: 'job-1', state: 'completed_with_errors', items: Array.from({ length: 6 }, (_, index) => ({ ...item, strategy_id: index < 5 ? `s${index}` : 'builtin_x', status: index < 5 ? 'completed' : 'failed' })), counts: { completed: 5, failed: 1 }, current_strategy_id: null, current_period: null, cancel_requested: false, updated_at: '2026-10-10T00:00:00Z', error: null }
   await act(async () => root.render(<BacktestJobPanel job={job} strategies={[]} onRunAll={() => undefined} onCancel={() => undefined} onRetry={retry} onRefresh={() => undefined} busy={false} />))
   expect(host.textContent).toContain('已完成 5 / 6')
   const retryButton = [...host.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent?.includes('重试失败项'))
@@ -151,7 +151,7 @@ it('shows the active backtest item progress instead of claiming the job is still
     status: 'running', attempts: 1, progress: { day: 120, total: 240, date: '2026-06-01' }, reason: null,
     started_at: '2026-10-10T01:00:00+00:00',
   }
-  const job = { id: 'job-1', state: 'running', items: [item], counts: { running: 1 }, current_strategy_id: 'builtin_x', current_period: '12m', error: null }
+  const job = { id: 'job-1', state: 'running', items: [item], counts: { running: 1 }, current_strategy_id: 'builtin_x', current_period: '12m', cancel_requested: false, updated_at: '2026-10-10T00:00:00Z', error: null }
   await act(async () => root.render(<BacktestJobPanel job={job} strategies={sampleLibrary().strategies as unknown as import('./api').StrategySummary[]} onRunAll={() => undefined} onCancel={() => undefined} onRetry={() => undefined} onRefresh={() => undefined} busy />))
   expect(host.textContent).toContain('任务运行中')
   expect(host.textContent).toContain('120 / 240')
@@ -163,7 +163,7 @@ it('reports cancel and refresh actions and uses explicit readable select colors'
   const onCancel = vi.fn().mockResolvedValue(undefined)
   const onRefresh = vi.fn().mockResolvedValue(undefined)
   const item = { strategy_id: 'builtin_x', period: '3m' as const, window: { requested_start: '2026-07-08', requested_end: '2026-10-08', actual_start: null, actual_end: null, availability: 'available', reason: null }, attempts: 1, progress: null, reason: null, started_at: null, status: 'running' }
-  const job = { id: 'job-2', state: 'running', items: [item], counts: { running: 1 }, current_strategy_id: 'builtin_x', current_period: '3m', cancel_requested: false, error: null }
+  const job = { id: 'job-2', state: 'running', items: [item], counts: { running: 1 }, current_strategy_id: 'builtin_x', current_period: '3m', cancel_requested: false, updated_at: '2026-10-10T00:00:00Z', error: null }
   await act(async () => root.render(<><BacktestJobPanel job={job} strategies={sampleLibrary().strategies as unknown as import('./api').StrategySummary[]} onRunAll={() => undefined} onCancel={onCancel} onRetry={() => undefined} onRefresh={onRefresh} busy /></>))
   const cancelButton = [...host.querySelectorAll('button')].find(button => button.textContent === '取消任务')
   const refreshButton = [...host.querySelectorAll('button')].find(button => button.textContent === '立即刷新')
