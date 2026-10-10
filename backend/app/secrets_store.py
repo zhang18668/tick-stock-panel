@@ -7,6 +7,7 @@ UI 改 Key 时只动这个文件,不动 .env。
 """
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -20,6 +21,10 @@ _USER_SECRET_KEYS = {
     "feishu_webhook_url", "feishu_webhook_secret", "wecom_webhook_url",
     "wecom_bot_id", "wecom_bot_secret",
 }
+# (mtime_ns, size) 签名缓存 — 与 preferences.load 同模式。
+# 实时行情每轮的 webhook/邮件判定会多次读 secrets, 避免每次全文件读+JSON 解析。
+_cache: dict | None = None
+_cache_sig: tuple[int, int] | None = None
 
 
 def _path() -> Path:
@@ -30,16 +35,29 @@ def _path() -> Path:
 
 
 def load() -> dict:
+    """读取 secrets.json (mtime 缓存);多用户请求叠加当前用户通知凭据。"""
+    global _cache, _cache_sig
     from app.user_system.settings_context import current
 
     context = current()
     p = _path()
-    base: dict = {}
-    if p.exists():
-        try:
-            base = json.loads(p.read_text(encoding="utf-8"))
-        except Exception as e:  # noqa: BLE001
-            logger.warning("secrets.json malformed: %s", e)
+    try:
+        sig = (p.stat().st_mtime_ns, p.stat().st_size)
+    except OSError:
+        base = {}
+    else:
+        if _cache is not None and sig == _cache_sig:
+            base = copy.deepcopy(_cache)
+        else:
+            try:
+                base = json.loads(p.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                base = {}
+            except Exception as e:  # noqa: BLE001
+                logger.warning("secrets.json malformed: %s", e)
+                base = {}
+            _cache = copy.deepcopy(base)
+            _cache_sig = sig
     if context is not None:
         # Multi-user deployments share platform TickFlow/AI credentials from
         # the server. Only notification credentials remain user-scoped.
@@ -66,6 +84,7 @@ def save(updates: dict) -> dict:
     atomic_write_text(
         p, json.dumps(current, indent=2, ensure_ascii=False), mode=0o600,
     )
+    _invalidate_cache()
     return current
 
 
@@ -87,6 +106,7 @@ def clear(*keys: str) -> dict:
         return {}
     if not keys:
         p.unlink()
+        _invalidate_cache()
         return {}
     current = load()
     for k in keys:
@@ -94,7 +114,14 @@ def clear(*keys: str) -> dict:
     atomic_write_text(
         p, json.dumps(current, indent=2, ensure_ascii=False), mode=0o600,
     )
+    _invalidate_cache()
     return current
+
+
+def _invalidate_cache() -> None:
+    global _cache, _cache_sig
+    _cache = None
+    _cache_sig = None
 
 
 def get_tickflow_key() -> str:
