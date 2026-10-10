@@ -1,12 +1,34 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { useLocation } from 'react-router-dom'
+import { useLocation, useNavigate } from 'react-router-dom'
 import { QK } from '../../lib/queryKeys'
+import { strategyLibraryApi, type StrategyGroup } from '../strategy-library/api'
 import { optimizerApi, type OptimizerContract, type OptimizerRun, type OptimizerStrategy } from './api'
 
 const activeStates = ['queued', 'running', 'cancelling']
 
+type MetricRow = Record<string, unknown>
+
+function formatPercent(value: unknown, absolute = false) {
+  if (value == null || value === '') return '—'
+  const number = Number(value)
+  if (!Number.isFinite(number)) return '—'
+  return `${((absolute ? Math.abs(number) : number) * 100).toFixed(2)}%`
+}
+
+function formatFoldReturn(value: unknown) {
+  if (value == null || value === '') return '—'
+  const number = Number(value)
+  if (!Number.isFinite(number)) return '—'
+  return `${number > 0 ? '+' : ''}${(number * 100).toFixed(2)}%`
+}
+
+function metricRows(value: unknown): MetricRow[] {
+  return Array.isArray(value) ? value.filter(item => item && typeof item === 'object') as MetricRow[] : []
+}
+
 export function StrategyOptimizerPage() {
+  const navigate = useNavigate()
   const location = useLocation()
   const queryClient = useQueryClient()
   const requestedIds = useMemo(() => {
@@ -14,9 +36,13 @@ export function StrategyOptimizerPage() {
     return Array.isArray(ids) ? ids.filter((id): id is string => typeof id === 'string') : []
   }, [location.state])
   const [strategies, setStrategies] = useState<OptimizerStrategy[]>([])
+  const [groups, setGroups] = useState<StrategyGroup[]>([])
+  const [selectedGroup, setSelectedGroup] = useState('')
   const [contract, setContract] = useState<OptimizerContract | null>(null)
   const [selected, setSelected] = useState('')
   const [run, setRun] = useState<OptimizerRun | null>(null)
+  const [autoSaveRunId, setAutoSaveRunId] = useState('')
+  const autoSaveStarted = useRef(new Set<string>())
   const [error, setError] = useState('')
   const [progress, setProgress] = useState<Record<string, unknown> | null>(null)
   const [start, setStart] = useState('2022-01-01')
@@ -55,6 +81,7 @@ export function StrategyOptimizerPage() {
 
   useEffect(() => {
     optimizerApi.strategies().then(setStrategies).catch(e => setError(String(e)))
+    strategyLibraryApi.library().then(value => setGroups(value.groups)).catch(e => setError(String(e)))
     optimizerApi.list().then(items => {
       setRuns(items)
       const scopedRuns = requestedIds.length ? items.filter(item => requestedIds.includes(String(item.config.strategy_id))) : items
@@ -65,6 +92,18 @@ export function StrategyOptimizerPage() {
       }
     }).catch(e => setError(String(e)))
   }, [requestedIds])
+  useEffect(() => {
+    if (!groups.length) return
+    const runStrategyId = String(run?.config.strategy_id ?? '')
+    const preferredGroup = groups.find(group => requestedIds.some(id => group.strategy_ids.includes(id)))
+      ?? groups.find(group => group.strategy_ids.includes(runStrategyId))
+    if (preferredGroup && (!selectedGroup || !groups.some(group => group.id === selectedGroup))) {
+      setSelectedGroup(preferredGroup.id)
+      const preferredStrategy = requestedIds.find(id => preferredGroup.strategy_ids.includes(id))
+        ?? runStrategyId
+      if (preferredStrategy) setSelected(preferredStrategy)
+    }
+  }, [groups, requestedIds, run?.config.strategy_id, selectedGroup])
   useEffect(() => {
     const preferred = requestedIds.find(id => strategies.some(item => item.strategy_id === id && item.optimizable))
     if (preferred && (!selected || !requestedIds.includes(selected))) setSelected(preferred)
@@ -87,8 +126,19 @@ export function StrategyOptimizerPage() {
     return () => { source.close(); window.clearInterval(timer) }
   }, [run?.run_id, run?.state])
 
+  useEffect(() => {
+    if (!run || run.run_id !== autoSaveRunId || run.state !== 'succeeded') return
+    if (!Array.isArray(run.result?.top3) || !run.result.top3.length || autoSaveStarted.current.has(run.run_id)) return
+    autoSaveStarted.current.add(run.run_id)
+    saveMutation.mutate()
+  }, [run, autoSaveRunId])
+
   const strategy = strategies.find(item => item.strategy_id === selected)
-  const visibleStrategies = requestedIds.length ? strategies.filter(item => requestedIds.includes(item.strategy_id)) : strategies
+  const groupStrategyIds = new Set(groups.find(group => group.id === selectedGroup)?.strategy_ids ?? [])
+  const visibleStrategies = strategies.filter(item => groupStrategyIds.has(item.strategy_id)
+    && (!requestedIds.length || requestedIds.includes(item.strategy_id)))
+  const resultStrategyId = String(run?.config.strategy_id ?? '')
+  const resultContract = contract?.strategy_id === resultStrategyId ? contract : null
   const weightTotal = Object.values(weights).reduce((sum, value) => sum + value, 0)
   const setRange = (id: string, key: 'min' | 'max' | 'step', value: number) => setRanges(current => ({ ...current, [id]: { ...current[id], [key]: value } }))
   const toggle = (values: string[], setter: (values: string[]) => void, id: string) => setter(values.includes(id) ? values.filter(value => value !== id) : [...values, id])
@@ -114,16 +164,23 @@ export function StrategyOptimizerPage() {
       commission_pct: commissionPct, stamp_tax_pct: stampTaxPct,
       symbols: symbolsText.trim() ? symbolsText.split(',').map(value => value.trim()).filter(Boolean) : null,
       matching, mode, holding_days: holdingDays,
-    }).then(value => { setRun(value); setRuns(current => [value, ...current.filter(item => item.run_id !== value.run_id)]) }).catch(e => setError(String(e)))
+    }).then(value => {
+      setAutoSaveRunId(value.run_id)
+      setRun(value)
+      setRuns(current => [value, ...current.filter(item => item.run_id !== value.run_id)])
+    }).catch(e => setError(String(e)))
   }
 
   return <main className="mx-auto flex max-w-5xl flex-col gap-6 p-4 sm:p-6">
     <header><h1 className="text-2xl font-semibold">策略优化</h1><p className="mt-1 text-sm text-muted">只生成推荐，不会修改原策略。</p></header>
     {error && <div role="alert" className="rounded border border-red-500 p-3 text-red-500">{error}</div>}
     <section className="grid gap-5 rounded border p-4 sm:p-6">
-      <label className="flex flex-col gap-2">策略<select value={selected} onChange={e => { setSelected(e.target.value); setRun(null); saveMutation.reset() }} className="rounded border bg-base p-2">
-        <option value="">请选择策略</option>{visibleStrategies.map(item => <option key={item.strategy_id} value={item.strategy_id}>{item.name}{item.optimizable ? '' : '（不可优化）'}</option>)}
+      <label className="flex flex-col gap-2">策略分组<select aria-label="策略分组" value={selectedGroup} onChange={e => { setSelectedGroup(e.target.value); setSelected(''); setContract(null); setRun(null); setAutoSaveRunId(''); saveMutation.reset() }} className="rounded border bg-base p-2">
+        <option value="">请先选择策略库分组</option>{groups.map(group => <option key={group.id} value={group.id}>{group.name}</option>)}
       </select></label>
+      <label className="flex flex-col gap-2">策略<select value={selected} disabled={!selectedGroup} onChange={e => { setSelected(e.target.value); setRun(null); setAutoSaveRunId(''); saveMutation.reset() }} className="rounded border bg-base p-2">
+        <option value="">请选择策略</option>{visibleStrategies.map(item => <option key={item.strategy_id} value={item.strategy_id}>{item.name}{item.optimizable ? '' : '（不可优化）'}</option>)}
+      </select>{selectedGroup && !visibleStrategies.length && <span className="text-xs text-muted">该分组中没有可选择的策略{requestedIds.length ? '（当前批量选择范围内）' : ''}。</span>}</label>
       {strategy && !strategy.optimizable && <p className="text-sm text-muted">{strategy.reason}</p>}
       {contract && strategy?.optimizable && <>
         <div className="grid gap-3 sm:grid-cols-2">
@@ -169,12 +226,77 @@ export function StrategyOptimizerPage() {
     {runs.length > 0 && <section className="rounded border p-4"><h2 className="mb-3 font-medium">最近优化任务</h2><ul className="grid gap-2">{runs.slice(0, 10).map(item => <li key={item.run_id}><button className="flex w-full items-center justify-between rounded border p-3 text-left" onClick={() => optimizerApi.get(item.run_id).then(value => { setRun(value); saveMutation.reset(); if (value.config.strategy_id) setSelected(String(value.config.strategy_id)) })}><span>{String(item.config.strategy_id ?? '策略')} · {item.run_id.slice(0, 8)}</span><span>{item.state}</span></button></li>)}</ul></section>}
     {run && <section className="rounded border p-4 sm:p-6">
       <h2 className="font-medium">任务状态：{run.state}</h2>
-      {run.state === 'succeeded' && ((run.result?.top3 as unknown[]) ?? []).length > 0 && <div className="mt-4 flex flex-wrap items-center gap-3 border-t pt-4"><button type="button" onClick={() => saveMutation.mutate()} disabled={saveMutation.isPending} className="rounded bg-primary px-4 py-2 text-sm text-white disabled:opacity-50">{saveMutation.isPending ? '正在保存…' : '将合格推荐保存到策略库'}</button>{saveMutation.data && <span role="status" className="text-sm text-emerald-700">已保存 {saveMutation.data.saved.length} 个策略{saveMutation.data.saved.length ? `：${saveMutation.data.saved.map(item => item.name).join('、')}` : ''}</span>}</div>}
       {progress && <p className="mt-2 text-sm text-muted">进度：{JSON.stringify(progress)}</p>}
       {run.error && <p className="mt-2 text-red-500">{run.error}</p>}
       {activeStates.includes(run.state) && <button className="mt-3 rounded border px-4 py-2" onClick={() => optimizerApi.cancel(run.run_id).then(setRun)}>取消</button>}
       {['interrupted', 'failed'].includes(run.state) && <button className="mt-3 rounded border px-4 py-2" onClick={() => optimizerApi.resume(run.run_id).then(setRun)}>恢复任务</button>}
-      {run.result && <><p className="mt-2 text-sm text-muted">停止原因：{String(run.result.stop_reason ?? '—')}；已评估 {String(run.result.evaluated_candidates ?? 0)} 个候选；数据指纹 {String(run.config.input_fingerprint ?? '—').slice(0, 12)}</p>{Array.isArray(run.result.training_candidates) && <p className="mt-1 text-xs text-muted">训练候选失败数：{(run.result.training_candidates as Record<string, unknown>[]).filter(item => Boolean(item.training_error)).length}</p>}{run.result.insufficient_recommendations === true && <p className="mt-2 text-sm text-amber-600">通过回撤、交易数等门槛的候选不足 3 个，以下仅展示可用推荐。</p>}<div className="mt-4 grid gap-3 sm:grid-cols-3">{((run.result.top3 as Record<string, unknown>[]) ?? []).map((item, index) => <article key={index} className="rounded border p-4"><h3 className="font-medium">推荐 {index + 1}</h3><p className="mt-2 text-sm">综合评分：{Number(item.score ?? 0).toFixed(3)}</p><p className="mt-1 text-sm">相对默认参数差异：{JSON.stringify(Object.fromEntries(Object.entries((item.parameters as Record<string, unknown>) ?? {}).filter(([key, value]) => JSON.stringify(value) !== JSON.stringify(contract?.parameters.find(param => param.id === key)?.default))))}</p><p className="mt-1 text-sm">参数：{JSON.stringify(item.parameters)}</p><p className="mt-1 text-sm">样本外指标：{JSON.stringify(item.oos_metrics)}</p><p className="mt-1 text-xs text-muted">逐折：{JSON.stringify(item.folds)}</p></article>)}</div>{((run.result.top3 as unknown[]) ?? []).length === 0 && <p className="mt-3 text-sm text-muted">没有候选通过硬性筛选门槛，请调整范围或条件后重试。</p>}</>}
+      {run.result && <>
+        <p className="mt-2 text-sm text-muted">优化区间：{String(run.config.start ?? '—')} 至 {String(run.config.end ?? '—')}；停止原因：{String(run.result.stop_reason ?? '—')}；已评估 {String(run.result.evaluated_candidates ?? 0)} 个候选；数据指纹 {String(run.config.input_fingerprint ?? '—').slice(0, 12)}</p>
+        {Array.isArray(run.result.training_candidates) && <p className="mt-1 text-xs text-muted">训练候选失败数：{(run.result.training_candidates as Record<string, unknown>[]).filter(item => Boolean(item.training_error)).length}</p>}
+        {run.result.insufficient_recommendations === true && <p className="mt-2 text-sm text-amber-600">通过回撤、交易数等门槛的候选不足 3 个，以下仅展示可用推荐。</p>}
+        <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">{((run.result.top3 as Record<string, unknown>[]) ?? []).map((item, index) => {
+          const metrics = (item.oos_metrics && typeof item.oos_metrics === 'object' ? item.oos_metrics : {}) as MetricRow
+          const folds = metricRows(metrics.fold_metrics).length
+            ? metricRows(metrics.fold_metrics)
+            : metricRows(item.folds).map(fold => ((fold.metrics && typeof fold.metrics === 'object') ? fold.metrics : fold) as MetricRow)
+          const parameters = (item.parameters && typeof item.parameters === 'object' ? item.parameters : {}) as Record<string, unknown>
+          const foldValues = folds.map(fold => Number(fold.total_return)).filter(Number.isFinite)
+          const maxFoldAbs = Math.max(...foldValues.map(Math.abs), 0.0001)
+          const config = run.config
+          const loadBacktest = () => navigate('/backtest?tab=strategy', { state: { loadCandidate: {
+            name: `策略优化推荐 ${index + 1}`,
+            config: {
+              strategy_id: resultStrategyId,
+              asset_type: config.asset_type,
+              symbols: config.symbols ?? [],
+              start: config.start,
+              end: config.end,
+              params: parameters,
+              entry_fill: config.matching,
+              exit_fill: config.matching,
+              commission_pct: config.commission_pct ?? config.fees_pct,
+              stamp_tax_pct: config.stamp_tax_pct,
+              slippage_bps: config.slippage_bps,
+              mode: config.mode,
+              holding_days: config.holding_days,
+              overrides: {
+                entry_signals: item.buy_signals ?? config.buy_signals ?? [],
+                exit_signals: item.sell_signals ?? config.sell_signals ?? [],
+              },
+            },
+          } } })
+          return <article key={String(item.candidate_id ?? index)} className="min-w-0 rounded border bg-surface p-4">
+            <div className="flex items-start justify-between gap-3"><div><h3 className="font-medium">推荐 {index + 1}</h3><p className="mt-1 text-xs text-muted">综合评分 {Number(item.score ?? 0).toFixed(3)}</p></div><button type="button" onClick={loadBacktest} className="shrink-0 rounded border border-accent/40 px-2.5 py-1.5 text-xs font-medium text-accent hover:bg-accent/10">载入回测</button></div>
+            <div className="mt-3 grid grid-cols-2 gap-px overflow-hidden rounded border bg-border sm:grid-cols-4 xl:grid-cols-2 2xl:grid-cols-4">
+              {[
+                ['样本外收益', formatPercent(metrics.oos_return)],
+                ['样本外最大回撤', formatPercent(metrics.max_oos_drawdown, true)],
+                ['胜率', formatPercent(metrics.win_rate)],
+                ['交易数', metrics.trade_count == null ? '—' : `${String(metrics.trade_count)} 笔`],
+              ].map(([label, value]) => <div key={label} className="min-w-0 bg-base px-2.5 py-2"><div className="truncate text-[10px] text-muted">{label}</div><div className={`mt-0.5 font-mono text-sm font-semibold ${label === '样本外收益' ? Number(metrics.oos_return) > 0 ? 'text-red-500' : Number(metrics.oos_return) < 0 ? 'text-emerald-600' : 'text-foreground' : 'text-foreground'}`}>{value}</div></div>)}
+            </div>
+            <div className="mt-3"><h4 className="text-xs font-medium text-secondary">推荐参数</h4><dl className="mt-1 grid grid-cols-2 gap-x-3 gap-y-1.5">{Object.entries(parameters).map(([key, value]) => {
+              const definition = resultContract?.parameters.find(param => param.id === key)
+              const changed = definition && JSON.stringify(value) !== JSON.stringify(definition.default)
+              return <div key={key} className="min-w-0"><dt className="truncate text-[10px] text-muted" title={definition?.label ?? key}>{definition?.label ?? key}</dt><dd className="truncate text-xs text-foreground" title={changed ? `默认 ${String(definition?.default)} → 推荐 ${String(value)}` : String(value)}>{changed && <span className="mr-1 text-muted">{String(definition?.default)} →</span>}{String(value)}</dd></div>
+            })}</dl></div>
+            <div className="mt-4"><h4 className="text-xs font-medium text-secondary">逐折收益 <span className="font-normal text-muted">({folds.length} 折)</span></h4>
+              {folds.length ? <div className="mt-1.5 space-y-1">{folds.map((fold, foldIndex) => {
+                const value = Number(fold.total_return)
+                const finite = Number.isFinite(value)
+                const width = finite ? `${Math.max(1, Math.abs(value) / maxFoldAbs * 100)}%` : '0%'
+                return <div key={foldIndex} className="grid grid-cols-[34px_minmax(0,1fr)_58px] items-center gap-2 text-[10px]" role="img" aria-label={`第 ${foldIndex + 1} 折收益 ${formatFoldReturn(fold.total_return)}`}>
+                  <span className="text-muted">第 {foldIndex + 1} 折</span>
+                  <div className="relative h-4 rounded bg-elevated" aria-hidden="true"><div className="absolute inset-y-0 left-1/2 w-px bg-border" />{finite && <div className={`absolute inset-y-0 ${value >= 0 ? 'left-1/2 rounded-r bg-red-500' : 'right-1/2 rounded-l bg-emerald-500'}`} style={{ width }} />}</div>
+                  <span className={`text-right font-mono ${value > 0 ? 'text-red-500' : value < 0 ? 'text-emerald-600' : 'text-foreground'}`}>{formatFoldReturn(fold.total_return)}</span>
+                </div>
+              })}</div> : <p className="mt-1 text-xs text-muted">没有逐折指标</p>}
+            </div>
+          </article>
+        })}</div>
+        {((run.result.top3 as unknown[]) ?? []).length === 0 && <p className="mt-3 text-sm text-muted">没有候选通过硬性筛选门槛，请调整范围或条件后重试。</p>}
+        {run.state === 'succeeded' && ((run.result.top3 as unknown[]) ?? []).length > 0 && <div className="mt-4 flex flex-wrap items-center gap-3 border-t pt-4"><span role="status" className="text-sm text-muted">{saveMutation.isPending ? '正在自动保存前三名到策略库…' : saveMutation.data ? `已自动保存 ${saveMutation.data.saved.length} 个策略${saveMutation.data.saved.length ? `：${saveMutation.data.saved.map(item => item.name).join('、')}` : ''}` : ''}</span>{saveMutation.data?.errors.length ? <button type="button" onClick={() => saveMutation.mutate()} disabled={saveMutation.isPending} className="rounded border px-3 py-1.5 text-sm disabled:opacity-50">重试保存</button> : null}</div>}
+      </>}
     </section>}
   </main>
 }

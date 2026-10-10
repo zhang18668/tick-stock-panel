@@ -64,9 +64,21 @@ async def handle_request(request: Request, call_next):
         current_user = await resolve_session(session, token)
         if current_user is not None:
             request.state.current_user = current_user
-            request.state.entitlements = await PostgresBillingRepository(
-                session
-            ).effective_entitlements(current_user.id, datetime.now(UTC))
+            billing = PostgresBillingRepository(session)
+            now = datetime.now(UTC)
+            request.state.entitlements = await billing.effective_entitlements(
+                current_user.id, now
+            )
+            subscription = await billing.subscription(current_user.id)
+            request.state.is_paid_user = bool(
+                subscription
+                and subscription["plan"]["code"] in {"pro", "pro_monthly", "pro_yearly"}
+                and subscription["status"] == "active"
+                and (
+                    subscription["current_period_end"] is None
+                    or datetime.fromisoformat(subscription["current_period_end"]) > now
+                )
+            )
             subscription_access = (
                 path
                 in {

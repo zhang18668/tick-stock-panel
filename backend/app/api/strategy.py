@@ -1190,6 +1190,15 @@ def get_strategy_source(strategy_id: str, request: Request):
     engine = _get_engine(request)
     s = _get_public_strategy(engine, strategy_id)
 
+    current_user = getattr(request.state, "current_user", None)
+    if current_user is not None and not current_user.is_admin:
+        accessible_ids = {
+            *getattr(request.state, "owned_strategy_ids", frozenset()),
+            *getattr(request.state, "installed_strategy_ids", frozenset()),
+        }
+        if s.source == "builtin" or strategy_id not in accessible_ids:
+            raise HTTPException(status_code=403, detail="策略源码仅对管理员和策略所有者开放")
+
     path = s.file_path
     if not path or not path.exists():
         raise HTTPException(status_code=404, detail="策略源文件不存在")

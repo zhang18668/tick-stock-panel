@@ -481,6 +481,10 @@ export function Layout() {
     queryKey: ['account-me'], queryFn: api.accountMe,
     enabled: authMode?.mode === 'multi_user', staleTime: 60_000,
   })
+  const { data: billing } = useQuery({
+    queryKey: ['billing-me'], queryFn: api.billingMe,
+    enabled: authMode?.mode === 'multi_user', staleTime: 60_000,
+  })
   const handleLogout = async () => {
     if (authMode?.mode === 'multi_user') await api.accountLogout()
     else await api.authLogout()
@@ -576,12 +580,17 @@ export function Layout() {
   const analysisNav: NavItem[] = (analysisMenus?.items ?? [])
     .filter(m => m.visible)
     .map(m => ({ to: `/analysis/${m.id}`, label: m.label, icon: m.icon === 'tags' ? Tags : BarChart3 }))
-  const extensionNav: NavItem[] = getFrontendExtensionNavigation().map(item => ({
+  const hasPaidFeatures = authMode?.mode !== 'multi_user'
+    || account?.role === 'admin'
+    || !!billing?.effective_plan.startsWith('pro_')
+  const extensionNav: NavItem[] = getFrontendExtensionNavigation()
+    .filter(item => hasPaidFeatures || !['/strategy-library', '/strategy-optimizer'].includes(item.route.path))
+    .map(item => ({
     to: item.route.path,
     label: item.label,
     icon: item.icon,
     badge: item.badge,
-  }))
+    }))
 
   const allNav: NavItem[] = [...nav, ...analysisNav, ...extensionNav]
   const savedOrder = prefs?.nav_order ?? []

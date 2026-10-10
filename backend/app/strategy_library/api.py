@@ -8,7 +8,7 @@ from dataclasses import replace
 from datetime import date
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.api.backtest import BACKTEST_MAX_SERVER_DAYS, BACKTEST_SERVER_GUARD_MESSAGE
@@ -29,6 +29,7 @@ from app.strategy_library.manager import (
     StrategyLibraryTaskConflict,
 )
 from app.strategy_library.store import StrategyLibraryStore
+from app.user_system.dependencies import require_paid_user
 
 EXTENSION_ID = "strategy.library"
 API_PREFIX = "/api/strategy-library"
@@ -64,7 +65,9 @@ class GroupsUpdateRequest(_RequestModel):
 
 
 def build_router() -> APIRouter:
-    router = APIRouter(prefix=API_PREFIX, tags=["strategy-library"])
+    router = APIRouter(
+        prefix=API_PREFIX, tags=["strategy-library"], dependencies=[Depends(require_paid_user)]
+    )
 
     @router.get("")
     def library(request: Request):

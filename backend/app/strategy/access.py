@@ -17,15 +17,5 @@ def can_access_strategy(
     current_user: UserContext | None,
     owned_strategy_ids: Collection[str] = (),
 ) -> bool:
-    """Standalone sees all; grouped private built-ins are admin-only in multi-user mode."""
-    if current_user is None:
-        return True
-    if strategy.source == "builtin":
-        return strategy.meta.get("visibility_group") not in {
-            "private",
-            "diya",
-            "tianya",
-            "douyin",
-            "board_pullback",
-        } or current_user.is_admin or strategy.meta["id"] in owned_strategy_ids
-    return strategy.meta["id"] in owned_strategy_ids
+    """Strategies are shared across accounts; user-specific group settings are separate."""
+    return True

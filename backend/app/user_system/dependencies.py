@@ -18,3 +18,13 @@ def require_admin(request: Request) -> CurrentUser:
     if not user.is_admin:
         raise HTTPException(status_code=403, detail="administrator access required")
     return user
+
+
+def require_paid_user(request: Request) -> CurrentUser | None:
+    """Allow standalone mode, admins, and active paid subscribers."""
+    user = getattr(request.state, "current_user", None)
+    if user is None:
+        return None
+    if user.is_admin or getattr(request.state, "is_paid_user", False):
+        return user
+    raise HTTPException(status_code=403, detail="此功能仅对付费用户开放")

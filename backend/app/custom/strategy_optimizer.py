@@ -7,12 +7,13 @@ import json
 import math
 import threading
 
-from fastapi import APIRouter, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.extensions import BACKEND_EXTENSION_API_VERSION, BackendExtensionRegistrar
 from app.strategy.access import can_access_strategy
+from app.user_system.dependencies import require_paid_user
 from app.strategy_optimizer.contracts import ParameterSpec, StrategyOptimizationContract
 from app.strategy_optimizer.manager import OptimizationJobManager
 from app.strategy_optimizer.store import OptimizationRunStore
@@ -158,7 +159,11 @@ def _contract(strategy) -> StrategyOptimizationContract:
 
 
 def build_router() -> APIRouter:
-    router = APIRouter(prefix="/api/custom/strategy-optimizer", tags=["strategy-optimizer"])
+    router = APIRouter(
+        prefix="/api/custom/strategy-optimizer",
+        tags=["strategy-optimizer"],
+        dependencies=[Depends(require_paid_user)],
+    )
 
     def strategy_for(request: Request, strategy_id: str):
         try:

@@ -141,10 +141,23 @@ function SubscriptionGuard({ children }: { children: React.ReactNode }) {
   return <>{children}</>
 }
 
-function OnboardingRoute() {
+function PaidFeatureGuard({ children }: { children: React.ReactNode }) {
   const mode = useQuery({ queryKey: ['auth-mode'], queryFn: api.authMode, staleTime: Infinity })
-  if (mode.isLoading) return <div className="min-h-screen bg-base grid place-items-center"><Logo size={28} /></div>
-  return mode.data?.mode === 'multi_user' ? <Navigate to="/" replace /> : <Onboarding />
+  const account = useQuery({
+    queryKey: ['account-me'], queryFn: api.accountMe,
+    enabled: mode.data?.mode === 'multi_user', staleTime: 5_000,
+  })
+  const billing = useQuery({
+    queryKey: ['billing-me'], queryFn: api.billingMe,
+    enabled: mode.data?.mode === 'multi_user', staleTime: 5_000,
+  })
+  if (mode.isLoading || (mode.data?.mode === 'multi_user' && (account.isLoading || billing.isLoading))) {
+    return <div className="min-h-screen bg-base grid place-items-center"><Logo size={28} className="text-foreground" /></div>
+  }
+  if (mode.data?.mode === 'multi_user' && account.data?.role !== 'admin' && !billing.data?.effective_plan.startsWith('pro_')) {
+    return <Navigate to="/subscription" replace />
+  }
+  return <>{children}</>
 }
 
 function PageUsageTracker() {
@@ -234,9 +247,11 @@ export const router = createBrowserRouter([
         return {
           path: route.path.slice(1),
           element: (
-            <ExtensionBoundary extensionId={route.extensionId}>
-              <ExtensionPage />
-            </ExtensionBoundary>
+            <PaidFeatureGuard>
+              <ExtensionBoundary extensionId={route.extensionId}>
+                <ExtensionPage />
+              </ExtensionBoundary>
+            </PaidFeatureGuard>
           ),
         }
       }),
