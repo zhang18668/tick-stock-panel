@@ -50,6 +50,7 @@ export type JobItem = {
   attempts: number
   progress: Record<string, unknown> | null
   reason: string | null
+  started_at: string | null
 }
 export type StrategyJob = {
   id: string
@@ -58,6 +59,8 @@ export type StrategyJob = {
   counts: Record<string, number>
   current_strategy_id: string | null
   current_period: string | null
+  cancel_requested: boolean
+  updated_at: string
   error: string | null
 }
 export type StrategyLibrary = {

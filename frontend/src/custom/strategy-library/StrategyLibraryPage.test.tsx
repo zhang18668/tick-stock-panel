@@ -5,6 +5,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { StrategyLibraryPage } from './StrategyLibraryPage'
 import { StrategyCard } from './components/StrategyCard'
+import { StrategyDetail } from './components/StrategyDetail'
 import { BacktestJobPanel } from './components/BacktestJobPanel'
 
 const { library, saveGroups } = vi.hoisted(() => ({
@@ -47,6 +48,9 @@ it('moves a strategy only after the user selects a group', async () => {
   await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)) })
   const select = host.querySelector<HTMLSelectElement>('select[aria-label="放入分组 X 策略"]')
   expect(select).toBeTruthy()
+  const groupFilter = host.querySelector<HTMLSelectElement>('select[aria-label="筛选分组"]')
+  expect(groupFilter?.className).toContain('text-foreground')
+  expect(groupFilter?.querySelector('option')?.className).toContain('bg-card')
   await act(async () => {
     if (!select) return
     select.value = 'g1'
@@ -67,6 +71,67 @@ it('shows unavailable windows and explains why the backtest is missing', async (
   expect(host.textContent).toContain('回测区间超过当前限制')
 })
 
+it('renders the strategy name as a visible heading instead of a placeholder-shaped chip', async () => {
+  const strategy = { ...sampleLibrary().strategies[0], source: 'BUILTIN' } as unknown as import('./api').StrategySummary
+  await act(async () => root.render(<StrategyCard strategy={strategy} groups={[]} groupId="" onGroup={() => undefined} onDetails={() => undefined} onRun={() => undefined} results={{}} />))
+  const heading = host.querySelector('h3')
+  expect(heading?.textContent).toBe('X 策略')
+  expect(heading?.className).toContain('text-base')
+  expect(host.querySelector('h3.rounded-full')).toBeNull()
+})
+
+it('uses readable source and tag chips and A-share colors for returns', async () => {
+  const strategy = {
+    ...sampleLibrary().strategies[0],
+    source: 'builtin',
+    tags: ['趋势策略'],
+    asset_types: ['stock'],
+    timeframes: ['1d'],
+  } as unknown as import('./api').StrategySummary
+  const result = (total_return: number) => ({
+    period: '3m' as const, status: 'completed', actual_start: '2026-07-09', actual_end: '2026-10-09',
+    total_return, max_drawdown: -0.05, sharpe: 1, win_rate: 0.5, profit_factor: 1.2,
+    benchmark_return: null, excess_return: null, trade_count: 3, config_fingerprint: null,
+    source_fingerprint: null, updated_at: null, reason: null,
+  })
+  await act(async () => root.render(<StrategyCard strategy={strategy} groups={[]} groupId="" onGroup={() => undefined} onDetails={() => undefined} onRun={() => undefined} results={{ '3m': result(-0.03), '6m': result(0.03) }} />))
+  const chips = [...host.querySelectorAll('span')]
+  expect(chips.find(node => node.textContent === 'builtin')?.className).toContain('bg-elevated')
+  expect(chips.find(node => node.textContent === '趋势策略')?.className).toContain('bg-elevated')
+  const returnMetrics = [...host.querySelectorAll('div')].filter(node => node.children.length === 2 && node.children[0]?.textContent === '收益')
+  expect(returnMetrics.find(node => node.textContent?.includes('-3.00%'))?.lastElementChild?.className).toContain('text-bear')
+  expect(returnMetrics.find(node => node.textContent?.includes('+3.00%'))?.lastElementChild?.className).toContain('text-bull')
+})
+
+it('keeps strategy detail content inside a viewport-sized scrollable dialog', async () => {
+  const strategy = {
+    ...sampleLibrary().strategies[0],
+    rules: [],
+    entry_signals: [],
+    exit_signals: [],
+    basic_filter: { long_filter_key: 'x'.repeat(180) },
+    execution: {},
+    params: [],
+    params_defaults: {},
+    scoring: {},
+    scoring_directions: {},
+    stop_loss: null,
+    take_profit: null,
+    trailing_stop: null,
+    trailing_take_profit_activate: null,
+    trailing_take_profit_drawdown: null,
+    max_hold_days: null,
+    source: 'BUILTIN',
+  } as unknown as import('./api').StrategySummary
+  await act(async () => root.render(<StrategyDetail strategy={strategy} results={{}} onClose={() => undefined} />))
+  const dialog = host.querySelector<HTMLElement>('[role="dialog"]')
+  expect(dialog?.className).toContain('max-h-[92dvh]')
+  expect(dialog?.className).toContain('flex-col')
+  expect(dialog?.querySelector('[data-dialog-content]')?.className).toContain('overflow-y-auto')
+  expect(dialog?.querySelector('[data-dialog-content]')?.className).toContain('min-h-0')
+  expect(host.querySelector('[data-dialog-content] .break-all')).toBeTruthy()
+})
+
 it('shows partial task progress and offers retry for failed periods', async () => {
   const retry = vi.fn()
   const item = { strategy_id: 'builtin_x', period: '3m' as const, window: { requested_start: '2026-07-08', requested_end: '2026-10-08', actual_start: null, actual_end: null, availability: 'available', reason: null }, attempts: 1, progress: null, reason: 'worker error', status: 'failed' }
@@ -77,4 +142,37 @@ it('shows partial task progress and offers retry for failed periods', async () =
   expect(retryButton).toBeTruthy()
   await act(async () => { retryButton?.click() })
   expect(retry).toHaveBeenCalledOnce()
+})
+
+it('shows the active backtest item progress instead of claiming the job is still starting', async () => {
+  const item = {
+    strategy_id: 'builtin_x', period: '12m' as const,
+    window: { requested_start: '2025-10-08', requested_end: '2026-10-08', actual_start: '2025-10-08', actual_end: '2026-10-08', availability: 'available', reason: null },
+    status: 'running', attempts: 1, progress: { day: 120, total: 240, date: '2026-06-01' }, reason: null,
+    started_at: '2026-10-10T01:00:00+00:00',
+  }
+  const job = { id: 'job-1', state: 'running', items: [item], counts: { running: 1 }, current_strategy_id: 'builtin_x', current_period: '12m', error: null }
+  await act(async () => root.render(<BacktestJobPanel job={job} strategies={sampleLibrary().strategies as unknown as import('./api').StrategySummary[]} onRunAll={() => undefined} onCancel={() => undefined} onRetry={() => undefined} onRefresh={() => undefined} busy />))
+  expect(host.textContent).toContain('任务运行中')
+  expect(host.textContent).toContain('120 / 240')
+  expect(host.textContent).toContain('2026-06-01')
+  expect(host.textContent).not.toContain('正在启动…')
+})
+
+it('reports cancel and refresh actions and uses explicit readable select colors', async () => {
+  const onCancel = vi.fn().mockResolvedValue(undefined)
+  const onRefresh = vi.fn().mockResolvedValue(undefined)
+  const item = { strategy_id: 'builtin_x', period: '3m' as const, window: { requested_start: '2026-07-08', requested_end: '2026-10-08', actual_start: null, actual_end: null, availability: 'available', reason: null }, attempts: 1, progress: null, reason: null, started_at: null, status: 'running' }
+  const job = { id: 'job-2', state: 'running', items: [item], counts: { running: 1 }, current_strategy_id: 'builtin_x', current_period: '3m', cancel_requested: false, error: null }
+  await act(async () => root.render(<><BacktestJobPanel job={job} strategies={sampleLibrary().strategies as unknown as import('./api').StrategySummary[]} onRunAll={() => undefined} onCancel={onCancel} onRetry={() => undefined} onRefresh={onRefresh} busy /></>))
+  const cancelButton = [...host.querySelectorAll('button')].find(button => button.textContent === '取消任务')
+  const refreshButton = [...host.querySelectorAll('button')].find(button => button.textContent === '立即刷新')
+  expect(cancelButton?.className).toContain('text-foreground')
+  expect(refreshButton?.className).toContain('text-foreground')
+  await act(async () => { cancelButton?.click(); await Promise.resolve() })
+  expect(onCancel).toHaveBeenCalledOnce()
+  expect(host.textContent).toContain('取消请求已发送')
+  await act(async () => { refreshButton?.click(); await Promise.resolve() })
+  expect(onRefresh).toHaveBeenCalledOnce()
+  expect(host.textContent).toContain('状态已刷新')
 })
