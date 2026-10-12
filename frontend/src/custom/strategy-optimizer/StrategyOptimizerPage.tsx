@@ -5,8 +5,9 @@ import { api } from '../../lib/api'
 import { QK } from '../../lib/queryKeys'
 import { persistStrategyPoolAddition, persistStrategyPoolRemoval } from '../../lib/useStrategyPool'
 import { strategyLibraryApi, type StrategyGroup } from '../strategy-library/api'
-import { optimizerApi, type OptimizerContract, type OptimizerRun, type OptimizerStrategy, type RobustPreview } from './api'
+import { optimizerApi, type OptimizerContract, type OptimizerRun, type OptimizerStrategy, type RobustPreview, type RobustResult } from './api'
 import { RobustnessConfig } from './RobustnessConfig'
+import { RobustnessResults } from './RobustnessResults'
 
 const activeStates = ['queued', 'running', 'cancelling']
 
@@ -170,6 +171,11 @@ export function StrategyOptimizerPage() {
     && (!requestedIds.length || requestedIds.includes(item.strategy_id)))
   const resultStrategyId = String(run?.config.strategy_id ?? '')
   const resultContract = contract?.strategy_id === resultStrategyId ? contract : null
+  const robustTop3 = (run?.result?.robust_result as RobustResult | undefined)?.top3 ?? []
+  const robustSavedRanks = new Set(robustTop3.flatMap((_candidate, index) => {
+    const strategyId = `custom_opt_${run?.run_id.slice(0, 12)}_top${index + 1}`
+    return savedRecommendationIds.has(strategyId) || strategies.some(item => item.strategy_id === strategyId) ? [index + 1] : []
+  }))
   const weightTotal = Object.values(weights).reduce((sum, value) => sum + value, 0)
   const setRange = (id: string, key: 'min' | 'max' | 'step', value: number) => setRanges(current => ({ ...current, [id]: { ...current[id], [key]: value } }))
   const toggle = (values: string[], setter: (values: string[]) => void, id: string) => setter(values.includes(id) ? values.filter(value => value !== id) : [...values, id])
@@ -271,7 +277,7 @@ export function StrategyOptimizerPage() {
           <label className="text-sm">随机种子<input type="number" value={seed} onChange={e => setSeed(Number(e.target.value))} className="mt-1 block w-full rounded border bg-base p-2" /></label>
         </div>}
         {evaluationMode === 'legacy' && <><fieldset className="grid gap-3 sm:grid-cols-2"><legend className="text-sm font-medium">评分权重（合计 100%）</legend>{Object.entries(weights).map(([key, value]) => <label key={key} className="text-sm">{key}<input type="number" min={0} max={1} step={0.01} value={value} onChange={e => setWeights(current => ({ ...current, [key]: Number(e.target.value) }))} className="mt-1 block w-full rounded border bg-base p-2" /></label>)}</fieldset><p className="text-xs text-muted">当前权重合计：{(weightTotal * 100).toFixed(0)}%</p></>}
-        <button className="w-fit rounded bg-primary px-4 py-2 text-white disabled:opacity-50" disabled={!start || !end || start >= end || (evaluationMode === 'legacy' && Math.abs(weightTotal - 1) > 1e-9) || Object.values(discreteValues).some(values => values.length === 0) || !!run || (evaluationMode === 'robust' && !robustPreview?.run_available)} onClick={submit}>{evaluationMode === 'robust' ? '稳健模式暂不可启动' : '启动优化'}</button>
+        <button className="w-fit rounded bg-primary px-4 py-2 text-white disabled:opacity-50" disabled={!start || !end || start >= end || (evaluationMode === 'legacy' && Math.abs(weightTotal - 1) > 1e-9) || Object.values(discreteValues).some(values => values.length === 0) || !!run || (evaluationMode === 'robust' && !robustPreview?.run_available)} onClick={submit}>{evaluationMode === 'robust' ? '启动稳健优化' : '启动优化'}</button>
       </>}
     </section>
     {runs.length > 0 && <section className="rounded border p-4"><h2 className="mb-3 font-medium">最近优化任务</h2><ul className="grid gap-2">{runs.slice(0, 10).map(item => {
@@ -286,10 +292,16 @@ export function StrategyOptimizerPage() {
       {activeStates.includes(run.state) && <button className="mt-3 rounded border px-4 py-2" onClick={() => optimizerApi.cancel(run.run_id).then(setRun)}>取消</button>}
       {['interrupted', 'failed'].includes(run.state) && <button className="mt-3 rounded border px-4 py-2" onClick={() => optimizerApi.resume(run.run_id).then(setRun)}>恢复任务</button>}
       {run.result && <>
+        {run.config.evaluation_mode === 'robust' && run.result.robust_result && <RobustnessResults
+          result={run.result.robust_result as RobustResult}
+          savedRanks={robustSavedRanks}
+          savingRank={saveMutation.isPending ? saveMutation.variables : null}
+          onSave={rank => { setError(''); saveMutation.mutate(rank) }}
+        />}
         <p className="mt-2 text-sm text-muted">优化区间：{String(run.config.start ?? '—')} 至 {String(run.config.end ?? '—')}；停止原因：{String(run.result.stop_reason ?? '—')}；已评估 {String(run.result.evaluated_candidates ?? 0)} 个候选；数据指纹 {String(run.config.input_fingerprint ?? '—').slice(0, 12)}</p>
         {Array.isArray(run.result.training_candidates) && <p className="mt-1 text-xs text-muted">训练候选失败数：{(run.result.training_candidates as Record<string, unknown>[]).filter(item => Boolean(item.training_error)).length}</p>}
         {run.result.insufficient_recommendations === true && <p className="mt-2 text-sm text-amber-600">通过回撤、交易数等门槛的候选不足 3 个，以下仅展示可用推荐。</p>}
-        <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">{((run.result.top3 as Record<string, unknown>[]) ?? []).map((item, index) => {
+        {run.config.evaluation_mode !== 'robust' && <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">{((run.result.top3 as Record<string, unknown>[]) ?? []).map((item, index) => {
           const metrics = (item.oos_metrics && typeof item.oos_metrics === 'object' ? item.oos_metrics : {}) as MetricRow
           const folds = metricRows(metrics.fold_metrics).length
             ? metricRows(metrics.fold_metrics)
@@ -361,8 +373,8 @@ export function StrategyOptimizerPage() {
               })}</div> : <p className="mt-1 text-xs text-muted">没有逐折指标</p>}
             </div>
           </article>
-        })}</div>
-        {((run.result.top3 as unknown[]) ?? []).length === 0 && <p className="mt-3 text-sm text-muted">没有候选通过硬性筛选门槛，请调整范围或条件后重试。</p>}
+        })}</div>}
+        {run.config.evaluation_mode !== 'robust' && ((run.result.top3 as unknown[]) ?? []).length === 0 && <p className="mt-3 text-sm text-muted">没有候选通过硬性筛选门槛，请调整范围或条件后重试。</p>}
       </>}
     </section>}
   </main>

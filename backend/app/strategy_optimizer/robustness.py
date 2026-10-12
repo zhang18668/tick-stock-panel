@@ -8,6 +8,7 @@ from dataclasses import asdict, replace
 from .contracts import (
     RobustCandidate,
     RobustGates,
+    SegmentMetrics,
     SegmentObservation,
 )
 from .neighborhood import count_legal_neighbors, generate_neighbors
@@ -47,7 +48,14 @@ class RobustnessRunner:
         if cancel_event.is_set():
             return self._cancelled_result()
         if len(baseline_segments) != 3 or any(segment.metrics is None for segment in baseline_segments):
-            raise ValueError("default baseline cannot be evaluated across all development windows")
+            failures = "; ".join(
+                f"{segment.window_id}: {segment.failure or 'required metrics unavailable'}"
+                for segment in baseline_segments if segment.metrics is None
+            )
+            raise ValueError(
+                "default baseline cannot be evaluated across all development windows"
+                + (f": {failures}" if failures else "")
+            )
 
         references = {}
         for reference in request.get("reference_candidates", ()):
@@ -71,10 +79,27 @@ class RobustnessRunner:
         if not 1 <= main_budget <= 500 or not 1 <= batch_size <= 50 or not 1 <= max_rounds <= 10:
             raise ValueError("robust search budget is outside supported limits")
         candidates: dict[tuple, RobustCandidate] = {}
-        examined = 0
+        resume_state = request.get("resume_state") or {}
+        if resume_state:
+            if resume_state.get("version") != 1 or resume_state.get("input_fingerprint") != request.get("input_fingerprint"):
+                raise ValueError("robust checkpoint does not match the frozen task")
+            for payload in resume_state.get("candidates", ()):
+                restored = self._candidate_from_payload(payload)
+                key = (tuple(sorted(restored.parameters.items())), restored.buy_signals, restored.sell_signals)
+                candidates[key] = restored
+                self.search_service.seen.add(key)
+            examined = int(resume_state.get("examined", len(candidates)))
+            search_round = int(resume_state.get("round", 0))
+            self.search_service.round_index = search_round
+            if resume_state.get("random_state"):
+                self.search_service.random.setstate(_tuple_tree(resume_state["random_state"]))
+            previous_ranked = self._feedback_rows(score_development(tuple(candidates.values()), gates)) if candidates else []
+        else:
+            examined = 0
+            search_round = 0
+            previous_ranked = []
         stop_reason = "budget_exhausted"
-        previous_ranked = []
-        for round_number in range(1, max_rounds + 1):
+        for round_number in range(search_round + 1, max_rounds + 1):
             if cancel_event.is_set():
                 return self._cancelled_result(candidates, examined)
             count = min(batch_size, main_budget - examined)
@@ -129,6 +154,8 @@ class RobustnessRunner:
                         "stage": "search",
                         "input_fingerprint": request.get("input_fingerprint"),
                         "examined": examined,
+                        "round": round_number,
+                        "random_state": self.search_service.random.getstate(),
                         "candidates": [self._candidate_payload(row) for row in candidates.values()],
                     },
                 }
@@ -153,6 +180,7 @@ class RobustnessRunner:
             key=lambda row: (-row.base_score, row.candidate.candidate_id),
         )[:center_limit]
         scored_centers = {row.candidate.candidate_id: row for row in ranked}
+        verified_center_ids: set[str] = set()
         neighbor_used = 0
         neighbor_cache_hits = 0
         neighborhood_coverage = []
@@ -217,6 +245,7 @@ class RobustnessRunner:
                 scored_centers[center.candidate.candidate_id] = score_neighborhood(
                     center, neighbor_ranked, gates
                 )
+                verified_center_ids.add(center.candidate.candidate_id)
             else:
                 scored_centers[center.candidate.candidate_id] = score_neighborhood(
                     center, (), gates
@@ -230,6 +259,7 @@ class RobustnessRunner:
                 row
                 for row in scored_centers.values()
                 if row.eligible and row.robust_score is not None
+                and row.candidate.candidate_id in verified_center_ids
             ),
             key=lambda row: (
                 -row.robust_score,
@@ -251,6 +281,7 @@ class RobustnessRunner:
             "candidate_details": [self._candidate_payload(row) for row in candidates.values()],
             "frozen_candidate_ids": [row.candidate.candidate_id for row in top3],
             "top3": [self._ranked_payload(row) for row in top3],
+            "evaluated_candidates": examined,
             "budgets": {
                 "main_limit": main_budget,
                 "main_used": examined,
@@ -260,7 +291,48 @@ class RobustnessRunner:
                 "neighborhood_centers": center_limit,
                 "neighborhood_coverage": neighborhood_coverage,
             },
+            "robust_result": {
+                "version": 1,
+                "time_plan": {
+                    "development": [self._window_payload(row) for row in windows],
+                    "holdout": request.get("holdout_window"),
+                    "diagnostics": [],
+                },
+                "baseline": self._observations_payload(baseline_segments),
+                "references": {
+                    key: self._observations_payload(value) for key, value in references.items()
+                },
+                "candidates": [self._ranked_payload(row) for row in ranked],
+                "top3": [self._ranked_payload(row) for row in top3],
+                "frozen_candidate_ids": [row.candidate.candidate_id for row in top3],
+                "verified_candidate_ids": sorted(verified_center_ids),
+                "holdout": {"status": "pending" if request.get("holdout_window") else "not_applicable", "usage": request.get("holdout_usage", "unknown"), "results": []},
+                "diagnostics": [],
+                "budgets": {
+                    "main_limit": main_budget,
+                    "main_used": examined,
+                    "neighborhood_limit": neighborhood_budget,
+                    "neighborhood_used": neighbor_used,
+                    "neighborhood_coverage": neighborhood_coverage,
+                },
+            },
         }
+
+    @staticmethod
+    def _window_payload(window):
+        return {"id": window.id, "start": window.start.isoformat(), "end": window.end.isoformat(), "role": window.role}
+
+    @staticmethod
+    def _candidate_from_payload(payload):
+        segments = []
+        for item in payload.get("segments", ()):
+            raw_metrics = item.get("metrics")
+            metrics = SegmentMetrics(**raw_metrics) if raw_metrics else None
+            segments.append(SegmentObservation(item["window_id"], metrics, item.get("failure")))
+        return RobustCandidate(
+            str(payload["candidate_id"]), dict(payload.get("parameters", {})),
+            tuple(payload.get("buy_signals", ())), tuple(payload.get("sell_signals", ())), tuple(segments),
+        )
 
     def _evaluate_windows(self, candidate, windows, cache, cancel_event, progress_cb, label, *, curve):
         observations = []
@@ -397,3 +469,7 @@ class RobustnessRunner:
             "top3": [],
             "budgets": {"main_used": examined, "neighborhood_used": neighbor_used},
         }
+
+
+def _tuple_tree(value):
+    return tuple(_tuple_tree(item) for item in value) if isinstance(value, list) else value

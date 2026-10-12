@@ -25,3 +25,14 @@ def test_constraint_accepts_literal_enum_value():
         (parameter,), constraints=({"left": "mode", "op": "ne", "right": "blocked"},)
     )
     assert all(item.parameters["mode"] != "blocked" for item in search.first_round(2))
+
+
+def test_first_round_numeric_candidates_stay_on_the_step_grid():
+    parameter = ParameterSpec("threshold", "Threshold", "float", 1.3, 1.0, 2.05, 0.3)
+    candidates = AdaptiveSearchService((parameter,), seed=1).first_round(10)
+
+    assert all(1.0 <= item.parameters["threshold"] <= 1.9 for item in candidates)
+    assert all(
+        abs((item.parameters["threshold"] - 1.0) / 0.3 - round((item.parameters["threshold"] - 1.0) / 0.3)) < 1e-8
+        for item in candidates
+    )

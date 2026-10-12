@@ -99,6 +99,8 @@ def score_development(
             continue
         rankable.add(item.candidate_id)
         for index, row in enumerate(typed_metrics, 1):
+            if row.trade_count == 0:
+                failure_map[item.candidate_id].append(f"segment {index}: no trades")
             if row.max_drawdown > gates.max_drawdown:
                 failure_map[item.candidate_id].append(f"segment {index}: drawdown exceeds limit")
             if row.trade_count < gates.min_trades:
@@ -108,7 +110,9 @@ def score_development(
         candidate_id
         for candidate_id in rankable
         if not any(
-            reason.endswith("drawdown exceeds limit") or reason.endswith("insufficient trades")
+            reason.endswith("drawdown exceeds limit")
+            or reason.endswith("insufficient trades")
+            or reason.endswith("no trades")
             for reason in failure_map[candidate_id]
         )
     }

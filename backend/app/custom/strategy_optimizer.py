@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import threading
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
@@ -270,16 +271,32 @@ def build_router() -> APIRouter:
             strategy = strategy_for(request, req.strategy_id)
             contract_obj = _contract(strategy)
             validate_run_config(req.model_dump(), contract_obj)
-            source = _optimization_gateway
+            source = getattr(request.app.state, "strategy_optimization_gateway", None) or _optimization_gateway
             if source is None:
                 raise ValueError("strategy optimization gateway is unavailable")
             preview_value = source.preview_robust_config(req.model_dump())
+            snapshot = _snapshot_strategy(strategy)
+            reference_ids = (req.robust_config or {}).get("reference_strategy_ids", [])
+            if not isinstance(reference_ids, list) or len(reference_ids) > 2 or any(not isinstance(item, str) or not item for item in reference_ids) or len(reference_ids) != len(set(reference_ids)):
+                raise ValueError("at most two unique reference strategies are supported")
+            for reference_id in reference_ids:
+                reference = strategy_for(request, reference_id)
+                if _contract(reference).asset_type != contract_obj.asset_type:
+                    raise ValueError("reference strategy asset type must match the optimized strategy")
+                if _snapshot_strategy(reference) is None:
+                    raise ValueError(f"reference strategy source snapshot is unavailable: {reference_id}")
+            if req.mode != "position":
+                snapshot_blocker = "robust evaluation requires position mode"
+            elif snapshot is None:
+                snapshot_blocker = "strategy source snapshot is unavailable"
+            else:
+                snapshot_blocker = None
             return {
                 **preview_value,
                 "strategy_id": req.strategy_id,
-                "strategy_snapshot_available": False,
-                "run_available": False,
-                "run_blocker": "strategy snapshot execution is unavailable",
+                "strategy_snapshot_available": snapshot is not None,
+                "run_available": snapshot_blocker is None,
+                "run_blocker": snapshot_blocker,
             }
         except HTTPException:
             raise
@@ -288,11 +305,30 @@ def build_router() -> APIRouter:
 
     @router.post("/runs", status_code=202)
     def create_run(req: RunRequest, request: Request):
-        if req.evaluation_mode == "robust":
-            raise HTTPException(409, "稳健模式暂不可启动：排队任务的策略源码快照执行尚未实现")
         try:
-            contract_obj = _contract(strategy_for(request, req.strategy_id))
+            strategy = strategy_for(request, req.strategy_id)
+            contract_obj = _contract(strategy)
             config = validate_run_config(req.model_dump(), contract_obj)
+            snapshot = _snapshot_strategy(strategy) if req.evaluation_mode == "robust" else None
+            if req.evaluation_mode == "robust" and req.mode != "position":
+                raise ValueError("robust evaluation requires position mode")
+            if req.evaluation_mode == "robust" and snapshot is None:
+                raise ValueError("strategy source snapshot is unavailable")
+            reference_snapshots = []
+            if req.evaluation_mode == "robust":
+                robust_config = req.robust_config or {}
+                reference_ids = robust_config.get("reference_strategy_ids", [])
+                if not isinstance(reference_ids, list) or len(reference_ids) > 2 or any(not isinstance(item, str) or not item for item in reference_ids) or len(reference_ids) != len(set(reference_ids)):
+                    raise ValueError("at most two unique reference strategies are supported")
+                for reference_id in reference_ids:
+                    reference = strategy_for(request, reference_id)
+                    reference_contract = _contract(reference)
+                    if reference_contract.asset_type != contract_obj.asset_type:
+                        raise ValueError("reference strategy asset type must match the optimized strategy")
+                    reference_snapshot = _snapshot_strategy(reference)
+                    if reference_snapshot is None:
+                        raise ValueError(f"reference strategy source snapshot is unavailable: {reference_id}")
+                    reference_snapshots.append(reference_snapshot)
         except (ValueError, TypeError) as exc:
             raise HTTPException(422, str(exc)) from exc
         app_manager = manager(request)
@@ -305,6 +341,15 @@ def build_router() -> APIRouter:
                 "end": config.end.isoformat(),
             },
         }
+        if snapshot is not None:
+            run_config["strategy_snapshot"] = snapshot
+        if req.evaluation_mode == "robust":
+            run_config["reference_strategy_snapshots"] = reference_snapshots
+        if req.evaluation_mode == "robust":
+            preview_gateway = getattr(request.app.state, "strategy_optimization_gateway", None) or _optimization_gateway
+            if preview_gateway is None:
+                raise HTTPException(422, "strategy optimization gateway is unavailable")
+            run_config["robust_preview"] = preview_gateway.preview_robust_config(req.model_dump())
         run_config["input_fingerprint"] = _input_fingerprint(request, run_config)
         try:
             return app_manager.create(run_config)
@@ -331,12 +376,24 @@ def build_router() -> APIRouter:
         if record.get("state") != "succeeded":
             raise HTTPException(409, "优化任务尚未成功完成")
         config = record.get("config", {})
-        strategy = strategy_for(request, str(config.get("strategy_id", "")))
-        contract_obj = _contract(strategy)
-        source_path = getattr(strategy, "file_path", None)
-        if not source_path or not source_path.is_file():
-            raise HTTPException(409, "策略源文件不可用, 无法另存优化结果")
-        source_code = source_path.read_text(encoding="utf-8")
+        frozen_snapshot = config.get("strategy_snapshot") if config.get("evaluation_mode") == "robust" else None
+        if isinstance(frozen_snapshot, dict):
+            if frozen_snapshot.get("strategy_id") != config.get("strategy_id") or not isinstance(frozen_snapshot.get("source_code"), str):
+                raise HTTPException(409, "冻结策略快照无效，无法另存优化结果")
+            strategy = type("FrozenStrategy", (), {
+                "meta": frozen_snapshot.get("meta", {}),
+                "entry_signals": frozen_snapshot.get("entry_signals", []),
+                "exit_signals": frozen_snapshot.get("exit_signals", []),
+            })()
+            contract_obj = _contract(strategy)
+            source_code = frozen_snapshot["source_code"]
+        else:
+            strategy = strategy_for(request, str(config.get("strategy_id", "")))
+            contract_obj = _contract(strategy)
+            source_path = getattr(strategy, "file_path", None)
+            if not source_path or not source_path.is_file():
+                raise HTTPException(409, "策略源文件不可用, 无法另存优化结果")
+            source_code = source_path.read_text(encoding="utf-8")
         candidates = (record.get("result") or {}).get("top3")
         if not isinstance(candidates, list) or not candidates:
             raise HTTPException(409, "没有通过筛选的推荐参数可保存")
@@ -487,10 +544,14 @@ def setup(registrar: BackendExtensionRegistrar) -> None:
 
 def _build_evaluator(request: Request):
     from app.backtest.worker import make_worker_task, run_worker_task
+    from app.strategy_optimizer.store import OptimizationRunStore
 
     data_dir = request.app.state.repo.store.data_dir
+    run_store = OptimizationRunStore(data_dir / "strategy_optimizer" / "runs")
 
     def evaluate(config, progress_cb, cancel_event):
+        config = {**config, "run_id": config.get("run_id")}
+        config["holdout_store_root"] = str(run_store.root)
         task = make_worker_task("strategy_optimizer", data_dir, config)
         return run_worker_task(task, progress_cb, cancel_event)
 
@@ -498,6 +559,20 @@ def _build_evaluator(request: Request):
 
 
 def _input_fingerprint(request: Request, config: dict) -> str:
+    if config.get("strategy_snapshot"):
+        snapshot = config["strategy_snapshot"]
+        repo = request.app.state.repo
+        payload = {
+            "strategy_id": config["strategy_id"],
+            "optimizer_api_version": 1,
+            "backtest_method_version": 1,
+            "robust_scoring_version": 1,
+            "time_plan_version": 1,
+            "strategy_snapshot_hash": snapshot["sha256"],
+            "data_generation": repo.get_matrix_data_generation(config.get("asset_type", "stock")),
+            "config": {key: value for key, value in config.items() if key not in {"resume_state", "input_fingerprint"}},
+        }
+        return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
     strategy = request.app.state.strategy_engine.get(config["strategy_id"])
     source_hash = ""
     if strategy.file_path and strategy.file_path.is_file():
@@ -520,3 +595,22 @@ def _input_fingerprint(request: Request, config: dict) -> str:
         },
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def _snapshot_strategy(strategy) -> dict | None:
+    source_path = getattr(strategy, "file_path", None)
+    if source_path is None or not Path(source_path).is_file():
+        return None
+    source_path = Path(source_path)
+    source_code = source_path.read_text(encoding="utf-8")
+    dependencies = {
+        path.name: path.read_text(encoding="utf-8")
+        for path in sorted(source_path.parent.glob("_*.py"))
+    }
+    digest = hashlib.sha256(json.dumps({"source": source_code, "dependencies": dependencies}, sort_keys=True).encode()).hexdigest()
+    return {
+        "strategy_id": str(strategy.meta["id"]), "source_code": source_code,
+        "dependencies": dependencies, "source": getattr(strategy, "source", "custom"),
+        "meta": strategy.meta, "entry_signals": list(strategy.entry_signals),
+        "exit_signals": list(strategy.exit_signals), "sha256": digest,
+    }

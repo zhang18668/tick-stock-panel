@@ -4,6 +4,7 @@ import pytest
 
 from app.strategy_optimizer.contracts import (
     ParameterSpec,
+    RobustGates,
     StrategyOptimizationContract,
 )
 from app.strategy_optimizer.validation import validate_run_config
@@ -63,3 +64,10 @@ def test_invalid_contract_and_unknown_fields_are_rejected():
             },
             contract,
         )
+
+
+def test_robust_gate_values_reject_non_finite_and_out_of_range_values():
+    with pytest.raises(ValueError, match="finite"):
+        RobustGates(min_stability=float("nan"))
+    with pytest.raises(ValueError, match="within"):
+        RobustGates(max_drawdown=1.1)

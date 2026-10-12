@@ -63,6 +63,19 @@ def test_manager_cancellation_prevents_result_publication(tmp_path):
     assert "result" not in result
 
 
+def test_manager_supplies_persistent_run_id_to_evaluator(tmp_path):
+    received = {}
+
+    def evaluator(config, _progress, _cancel):
+        received.update(config)
+        return {"top3": []}
+
+    manager = OptimizationJobManager(OptimizationRunStore(tmp_path), evaluator)
+    run = manager.create({"evaluation_mode": "robust"})
+    wait_for_state(manager, run["run_id"], "succeeded")
+    assert received["run_id"] == run["run_id"]
+
+
 def test_robust_resume_rejects_changed_fingerprint(tmp_path):
     store = OptimizationRunStore(tmp_path)
     store.create(

@@ -9,7 +9,7 @@ from app.strategy_optimizer.store import OptimizationRunStore
 
 
 class FakeStrategy:
-    def __init__(self):
+    def __init__(self, source_path=None):
         self.meta = {
             "id": "demo",
             "name": "Demo",
@@ -28,7 +28,7 @@ class FakeStrategy:
         }
         self.entry_signals = ["buy_a"]
         self.exit_signals = ["sell_a"]
-        self.file_path = None
+        self.file_path = source_path
         self.source = "custom"
 
 
@@ -63,7 +63,16 @@ def make_client(tmp_path):
             request.state.is_paid_user = getattr(app.state, "test_is_paid_user", False)
         return await call_next(request)
 
-    app.state.strategy_engine = FakeEngine()
+    source_path = tmp_path / "demo.py"
+    source_path.write_text(
+        'META = {"id": "demo", "name": "Demo", "params": '
+        '[{"id": "window", "type": "int", "default": 10, "min": 2, '
+        '"max": 30, "step": 1}]}\nENTRY_SIGNALS = ["buy_a"]\n'
+        'EXIT_SIGNALS = ["sell_a"]\n', encoding="utf-8"
+    )
+    engine = FakeEngine()
+    engine.strategy.file_path = source_path
+    app.state.strategy_engine = engine
     repo = FakeRepo()
     repo.store = SimpleNamespace(data_dir=tmp_path)
     app.state.repo = repo
@@ -140,8 +149,24 @@ def test_create_run_uses_manager_and_persists_owner_scope(tmp_path):
     }
 
 
-def test_robust_run_is_rejected_until_snapshot_execution_exists(tmp_path):
+def test_robust_run_queues_frozen_strategy_snapshot(tmp_path):
     client = make_client(tmp_path)
+    source = tmp_path / "demo.py"
+    source.write_text(
+        'META = {"id": "demo", "name": "Demo", "params": '
+        '[{"id": "window", "type": "int", "default": 10, "min": 2, '
+        '"max": 30, "step": 1}]}\nENTRY_SIGNALS = ["buy_a"]\n'
+        'EXIT_SIGNALS = ["sell_a"]\n',
+        encoding="utf-8",
+    )
+    client.app.state.strategy_engine.get("demo").file_path = source
+    client.app.state.strategy_optimization_gateway = SimpleNamespace(
+        preview_robust_config=lambda _config: {"time_plan": {}, "budgets": {}}
+    )
+    manager_config = {}
+    client.app.state.strategy_optimizer_manager = SimpleNamespace(
+        create=lambda config: manager_config.update(config) or {"run_id": "robust-run", "config": config}
+    )
     response = client.post(
         "/api/custom/strategy-optimizer/runs",
         json={
@@ -153,8 +178,98 @@ def test_robust_run_is_rejected_until_snapshot_execution_exists(tmp_path):
         },
     )
 
-    assert response.status_code == 409
-    assert "源码快照执行" in response.json()["detail"]
+    assert response.status_code == 202
+    assert manager_config["strategy_snapshot"]["source_code"] == source.read_text(encoding="utf-8")
+    assert manager_config["strategy_snapshot"]["sha256"]
+
+
+def test_robust_input_fingerprint_uses_frozen_snapshot_after_live_edit(tmp_path):
+    from app.custom.strategy_optimizer import _input_fingerprint
+
+    client = make_client(tmp_path)
+    strategy = client.app.state.strategy_engine.get("demo")
+    snapshot = {
+        "sha256": "frozen-hash", "source_code": "original",
+        "meta": {"id": "demo"}, "entry_signals": [], "exit_signals": [],
+    }
+    config = {"strategy_id": "demo", "asset_type": "stock", "evaluation_mode": "robust", "strategy_snapshot": snapshot}
+    request = SimpleNamespace(app=client.app)
+    before = _input_fingerprint(request, config)
+    strategy.file_path.write_text("edited after queue", encoding="utf-8")
+    assert _input_fingerprint(request, config) == before
+
+
+def test_robust_preview_reports_snapshot_execution_available(tmp_path):
+    client = make_client(tmp_path)
+    source = tmp_path / "demo.py"
+    source.write_text("META = {}\n", encoding="utf-8")
+    client.app.state.strategy_engine.get("demo").file_path = source
+    client.app.state.strategy_optimization_gateway = SimpleNamespace(
+        preview_robust_config=lambda _config: {"time_plan": {}, "budgets": {}}
+    )
+    response = client.post(
+        "/api/custom/strategy-optimizer/preview",
+        json={
+            "strategy_id": "demo", "start": "2022-01-01", "end": "2025-12-31",
+            "evaluation_mode": "robust", "robust_config": {"layout": "diagnostic"},
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["strategy_snapshot_available"] is True
+    assert response.json()["run_available"] is True
+
+
+def test_robust_run_rejects_more_than_two_reference_strategies(tmp_path):
+    client = make_client(tmp_path)
+    client.app.state.strategy_optimization_gateway = SimpleNamespace(
+        preview_robust_config=lambda _config: {"time_plan": {}, "budgets": {}}
+    )
+    response = client.post(
+        "/api/custom/strategy-optimizer/runs",
+        json={
+            "strategy_id": "demo", "start": "2022-01-01", "end": "2025-12-31",
+            "evaluation_mode": "robust",
+            "robust_config": {"layout": "diagnostic", "reference_strategy_ids": ["demo", "demo", "demo"]},
+        },
+    )
+    assert response.status_code == 422
+    assert "two unique reference" in response.json()["detail"]
+
+
+def test_robust_save_uses_frozen_source_after_live_strategy_is_deleted(tmp_path, monkeypatch):
+    from app.api import strategy as strategy_api
+
+    saved = []
+    monkeypatch.setattr(strategy_api, "_save_strategy_code", lambda req, _request: saved.append(req) or {"ok": True})
+
+    async def persist(_request, _result):
+        return None
+
+    monkeypatch.setattr(strategy_api, "_persist_user_strategy", persist)
+    client = make_client(tmp_path)
+    live_path = client.app.state.strategy_engine.get("demo").file_path
+    frozen_code = live_path.read_text(encoding="utf-8")
+    live_path.unlink()
+    run_id = "frozen-source-run"
+    client.app.state.strategy_optimizer_manager = SimpleNamespace(get=lambda _run_id: {
+        "run_id": run_id, "state": "succeeded",
+        "config": {
+            "strategy_id": "demo", "owner_scope": "standalone", "evaluation_mode": "robust",
+            "strategy_snapshot": {
+                "strategy_id": "demo", "source_code": frozen_code,
+                "meta": client.app.state.strategy_engine.get("demo").meta,
+                "entry_signals": ["buy_a"], "exit_signals": ["sell_a"],
+            },
+        },
+        "result": {"top3": [{"parameters": {"window": 12}, "buy_signals": ["buy_a"], "sell_signals": ["sell_a"]}]},
+    })
+
+    response = client.post(f"/api/custom/strategy-optimizer/runs/{run_id}/save")
+
+    assert response.status_code == 200
+    assert len(saved) == 1
+    assert "'default': 12" in saved[0].code
 
 
 def test_save_recommendations_creates_independent_strategies_from_passed_candidates(tmp_path, monkeypatch):

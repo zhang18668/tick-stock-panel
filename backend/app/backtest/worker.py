@@ -6,6 +6,7 @@ import logging
 import multiprocessing as mp
 import os
 import queue
+import tempfile
 import threading
 import time
 import traceback
@@ -245,8 +246,48 @@ def _worker_entry(task: dict[str, Any], event_queue, cancel_event) -> None:
         elif kind == "strategy_optimizer":
             from app.strategy_optimizer.gateway import StrategyOptimizationGateway
 
+            config = task["config"]
+            snapshot = config.get("strategy_snapshot")
+            reference_snapshots = config.get("reference_strategy_snapshots", ())
+            snapshot_temp = tempfile.TemporaryDirectory(prefix="strategy-optimizer-snapshot-") if snapshot or reference_snapshots else None
+            if snapshot:
+                source_dir = Path(snapshot_temp.name) / str(snapshot.get("source", "custom")) / str(snapshot["strategy_id"])
+                source_dir.mkdir(parents=True, exist_ok=True)
+                strategy_path = source_dir / f"{snapshot['strategy_id']}.py"
+                strategy_path.write_text(snapshot["source_code"], encoding="utf-8")
+                for name, code in snapshot.get("dependencies", {}).items():
+                    if Path(name).name != name or not name.startswith("_") or not name.endswith(".py"):
+                        raise ValueError("invalid frozen strategy dependency name")
+                    (source_dir / name).write_text(code, encoding="utf-8")
+                frozen_strategy = StrategyEngine._load_file(strategy_path)
+                if frozen_strategy.meta.get("id") != snapshot["strategy_id"]:
+                    raise ValueError("frozen strategy snapshot identity mismatch")
+                if frozen_strategy.meta != snapshot.get("meta") or frozen_strategy.entry_signals != snapshot.get("entry_signals") or frozen_strategy.exit_signals != snapshot.get("exit_signals"):
+                    raise ValueError("frozen strategy source does not match its declaration snapshot")
+                strategy_engine._strategies = dict(strategy_engine._strategies)
+                strategy_engine._strategies[snapshot["strategy_id"]] = frozen_strategy
+            for reference_snapshot in reference_snapshots:
+                source_dir = Path(snapshot_temp.name) / str(reference_snapshot.get("source", "custom")) / str(reference_snapshot["strategy_id"])
+                source_dir.mkdir(parents=True, exist_ok=True)
+                strategy_path = source_dir / f"{reference_snapshot['strategy_id']}.py"
+                strategy_path.write_text(reference_snapshot["source_code"], encoding="utf-8")
+                for name, code in reference_snapshot.get("dependencies", {}).items():
+                    if Path(name).name != name or not name.startswith("_") or not name.endswith(".py"):
+                        raise ValueError("invalid frozen reference dependency name")
+                    (source_dir / name).write_text(code, encoding="utf-8")
+                frozen_reference = StrategyEngine._load_file(strategy_path)
+                if frozen_reference.meta.get("id") != reference_snapshot["strategy_id"]:
+                    raise ValueError("frozen reference snapshot identity mismatch")
+                if frozen_reference.meta != reference_snapshot.get("meta") or frozen_reference.entry_signals != reference_snapshot.get("entry_signals") or frozen_reference.exit_signals != reference_snapshot.get("exit_signals"):
+                    raise ValueError("frozen reference source does not match its declaration snapshot")
+                strategy_engine._strategies = dict(strategy_engine._strategies)
+                strategy_engine._strategies[reference_snapshot["strategy_id"]] = frozen_reference
             gateway = StrategyOptimizationGateway(service, strategy_engine, repository=repo)
-            result = gateway.run_optimization(task["config"], _progress, cancel_event)
+            try:
+                result = gateway.run_optimization(config, _progress, cancel_event)
+            finally:
+                if snapshot_temp is not None:
+                    snapshot_temp.cleanup()
         else:
             raise ValueError(f"unsupported worker task kind: {kind}")
 
@@ -269,7 +310,7 @@ def _worker_entry(task: dict[str, Any], event_queue, cancel_event) -> None:
         }
         _attach_worker_metrics(kind, result, metrics)
         event_queue.put({"type": "result", "payload": result})
-    except BaseException as exc:
+    except BaseException as exc:  # noqa: BLE001 - worker must report even process-level failures
         with suppress(Exception):
             sampler.stop()
         event_queue.put({

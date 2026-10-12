@@ -48,14 +48,21 @@ class AdaptiveSearchService:
         ]
         for p in self.parameters:
             if p.type in ("int", "float"):
-                midpoint = (float(p.minimum) + float(p.maximum)) / 2
-                steps = round((midpoint - float(p.minimum)) / float(p.step))
-                midpoint = min(float(p.maximum), float(p.minimum) + steps * float(p.step))
-                midpoint = round(midpoint) if p.type == "int" else round(midpoint, 8)
+                minimum = float(p.minimum)
+                step = float(p.step)
+                max_index = max(0, int((float(p.maximum) - minimum) / step + 1e-8))
+                maximum = minimum + max_index * step
+                default_index = min(max_index, max(0, round((float(p.default) - minimum) / step)))
+                default = self._grid_value(p, minimum + default_index * step)
+                candidates[0] = Candidate({**candidates[0].parameters, p.id: default})
+                midpoint_index = round(max_index / 2)
+                midpoint = self._grid_value(p, minimum + midpoint_index * step)
+                minimum_value = self._grid_value(p, minimum)
+                maximum_value = self._grid_value(p, maximum)
                 candidates += [
-                    Candidate({**candidates[0].parameters, p.id: p.minimum}),
+                    Candidate({**candidates[0].parameters, p.id: minimum_value}),
                     Candidate({**candidates[0].parameters, p.id: midpoint}),
-                    Candidate({**candidates[0].parameters, p.id: p.maximum}),
+                    Candidate({**candidates[0].parameters, p.id: maximum_value}),
                 ]
             elif p.type == "bool":
                 candidates.append(Candidate({**candidates[0].parameters, p.id: not p.default}))
@@ -118,9 +125,13 @@ class AdaptiveSearchService:
             return bool(self.random.getrandbits(1))
         if p.type == "enum":
             return self.random.choice(p.options)
-        count = int((float(p.maximum) - float(p.minimum)) / float(p.step))
+        count = max(0, int((float(p.maximum) - float(p.minimum)) / float(p.step) + 1e-8))
         value = float(p.minimum) + self.random.randint(0, max(0, count)) * float(p.step)
         return round(value) if p.type == "int" else round(value, 8)
+
+    @staticmethod
+    def _grid_value(parameter: ParameterSpec, value: float):
+        return round(value) if parameter.type == "int" else round(value, 8)
 
     def _unique(self, candidates: list[Candidate], limit: int, *, refill=False) -> list[Candidate]:
         result = []

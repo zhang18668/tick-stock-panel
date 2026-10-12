@@ -34,6 +34,26 @@ class RobustGates:
     strong_segment_percentile: float = 0.70
     min_stability: float = 0.60
 
+    def __post_init__(self) -> None:
+        fractions = (
+            self.max_drawdown,
+            self.all_segment_percentile,
+            self.strong_segment_percentile,
+            self.min_stability,
+        )
+        if any(not math.isfinite(float(value)) for value in (*fractions, self.min_baseline_delta)):
+            raise ValueError("robust gates must be finite")
+        if not 0 <= self.max_drawdown <= 1:
+            raise ValueError("max_drawdown must be within [0, 1]")
+        if type(self.min_trades) is not int or self.min_trades < 0:
+            raise ValueError("min_trades must be a non-negative integer")
+        if not 1 <= self.min_positive_segments <= 3:
+            raise ValueError("min_positive_segments must be within [1, 3]")
+        if any(not 0 <= value <= 1 for value in (
+            self.all_segment_percentile, self.strong_segment_percentile, self.min_stability
+        )):
+            raise ValueError("robust gate percentiles and stability must be within [0, 1]")
+
 
 @dataclass(frozen=True)
 class SegmentMetrics:

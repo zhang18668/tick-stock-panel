@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import calendar as month_calendar
 import hashlib
 import json
 import threading
 from bisect import bisect_left
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import date, timedelta
+from pathlib import Path
 
 from app.backtest.strategy import (
     BacktestResultPolicy,
@@ -13,7 +15,15 @@ from app.backtest.strategy import (
     StrategyBacktestService,
 )
 
-from .contracts import ParameterSpec, StrategyOptimizationContract
+from .contracts import (
+    EvaluationWindow,
+    ParameterSpec,
+    RobustGates,
+    RobustTimePlan,
+    SegmentMetrics,
+    SegmentObservation,
+    StrategyOptimizationContract,
+)
 from .scoring import DEFAULT_WEIGHTS, score_candidates, select_top_candidates
 from .search import AdaptiveSearchService
 from .time_plan import build_time_plan
@@ -46,7 +56,29 @@ class StrategyOptimizationGateway:
         if start > end:
             raise ValueError("invalid date range")
         robust_config = raw.get("robust_config") or {}
+        if not isinstance(robust_config, dict):
+            raise ValueError("robust_config must be an object")
+        allowed_robust_fields = {
+            "layout", "boundaries", "holdout_usage", "gates", "reference_strategy_ids",
+            "neighbor_budget", "neighbor_centers",
+        }
+        unknown = set(robust_config) - allowed_robust_fields
+        if unknown:
+            raise ValueError(f"unknown robust_config field: {sorted(unknown)[0]}")
         layout = robust_config.get("layout", "holdout")
+        if layout not in {"holdout", "diagnostic"}:
+            raise ValueError("layout must be 'holdout' or 'diagnostic'")
+        usage = robust_config.get("holdout_usage", "unknown")
+        if usage not in {"used", "declared_unused", "unknown"}:
+            raise ValueError("invalid holdout usage declaration")
+        gates = robust_config.get("gates", {})
+        if not isinstance(gates, dict):
+            raise ValueError("robust gates must be an object")
+        RobustGates(**gates)
+        neighbor_budget = int(robust_config.get("neighbor_budget", 200))
+        neighbor_centers = int(robust_config.get("neighbor_centers", 10))
+        if not 0 <= neighbor_budget <= 200 or not 0 <= neighbor_centers <= 10:
+            raise ValueError("neighborhood budget is outside supported limits")
         reader = self.trading_dates_reader or self.historical_trading_dates
         try:
             calendar = tuple(reader(start, end, raw.get("asset_type", "stock")))
@@ -65,17 +97,22 @@ class StrategyOptimizationGateway:
             except (TypeError, ValueError) as exc:
                 raise ValueError("robust boundaries must be ISO dates") from exc
         plan = build_time_plan(start, end, calendar, tuple(boundaries), layout)
+        diagnostics = _rolling_diagnostic_windows(
+            plan.development[0].start, plan.development[-1].end, tuple(calendar)
+        )
         time_plan = {
             "development": [_window_payload(window) for window in plan.development],
             "holdout": _window_payload(plan.holdout) if plan.holdout else None,
-            "diagnostics": [_window_payload(window) for window in plan.diagnostics],
+            "diagnostics": [_window_payload(window) for window in diagnostics],
         }
         total_candidates = min(500, max(1, int(raw.get("total_candidates", 500))))
-        neighbor_budget = min(200, max(0, int(robust_config.get("neighbor_budget", 200))))
+        neighbor_budget = min(200, max(0, neighbor_budget))
         references = robust_config.get("reference_strategy_ids", ())
         if not isinstance(references, (list, tuple)) or len(references) > 2:
-            raise ValueError("at most two fixed reference strategies are supported")
-        windows_for_budget = len(plan.diagnostics)
+            raise ValueError("at most two unique fixed reference strategies are supported")
+        if any(not isinstance(item, str) or not item for item in references) or len(references) != len(set(references)):
+            raise ValueError("at most two unique fixed reference strategies are supported")
+        windows_for_budget = len(diagnostics)
         holdout_count = int(plan.holdout is not None)
         budget = (
             3 * total_candidates
@@ -98,7 +135,7 @@ class StrategyOptimizationGateway:
                 "neighbor_candidates": neighbor_budget,
                 "estimated_backtests": budget,
             },
-            "holdout_usage": robust_config.get("holdout_usage", "unknown"),
+            "holdout_usage": usage,
             "warnings": [],
         }
 
@@ -246,6 +283,8 @@ class StrategyOptimizationGateway:
         return rows
 
     def run_optimization(self, request: dict, progress_cb, cancel_event: threading.Event):
+        if request.get("evaluation_mode") == "robust":
+            return self.run_robust_optimization(request, progress_cb, cancel_event)
         contract = self.get_optimization_contract(request["strategy_id"])
         search_params = []
         for parameter in contract.parameters:
@@ -395,6 +434,278 @@ class StrategyOptimizationGateway:
             }
         )
         return result
+
+    def run_robust_optimization(self, request: dict, progress_cb, cancel_event: threading.Event):
+        from .robustness import RobustnessRunner
+        from .search import Candidate
+
+        checkpoint = request.get("resume_state") or {}
+        if checkpoint.get("version") == 2 and checkpoint.get("stage") == "holdout_complete":
+            if checkpoint.get("input_fingerprint") != request.get("input_fingerprint"):
+                raise ValueError("robust checkpoint does not match the frozen task")
+            return checkpoint["result"]
+
+        snapshot = request.get("strategy_snapshot")
+        if not snapshot or snapshot.get("strategy_id") != request.get("strategy_id"):
+            raise ValueError("frozen strategy snapshot is unavailable or invalid")
+        preview = request.get("robust_preview") or self.preview_robust_config(request)
+        plan_data = preview["time_plan"]
+        development = tuple(
+            EvaluationWindow(item["id"], _as_date(item["start"]), _as_date(item["end"]), "development")
+            for item in plan_data["development"]
+        )
+        holdout_data = plan_data.get("holdout")
+        holdout = (
+            EvaluationWindow(holdout_data["id"], _as_date(holdout_data["start"]), _as_date(holdout_data["end"]), "holdout")
+            if holdout_data else None
+        )
+        plan = RobustTimePlan(development, holdout)
+        expected_generation = preview.get("data_generation")
+        current_generation = self.data_generation(request.get("asset_type", "stock"))
+        if expected_generation and current_generation != expected_generation:
+            raise ValueError("matrix data generation changed after robust preview; create a new run")
+        calendar_reader = self.trading_dates_reader or self.historical_trading_dates
+        calendar = tuple(calendar_reader(
+            _as_date(request["start"]), _as_date(request["end"]), request.get("asset_type", "stock")
+        ))
+        if not calendar:
+            raise ValueError("historical trading calendar is unavailable for robust preflight")
+        for window in (*development, *((holdout,) if holdout else ())):
+            covered = tuple(day for day in calendar if window.start <= day <= window.end)
+            if not covered or covered[0] != window.start or covered[-1] != window.end:
+                raise ValueError(f"trading calendar does not cover {window.id}")
+        rolling_windows = tuple(
+            EvaluationWindow(item["id"], _as_date(item["start"]), _as_date(item["end"]), "diagnostic")
+            for item in plan_data.get("diagnostics", ())
+        )
+        contract = self.get_optimization_contract(request["strategy_id"])
+        search_params = []
+        for parameter in contract.parameters:
+            override = request["validated"].get("parameters", {}).get(parameter.id, {})
+            minimum = override.get("min", parameter.minimum)
+            maximum = override.get("max", parameter.maximum)
+            options = tuple(override.get("values", parameter.options))
+            default = parameter.default
+            if parameter.type in {"int", "float"}:
+                default = min(max(default, minimum), maximum)
+            elif parameter.type in {"bool", "enum"} and options and default not in options:
+                default = options[0]
+            search_params.append(replace(parameter, minimum=minimum, maximum=maximum,
+                step=override.get("step", parameter.step), options=options, default=default))
+        search = AdaptiveSearchService(
+            tuple(parameter for parameter in search_params if parameter.optimizable),
+            buy_signals=tuple(request["validated"].get("buy_signals", ())),
+            sell_signals=tuple(request["validated"].get("sell_signals", ())),
+            seed=int(request.get("seed", 0)), constraints=contract.constraints,
+            base_values={parameter.id: parameter.default for parameter in contract.parameters if not parameter.optimizable},
+        )
+        config = request["validated"]
+
+        evaluation_artifacts = {}
+
+        def evaluate(candidate, window, include_curve):
+            result = self.service.run(StrategyBacktestConfig(
+                strategy_id=request["strategy_id"], symbols=request.get("symbols"),
+                start=window.start, end=window.end,
+                params={parameter.id: parameter.default for parameter in contract.parameters} | candidate.parameters,
+                overrides={"entry_signals": list(candidate.buy_signals), "exit_signals": list(candidate.sell_signals)},
+                asset_type=request.get("asset_type", "stock"),
+                matching=request.get("matching", "open_t+1"), fees_pct=float(request.get("fees_pct", 0.0002)),
+                commission_pct=request.get("commission_pct"), stamp_tax_pct=request.get("stamp_tax_pct"),
+                slippage_bps=float(request.get("slippage_bps", 5)), mode="position",
+                holding_days=int(request.get("holding_days", 5)),
+            ), cancel_event=cancel_event, result_policy=BacktestResultPolicy(
+                required_stats=frozenset({"total_return", "annual_return", "max_drawdown", "n_trades"}),
+                include_curves=include_curve, include_trades=False, include_per_symbol_stats=False,
+                include_return_distribution=False, include_benchmark=False, include_strategy_info=False,
+            ))
+            if result.error:
+                return SegmentObservation(window.id, None, result.error)
+            stats = result.stats or {}
+            from .robust_scoring import annualize
+            curve = result.equity_curve or []
+            if curve:
+                ending_nav = float(curve[-1].get("value", curve[-1].get("equity", curve[-1].get("nav", 1.0))))
+                initial_capital = float(result.config.get("initial_capital", 1_000_000) or 1_000_000)
+                ending_nav /= initial_capital
+                drawdown_values = [float(row["value"]) for row in result.drawdown_curve if row.get("value") is not None]
+                curve_drawdown = abs(min(drawdown_values, default=float(stats.get("max_drawdown", 0))))
+            else:
+                ending_nav = 1.0 + float(stats.get("total_return", 0) or 0)
+                curve_drawdown = abs(float(stats.get("max_drawdown", 0) or 0))
+            annualized = annualize(ending_nav, (window.end - window.start).days + 1)
+            drawdown = curve_drawdown if include_curve else stats.get("max_drawdown")
+            trades = stats.get("n_trades", stats.get("trade_count"))
+            if annualized is None or drawdown is None or trades is None:
+                return SegmentObservation(window.id, None, "backtest omitted required robust metrics")
+            if int(trades) <= 0:
+                return SegmentObservation(window.id, None, "no trades in evaluation window")
+            observation = SegmentObservation(window.id, SegmentMetrics(float(annualized), abs(float(drawdown)), int(trades), 0.0))
+            if include_curve:
+                evaluation_artifacts[(candidate.key, window.id)] = {
+                    "equity_curve": curve,
+                    "drawdown_curve": result.drawdown_curve,
+                    "stats": stats,
+                }
+            return observation
+
+        raw_robust = request.get("robust_config") or {}
+        gates = RobustGates(**raw_robust.get("gates", {}))
+        reference_candidates = []
+        for reference_snapshot in request.get("reference_strategy_snapshots", ()):
+            reference_contract = self.get_optimization_contract(reference_snapshot["strategy_id"])
+            reference_candidates.append((
+                reference_snapshot["strategy_id"],
+                Candidate(
+                    {parameter.id: parameter.default for parameter in reference_contract.parameters},
+                    tuple(reference_snapshot.get("entry_signals", ())),
+                    tuple(reference_snapshot.get("exit_signals", ())),
+                ),
+            ))
+        robust_result = RobustnessRunner(evaluate, search).run({
+            "time_plan": plan, "gates": gates,
+            "baseline_parameters": {parameter.id: parameter.default for parameter in contract.parameters},
+            "baseline_buy_signals": tuple(snapshot.get("entry_signals", ())),
+            "baseline_sell_signals": tuple(snapshot.get("exit_signals", ())),
+            "reference_candidates": reference_candidates,
+            "total_candidates": int(config.get("total_candidates", 500)),
+            "candidates_per_round": int(config.get("candidates_per_round", 50)),
+            "max_rounds": int(config.get("max_rounds", 10)),
+            "neighbor_budget": int(raw_robust.get("neighbor_budget", 200)),
+            "neighbor_centers": int(raw_robust.get("neighbor_centers", 10)),
+            "holdout_window": ({"id": holdout.id, "start": holdout.start.isoformat(), "end": holdout.end.isoformat(), "role": "holdout"} if holdout else None),
+            "holdout_usage": raw_robust.get("holdout_usage", "unknown"),
+            "run_id": request.get("run_id"),
+            "owner_scope": request.get("owner_scope", "standalone"),
+            "holdout_store_root": request.get("holdout_store_root"),
+        }, progress_cb, cancel_event)
+        if robust_result.get("cancelled"):
+            return robust_result
+        progress_cb({"type": "stage", "stage": "continuous_diagnostics"})
+        baseline_candidate = Candidate(
+            {parameter.id: parameter.default for parameter in contract.parameters},
+            tuple(snapshot.get("entry_signals", ())),
+            tuple(snapshot.get("exit_signals", ())),
+        )
+        continuous_window = EvaluationWindow(
+            "continuous-development", development[0].start, development[-1].end, "diagnostic"
+        )
+        continuous_baseline = evaluate(baseline_candidate, continuous_window, True)
+        continuous_rows = []
+        frozen_rows = []
+        for index, frozen in enumerate(robust_result["top3"], 1):
+            if cancel_event.is_set():
+                return {**robust_result, "cancelled": True, "stop_reason": "cancelled", "top3": [], "frozen_candidate_ids": []}
+            candidate = Candidate(
+                frozen["parameters"], tuple(frozen["buy_signals"]), tuple(frozen["sell_signals"])
+            )
+            observation = evaluate(candidate, continuous_window, True)
+            baseline_metrics = continuous_baseline.metrics
+            metrics = observation.metrics
+            continuous_rows.append({
+                "candidate_id": frozen["candidate_id"],
+                "metrics": {**metrics.__dict__, "baseline_delta": metrics.annualized_return - baseline_metrics.annualized_return}
+                    if metrics and baseline_metrics else None,
+                "failure": observation.failure if metrics is None else None,
+            })
+            frozen_rows.append((frozen, candidate))
+            progress_cb({"type": "candidate_progress", "stage": "continuous_development", "done": index, "total": len(robust_result["top3"])})
+        rolling_rows = []
+        if rolling_windows:
+            baseline_rolling = {window.id: evaluate(baseline_candidate, window, False) for window in rolling_windows}
+            for window in rolling_windows:
+                for frozen, candidate in frozen_rows:
+                    observation = evaluate(candidate, window, False)
+                    base = baseline_rolling[window.id].metrics
+                    metrics = observation.metrics
+                    rolling_rows.append({
+                        "candidate_id": frozen["candidate_id"], "window_id": window.id,
+                        "metrics": {**metrics.__dict__, "baseline_delta": metrics.annualized_return - base.annualized_return}
+                            if metrics and base else None,
+                        "failure": observation.failure if metrics is None else None,
+                    })
+                progress_cb({"type": "candidate_progress", "stage": "rolling_diagnostics", "window": window.id, "done": rolling_windows.index(window) + 1, "total": len(rolling_windows)})
+        robust_result["robust_result"]["continuous_development"] = {
+            "window": {"start": continuous_window.start.isoformat(), "end": continuous_window.end.isoformat()},
+            "baseline": asdict(continuous_baseline.metrics) if continuous_baseline.metrics else None,
+            "candidates": continuous_rows,
+        }
+        robust_result["robust_result"]["diagnostics"] = [
+            {"window": {"id": item["id"], "start": item["start"], "end": item["end"]},
+             "candidates": [row for row in rolling_rows if row["window_id"] == item["id"]]}
+            for item in plan_data.get("diagnostics", ())
+        ]
+        robust_result["robust_result"]["coverage"] = {
+            "calendar_source": preview.get("calendar_source"),
+            "calendar_coverage": preview.get("calendar_coverage"),
+            "data_generation": current_generation,
+            "universe_mode": "explicit_symbols" if request.get("symbols") else "current_universe",
+            "survivorship_bias_warning": True,
+            "warnings": ["当前回测数据契约未提供历史退市证券池，无法验证历史股票池完整性，结果可能存在幸存者偏差。"],
+        }
+        if holdout is not None:
+            run_id = request.get("run_id")
+            usage_key = f"{request.get('owner_scope', 'standalone')}:{request['strategy_id']}:{request.get('asset_type', 'stock')}:{holdout.start}:{holdout.end}"
+            from .store import OptimizationRunStore
+            holdout_store = (
+                OptimizationRunStore(Path(request["holdout_store_root"]))
+                if run_id and request.get("holdout_store_root") else None
+            )
+            claim = holdout_store.claim_holdout(run_id, usage_key) if holdout_store else "unknown"
+            if claim == "completed":
+                saved_holdout = holdout_store.get_holdout_result(run_id, usage_key)
+                if saved_holdout is None:
+                    raise ValueError("completed holdout claim has no persisted result")
+                robust_result["robust_result"]["holdout"] = saved_holdout
+                return robust_result
+            if claim == "resumed":
+                robust_result["robust_result"]["holdout"] = {
+                    "status": "insufficient",
+                    "usage": raw_robust.get("holdout_usage", "unknown"),
+                    "reuse": "interrupted",
+                    "results": [],
+                    "failure": "留出验证曾启动但结果未持久化；为避免重复访问该区间，本次恢复不重跑。请创建新任务。",
+                }
+                return robust_result
+            holdout_rows = []
+            passed = True
+            enough = True
+            baseline = Candidate(
+                {parameter.id: parameter.default for parameter in contract.parameters},
+                tuple(request["validated"].get("buy_signals", ())),
+                tuple(request["validated"].get("sell_signals", ())),
+            )
+            baseline_observation = evaluate(baseline, holdout, False)
+            for frozen in robust_result["top3"]:
+                candidate = Candidate(frozen["parameters"], tuple(frozen["buy_signals"]), tuple(frozen["sell_signals"]))
+                observation = evaluate(candidate, holdout, False)
+                metrics = observation.metrics
+                base_metrics = baseline_observation.metrics
+                if metrics is None or base_metrics is None:
+                    enough = False
+                    holdout_rows.append({"candidate_id": frozen["candidate_id"], "metrics": None, "failure": observation.failure or baseline_observation.failure})
+                    continue
+                delta = metrics.annualized_return - base_metrics.annualized_return
+                relative_pass = delta >= gates.min_baseline_delta
+                risk_pass = metrics.max_drawdown <= gates.max_drawdown
+                sample_pass = metrics.trade_count >= gates.min_trades and base_metrics.trade_count >= gates.min_trades
+                passed = passed and relative_pass and risk_pass and sample_pass
+                enough = enough and sample_pass
+                holdout_rows.append({"candidate_id": frozen["candidate_id"], "metrics": {**metrics.__dict__, "baseline_delta": delta}, "passed": relative_pass and risk_pass and sample_pass})
+            status = "insufficient" if not enough else ("passed" if passed else "failed")
+            holdout_result = {
+                "status": status, "usage": raw_robust.get("holdout_usage", "unknown"),
+                "reuse": claim, "results": holdout_rows,
+            }
+            if holdout_store:
+                holdout_store.complete_holdout(run_id, usage_key, holdout_result)
+            robust_result["robust_result"]["holdout"] = holdout_result
+            progress_cb({"type": "checkpoint", "checkpoint": {
+                "version": 2, "stage": "holdout_complete",
+                "input_fingerprint": request.get("input_fingerprint"),
+                "result": robust_result,
+            }})
+        return robust_result
 
     def validate_oos(
         self, request: dict, candidates: list[dict], progress_cb, cancel_event: threading.Event
@@ -633,3 +944,31 @@ def _window_payload(window):
         "end": window.end.isoformat(),
         "role": window.role,
     }
+
+
+def _add_months(day: date, months: int) -> date:
+    month_index = day.year * 12 + day.month - 1 + months
+    year, month0 = divmod(month_index, 12)
+    month = month0 + 1
+    return date(year, month, min(day.day, month_calendar.monthrange(year, month)[1]))
+
+
+def _rolling_diagnostic_windows(start: date, end: date, trading_dates: tuple[date, ...]):
+    from bisect import bisect_right
+
+    windows = []
+    cursor = start
+    index = 1
+    while True:
+        window_end = _add_months(cursor, 24)
+        if window_end > end:
+            break
+        left = bisect_left(trading_dates, cursor)
+        right = bisect_right(trading_dates, window_end)
+        if left < right:
+            windows.append(EvaluationWindow(
+                f"rolling-{index}", trading_dates[left], trading_dates[right - 1], "diagnostic"
+            ))
+            index += 1
+        cursor = _add_months(cursor, 6)
+    return tuple(windows)

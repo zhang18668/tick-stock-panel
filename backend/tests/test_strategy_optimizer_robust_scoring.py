@@ -74,6 +74,26 @@ def test_incomplete_segment_cannot_become_a_zero_score_recommendation():
     assert ranked.failures
 
 
+def test_zero_trade_candidate_is_not_rankable_when_minimum_gate_is_zero():
+    candidate = RobustCandidate(
+        "no-trades", {"x": 1}, (), (),
+        tuple(
+            SegmentObservation(window_id, SegmentMetrics(0.0, 0.0, 0, 0.0))
+            for window_id in ("d-1", "d-2", "d-3")
+        ),
+    )
+
+    (ranked,) = score_development(
+        (candidate,),
+        RobustGates(min_trades=0, min_positive_segments=1,
+                    all_segment_percentile=0, strong_segment_percentile=0),
+    )
+
+    assert ranked.base_score is None
+    assert not ranked.eligible
+    assert "segment 1: no trades" in ranked.failures
+
+
 def test_baseline_floor_is_inclusive_but_lower_values_fail():
     windows = tuple(
         EvaluationWindow(f"d-{index}", date(2020, index, 1), date(2020, index, 28), "development")

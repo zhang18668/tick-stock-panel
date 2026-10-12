@@ -1,3 +1,4 @@
+import random
 import threading
 from datetime import date
 
@@ -20,6 +21,8 @@ class FakeSearch:
         self.seen = set()
         self.prior_scores = []
         self.next_candidates = []
+        self.round_index = 0
+        self.random = random.Random(0)
 
     def first_round(self, limit):
         candidates = [Candidate({"x": 1}), Candidate({"x": 2})]
@@ -129,3 +132,51 @@ def test_next_round_uses_cumulative_candidate_scores_and_references_are_cached()
     assert len(search.prior_scores[0]) == 2
     assert all(value == search.prior_scores[0][0] for value in search.prior_scores[0])
     assert sum(parameters == {"x": 9} for parameters, _window in calls) == 3
+
+
+def test_holdout_is_reported_pending_and_empty_neighborhood_cannot_be_recommended():
+    result = RobustnessRunner(
+        lambda candidate, window, include_curve: SegmentObservation(
+            window.id, SegmentMetrics(0.1, 0.05, 30, 0.0)
+        ),
+        FakeSearch(),
+    ).run(
+        {
+            "time_plan": windows(),
+            "gates": RobustGates(all_segment_percentile=0, strong_segment_percentile=0),
+            "total_candidates": 2, "candidates_per_round": 2, "max_rounds": 1,
+            "neighbor_centers": 0, "baseline_parameters": {"x": 1},
+            "holdout_window": {"id": "holdout", "start": "2021-01-01", "end": "2021-12-31", "role": "holdout"},
+        },
+        lambda _event: None, threading.Event(),
+    )
+
+    assert result["robust_result"]["holdout"]["status"] == "pending"
+    assert result["top3"] == []
+    assert result["robust_result"]["verified_candidate_ids"] == []
+
+
+def test_search_checkpoint_restores_candidates_and_continues_next_round():
+    events = []
+    first_search = FakeSearch()
+    first_search.next_candidates = [Candidate({"x": 3})]
+    common = {
+        "time_plan": windows(), "gates": RobustGates(all_segment_percentile=0, strong_segment_percentile=0),
+        "total_candidates": 3, "candidates_per_round": 2, "neighbor_centers": 0,
+        "baseline_parameters": {"x": 1}, "input_fingerprint": "fingerprint-v1",
+    }
+    def evaluate(candidate, window, curve):
+        return SegmentObservation(window.id, SegmentMetrics(0.1, 0.05, 30, 0.0))
+    RobustnessRunner(evaluate, first_search).run(
+        {**common, "max_rounds": 1}, events.append, threading.Event()
+    )
+    checkpoint = next(event["checkpoint"] for event in events if event.get("type") == "checkpoint")
+    second_search = FakeSearch()
+    second_search.next_candidates = [Candidate({"x": 3})]
+    second_search.first_round = lambda _limit: (_ for _ in ()).throw(AssertionError("restarted from round one"))
+    result = RobustnessRunner(evaluate, second_search).run(
+        {**common, "max_rounds": 2, "resume_state": checkpoint}, lambda _event: None, threading.Event()
+    )
+
+    assert result["evaluated_candidates"] == 3
+    assert result["stop_reason"] == "budget_exhausted"

@@ -20,6 +20,20 @@ export type RobustPreview = {
 }
 export type RobustSegment = { window_id: string; annualized_return: number | null; max_drawdown: number | null; trade_count: number | null; baseline_delta: number | null; percentile: number | null; failures: string[] }
 export type RobustRecommendation = { candidate_id: string; base_score: number; robust_score: number | null; stability: number | null; segments: RobustSegment[]; holdout_status: HoldoutStatus }
+export type RobustResult = {
+  version: number
+  time_plan: { development: WindowPlan[]; holdout: WindowPlan | null; diagnostics: WindowPlan[] }
+  baseline: Array<{ window_id: string; metrics: { annualized_return: number; max_drawdown: number; trade_count: number } | null; failure?: string | null }>
+  references?: Record<string, Array<{ window_id: string; metrics: { annualized_return: number; max_drawdown: number; trade_count: number } | null; failure?: string | null }>>
+  candidates: Array<Record<string, unknown>>
+  top3: Array<Record<string, unknown>>
+  frozen_candidate_ids: string[]
+  holdout: { status: HoldoutStatus; usage: string; reuse?: string; failure?: string; results: Array<Record<string, unknown>> }
+  diagnostics: Array<Record<string, unknown>>
+  continuous_development?: { window: { start: string; end: string }; baseline: Record<string, number> | null; candidates: Array<Record<string, unknown>> }
+  coverage?: { calendar_source?: string; data_generation?: string; universe_mode?: string; survivorship_bias_warning?: boolean; warnings?: string[] }
+  budgets: Record<string, unknown>
+}
 
 const json = async (url: string, init?: RequestInit) => {
   const response = await fetch(url, { ...init, headers: { 'Content-Type': 'application/json', ...(init?.headers ?? {}) } })

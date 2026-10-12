@@ -196,8 +196,9 @@ class OptimizationJobManager:
             if self.evaluator is None:
                 raise RuntimeError("strategy optimization gateway is unavailable")
             with shared_heavy_job_limiter.slot("normal", cancel_event=self._cancel_events[run_id]):
+                worker_config = {**record["config"], "run_id": run_id}
                 result = self.evaluator(
-                    record["config"],
+                    worker_config,
                     lambda event: self._event(run_id, event),
                     self._cancel_events[run_id],
                 )

@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -19,23 +20,57 @@ class OptimizationRunStore:
         self._dir(run_id)
         if not usage_key or not isinstance(usage_key, str):
             raise ValueError("holdout usage key must be non-empty")
-        with self._holdout_lock:
+        with self._holdout_lock, _exclusive_file_lock(self.root / ".holdout-usage.lock"):
             usage_path = self.root / "holdout-usage.json"
-            try:
-                uses = json.loads(usage_path.read_text(encoding="utf-8"))
-            except FileNotFoundError:
-                uses = {}
-            if not isinstance(uses, dict):
-                raise ValueError("holdout usage registry is invalid")
+            uses = self._read_holdout_registry(usage_path)
             existing = uses.get(usage_key, [])
-            if not isinstance(existing, list):
-                raise ValueError("holdout usage registry is invalid")
-            if run_id in existing:
-                return "first" if existing[0] == run_id else "repeated"
+            for row in existing:
+                if row["run_id"] == run_id:
+                    return "completed" if row["state"] == "completed" else "resumed"
             classification = "first" if not existing else "repeated"
-            uses[usage_key] = [*existing, run_id]
-            self._write_registry_atomic(usage_path, uses)
+            uses[usage_key] = [*existing, {"run_id": run_id, "state": "claimed"}]
+            self._write_registry_atomic(usage_path, {"version": 2, "uses": uses})
             return classification
+
+    def complete_holdout(self, run_id: str, usage_key: str, result: dict) -> None:
+        self._dir(run_id)
+        with self._holdout_lock, _exclusive_file_lock(self.root / ".holdout-usage.lock"):
+            usage_path = self.root / "holdout-usage.json"
+            uses = self._read_holdout_registry(usage_path)
+            rows = uses.get(usage_key, [])
+            for row in rows:
+                if row["run_id"] == run_id:
+                    row.update(state="completed", result=result)
+                    self._write_registry_atomic(usage_path, {"version": 2, "uses": uses})
+                    return
+            raise ValueError("holdout claim must exist before storing its result")
+
+    def get_holdout_result(self, run_id: str, usage_key: str) -> dict | None:
+        self._dir(run_id)
+        with self._holdout_lock, _exclusive_file_lock(self.root / ".holdout-usage.lock"):
+            uses = self._read_holdout_registry(self.root / "holdout-usage.json")
+            for row in uses.get(usage_key, []):
+                if row["run_id"] == run_id:
+                    result = row.get("result")
+                    return result if isinstance(result, dict) else None
+        return None
+
+    @staticmethod
+    def _read_holdout_registry(path: Path) -> dict:
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        if isinstance(raw, dict) and raw.get("version") == 2 and isinstance(raw.get("uses"), dict):
+            return raw["uses"]
+        if isinstance(raw, dict):
+            # Read the pre-v2 registry written as key -> [run_id, ...].
+            return {
+                key: [{"run_id": run_id, "state": "claimed"} for run_id in run_ids]
+                for key, run_ids in raw.items()
+                if isinstance(run_ids, list) and all(isinstance(run_id, str) for run_id in run_ids)
+            }
+        raise ValueError("holdout usage registry is invalid")
 
     @staticmethod
     def _write_registry_atomic(target: Path, data: dict) -> None:
@@ -49,7 +84,6 @@ class OptimizationRunStore:
         finally:
             if os.path.exists(temp):
                 os.unlink(temp)
-
     def _dir(self, run_id: str) -> Path:
         if not run_id or Path(run_id).name != run_id or run_id in {".", ".."}:
             raise ValueError("invalid run id")
@@ -128,3 +162,30 @@ class OptimizationRunStore:
                 except json.JSONDecodeError:
                     continue
             return rows
+
+
+@contextmanager
+def _exclusive_file_lock(path: Path):
+    """Serialize holdout registry read-modify-write across worker processes."""
+    with path.open("a+b") as handle:
+        if os.name == "nt":
+            import msvcrt
+
+            if path.stat().st_size == 0:
+                handle.write(b"0")
+                handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
