@@ -10,6 +10,68 @@ ParameterType = Literal["int", "float", "bool", "enum"]
 
 
 @dataclass(frozen=True)
+class EvaluationWindow:
+    id: str
+    start: date
+    end: date
+    role: Literal["development", "holdout", "diagnostic"]
+
+
+@dataclass(frozen=True)
+class RobustTimePlan:
+    development: tuple[EvaluationWindow, ...]
+    holdout: EvaluationWindow | None
+    diagnostics: tuple[EvaluationWindow, ...] = ()
+
+
+@dataclass(frozen=True)
+class RobustGates:
+    max_drawdown: float = 0.20
+    min_trades: int = 30
+    min_baseline_delta: float = -0.03
+    min_positive_segments: int = 2
+    all_segment_percentile: float = 0.50
+    strong_segment_percentile: float = 0.70
+    min_stability: float = 0.60
+
+
+@dataclass(frozen=True)
+class SegmentMetrics:
+    annualized_return: float
+    max_drawdown: float
+    trade_count: int
+    baseline_delta: float
+
+
+@dataclass(frozen=True)
+class SegmentObservation:
+    window_id: str
+    metrics: SegmentMetrics | None
+    failure: str | None = None
+
+
+@dataclass(frozen=True)
+class RobustCandidate:
+    candidate_id: str
+    parameters: dict[str, Any]
+    buy_signals: tuple[str, ...]
+    sell_signals: tuple[str, ...]
+    segments: tuple[SegmentObservation, ...]
+
+
+@dataclass(frozen=True)
+class RankedCandidate:
+    candidate: RobustCandidate
+    segment_scores: tuple[float, ...]
+    segment_percentiles: tuple[float, ...]
+    base_score: float | None
+    robust_score: float | None
+    stability: float | None
+    eligible: bool
+    failures: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class ParameterSpec:
     id: str
     label: str

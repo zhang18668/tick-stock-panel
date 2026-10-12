@@ -60,6 +60,7 @@ def make_client(tmp_path):
         if hasattr(app.state, "test_user"):
             request.state.current_user = app.state.test_user
             request.state.owned_strategy_ids = app.state.test_owned_ids
+            request.state.is_paid_user = getattr(app.state, "test_is_paid_user", False)
         return await call_next(request)
 
     app.state.strategy_engine = FakeEngine()
@@ -96,13 +97,29 @@ def test_run_request_rejects_unknown_strategy_and_unknown_fields(tmp_path):
     )
 
 
-def test_private_strategy_and_run_endpoints_are_owner_scoped(tmp_path):
+def test_shared_strategy_access_and_run_endpoints_are_owner_scoped(tmp_path):
     client = make_client(tmp_path)
     client.app.state.test_user = SimpleNamespace(id="alice", is_admin=False)
     client.app.state.test_owned_ids = frozenset()
+    client.app.state.test_is_paid_user = True
     response = client.get("/api/custom/strategy-optimizer/strategies/demo/contract")
-    assert response.status_code == 404
-    assert client.get("/api/custom/strategy-optimizer/strategies").json() == []
+    assert response.status_code == 200
+    assert [item["strategy_id"] for item in client.get(
+        "/api/custom/strategy-optimizer/strategies"
+    ).json()] == ["demo"]
+
+    other_users_run = {
+        "run_id": "other-user-run",
+        "state": "succeeded",
+        "config": {"owner_scope": "bob", "strategy_id": "demo"},
+        "result": {"top3": []},
+    }
+    client.app.state.strategy_optimizer_manager = SimpleNamespace(
+        get=lambda _run_id: other_users_run,
+        list=lambda: [other_users_run],
+    )
+    assert client.get("/api/custom/strategy-optimizer/runs/other-user-run").status_code == 404
+    assert client.get("/api/custom/strategy-optimizer/runs").json() == []
 
 
 def test_create_run_uses_manager_and_persists_owner_scope(tmp_path):
@@ -121,6 +138,23 @@ def test_create_run_uses_manager_and_persists_owner_scope(tmp_path):
     assert record["run_id"] in {
         item["run_id"] for item in client.get("/api/custom/strategy-optimizer/runs").json()
     }
+
+
+def test_robust_run_is_rejected_until_snapshot_execution_exists(tmp_path):
+    client = make_client(tmp_path)
+    response = client.post(
+        "/api/custom/strategy-optimizer/runs",
+        json={
+            "strategy_id": "demo",
+            "start": "2022-01-01",
+            "end": "2025-12-31",
+            "evaluation_mode": "robust",
+            "robust_config": {"layout": "diagnostic"},
+        },
+    )
+
+    assert response.status_code == 409
+    assert "源码快照执行" in response.json()["detail"]
 
 
 def test_save_recommendations_creates_independent_strategies_from_passed_candidates(tmp_path, monkeypatch):
@@ -163,3 +197,39 @@ def test_save_recommendations_creates_independent_strategies_from_passed_candida
     assert "'default': 12" in saved[0].code
     assert 'ENTRY_SIGNALS = [\'buy_a\']' in saved[0].code
     assert "'default': 15" in saved[1].code
+
+
+def test_save_recommendations_can_save_only_one_rank(tmp_path, monkeypatch):
+    from app.api import strategy as strategy_api
+
+    saved = []
+
+    def save_strategy(req, _request):
+        saved.append(req)
+        return {"ok": True, "strategy_id": req.strategy_id, "meta": {"name": req.name}}
+
+    async def persist_strategy(_request, _result):
+        return None
+
+    monkeypatch.setattr(strategy_api, "_save_strategy_code", save_strategy)
+    monkeypatch.setattr(strategy_api, "_persist_user_strategy", persist_strategy)
+    client = make_client(tmp_path)
+    source = tmp_path / "demo.py"
+    source.write_text('META = {"id": "demo", "name": "Demo", "params": [{"id": "window", "type": "int", "default": 10, "min": 2, "max": 30, "step": 1}]}\nENTRY_SIGNALS = ["buy_a"]\nEXIT_SIGNALS = ["sell_a"]\n', encoding="utf-8")
+    client.app.state.strategy_engine.get("demo").file_path = source
+    run_id = "b2c3d4e5f6a7"
+    client.app.state.strategy_optimizer_manager = SimpleNamespace(get=lambda _run_id: {
+        "run_id": run_id, "state": "succeeded",
+        "config": {"strategy_id": "demo", "owner_scope": "standalone"},
+        "result": {"top3": [
+            {"parameters": {"window": 12}, "buy_signals": ["buy_a"], "sell_signals": ["sell_a"]},
+            {"parameters": {"window": 15}, "buy_signals": ["buy_a"], "sell_signals": ["sell_a"]},
+        ]},
+    })
+
+    response = client.post(f"/api/custom/strategy-optimizer/runs/{run_id}/save?rank=2")
+
+    assert response.status_code == 200
+    assert [item.strategy_id for item in saved] == [f"custom_opt_{run_id[:12]}_top2"]
+    assert [item.name for item in saved] == ["Demo-top2"]
+    assert "'default': 15" in saved[0].code

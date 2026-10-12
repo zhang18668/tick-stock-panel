@@ -17,19 +17,19 @@ def _strategy(strategy_id: str, source: str, visibility: str | None = None):
     return SimpleNamespace(meta=meta, source=source)
 
 
-def test_private_builtin_is_admin_only_in_multi_user_mode() -> None:
+def test_private_builtin_definitions_are_shared_across_accounts() -> None:
     strategy = _strategy("private_builtin", "builtin", "private")
 
     assert can_access_strategy(strategy, None) is True
     assert can_access_strategy(strategy, _user("admin")) is True
-    assert can_access_strategy(strategy, _user("user")) is False
+    assert can_access_strategy(strategy, _user("user")) is True
 
 
-def test_installed_marketplace_builtin_is_visible_only_to_owner() -> None:
+def test_installed_marketplace_builtin_definition_is_shared() -> None:
     strategy = _strategy("paid_builtin", "builtin", "tianya")
 
     assert can_access_strategy(strategy, _user("user"), {"paid_builtin"}) is True
-    assert can_access_strategy(strategy, _user("user"), set()) is False
+    assert can_access_strategy(strategy, _user("user"), set()) is True
 
 
 def test_strategy_config_and_installation_models_keep_separate_contracts() -> None:
@@ -44,15 +44,15 @@ def test_public_builtin_remains_visible_to_regular_users() -> None:
     assert can_access_strategy(_strategy("public_builtin", "builtin"), _user("user")) is True
 
 
-def test_all_private_groups_are_admin_only() -> None:
+def test_visibility_groups_do_not_hide_shared_strategy_definitions() -> None:
     for visibility in ("private", "diya", "tianya", "douyin", "board_pullback"):
         strategy = _strategy(f"{visibility}_builtin", "builtin", visibility)
         assert can_access_strategy(strategy, _user("admin")) is True
-        assert can_access_strategy(strategy, _user("user")) is False
+        assert can_access_strategy(strategy, _user("user")) is True
 
 
-def test_user_strategy_remains_owner_scoped() -> None:
+def test_user_strategy_definitions_are_shared_across_accounts() -> None:
     strategy = _strategy("mine", "custom")
 
     assert can_access_strategy(strategy, _user("user"), {"mine"}) is True
-    assert can_access_strategy(strategy, _user("user"), set()) is False
+    assert can_access_strategy(strategy, _user("user"), set()) is True

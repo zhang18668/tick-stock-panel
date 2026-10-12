@@ -1,9 +1,12 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { useLocation, useNavigate } from 'react-router-dom'
+import { api } from '../../lib/api'
 import { QK } from '../../lib/queryKeys'
+import { persistStrategyPoolAddition, persistStrategyPoolRemoval } from '../../lib/useStrategyPool'
 import { strategyLibraryApi, type StrategyGroup } from '../strategy-library/api'
-import { optimizerApi, type OptimizerContract, type OptimizerRun, type OptimizerStrategy } from './api'
+import { optimizerApi, type OptimizerContract, type OptimizerRun, type OptimizerStrategy, type RobustPreview } from './api'
+import { RobustnessConfig } from './RobustnessConfig'
 
 const activeStates = ['queued', 'running', 'cancelling']
 
@@ -42,8 +45,7 @@ export function StrategyOptimizerPage() {
   const [contract, setContract] = useState<OptimizerContract | null>(null)
   const [selected, setSelected] = useState('')
   const [run, setRun] = useState<OptimizerRun | null>(null)
-  const [autoSaveRunId, setAutoSaveRunId] = useState('')
-  const autoSaveStarted = useRef(new Set<string>())
+  const [savedRecommendationIds, setSavedRecommendationIds] = useState<Set<string>>(() => new Set())
   const [error, setError] = useState('')
   const [progress, setProgress] = useState<Record<string, unknown> | null>(null)
   const [start, setStart] = useState('2022-01-01')
@@ -69,13 +71,45 @@ export function StrategyOptimizerPage() {
   const [matching, setMatching] = useState<'open_t+1' | 'close_t'>('open_t+1')
   const [mode, setMode] = useState<'position' | 'full'>('position')
   const [holdingDays, setHoldingDays] = useState(5)
+  const [evaluationMode, setEvaluationMode] = useState<'legacy' | 'robust'>('legacy')
+  const [robustLayout, setRobustLayout] = useState<'holdout' | 'diagnostic'>('holdout')
+  const [holdoutUsage, setHoldoutUsage] = useState<'used' | 'declared_unused' | 'unknown'>('unknown')
+  const [neighborBudget, setNeighborBudget] = useState(200)
+  const [robustPreview, setRobustPreview] = useState<RobustPreview | null>(null)
+  const [robustPreviewError, setRobustPreviewError] = useState('')
   const [runs, setRuns] = useState<OptimizerRun[]>([])
   const saveMutation = useMutation({
-    mutationFn: () => optimizerApi.saveRecommendations(run!.run_id),
-    onSuccess: async result => {
-      setError(result.errors.length ? `部分推荐未保存：${result.errors.map(item => `top${item.rank} ${item.error}`).join('；')}` : '')
+    mutationFn: (rank: number) => optimizerApi.saveRecommendations(run!.run_id, rank),
+    onSuccess: async (result, rank) => {
+      const saved = result.saved[0]
+      if (saved) {
+        persistStrategyPoolAddition(saved.strategy_id)
+        setSavedRecommendationIds(current => new Set(current).add(saved.strategy_id))
+        setStrategies(current => current.some(item => item.strategy_id === saved.strategy_id)
+          ? current
+          : [...current, { strategy_id: saved.strategy_id, name: saved.name, optimizable: true, reason: null }])
+      }
+      setError(result.errors.length ? `推荐 ${rank} 添加失败：${result.errors.map(item => item.error).join('；')}` : '')
       await queryClient.invalidateQueries({ queryKey: QK.strategyLibrary })
       await queryClient.invalidateQueries({ queryKey: QK.strategyOptimizerStrategies })
+      await queryClient.invalidateQueries({ queryKey: ['screener-strategies'] })
+    },
+    onError: reason => setError(String(reason)),
+  })
+  const deleteMutation = useMutation({
+    mutationFn: (strategyId: string) => api.strategyDelete(strategyId),
+    onSuccess: async (_result, strategyId) => {
+      persistStrategyPoolRemoval(strategyId)
+      setSavedRecommendationIds(current => {
+        const next = new Set(current)
+        next.delete(strategyId)
+        return next
+      })
+      setStrategies(current => current.filter(item => item.strategy_id !== strategyId))
+      setError('')
+      await queryClient.invalidateQueries({ queryKey: QK.strategyLibrary })
+      await queryClient.invalidateQueries({ queryKey: QK.strategyOptimizerStrategies })
+      await queryClient.invalidateQueries({ queryKey: ['screener-strategies'] })
     },
     onError: reason => setError(String(reason)),
   })
@@ -130,13 +164,6 @@ export function StrategyOptimizerPage() {
     return () => { source.close(); window.clearInterval(timer) }
   }, [run?.run_id, run?.state])
 
-  useEffect(() => {
-    if (!run || run.run_id !== autoSaveRunId || run.state !== 'succeeded') return
-    if (!Array.isArray(run.result?.top3) || !run.result.top3.length || autoSaveStarted.current.has(run.run_id)) return
-    autoSaveStarted.current.add(run.run_id)
-    saveMutation.mutate()
-  }, [run, autoSaveRunId])
-
   const strategy = strategies.find(item => item.strategy_id === selected)
   const groupStrategyIds = new Set(groups.find(group => group.id === selectedGroup)?.strategy_ids ?? [])
   const visibleStrategies = strategies.filter(item => groupStrategyIds.has(item.strategy_id)
@@ -150,6 +177,24 @@ export function StrategyOptimizerPage() {
     const existing = current[id] ?? []
     return { ...current, [id]: existing.includes(value) ? existing.filter(item => item !== value) : [...existing, value] }
   })
+
+  const previewRobust = () => {
+    setRobustPreview(null)
+    setRobustPreviewError('')
+    const parameters = Object.fromEntries([
+      ...Object.entries(ranges).map(([id, range]) => [id, range]),
+      ...Object.entries(discreteValues).filter(([, values]) => values.length > 0).map(([id, values]) => [id, { values }]),
+    ])
+    optimizerApi.preview({
+      evaluation_mode: 'robust', strategy_id: selected, asset_type: contract?.asset_type, start, end,
+      parameters, buy_signals: buySignals, sell_signals: sellSignals, seed,
+      max_rounds: maxRounds, candidates_per_round: perRound, total_candidates: maxRounds * perRound,
+      robust_config: { layout: robustLayout, holdout_usage: holdoutUsage, neighbor_budget: neighborBudget },
+      symbols: symbolsText.trim() ? symbolsText.split(',').map(value => value.trim()).filter(Boolean) : null,
+      matching, mode: 'position', fees_pct: feesPct, commission_pct: commissionPct,
+      stamp_tax_pct: stampTaxPct, slippage_bps: slippageBps, holding_days: holdingDays,
+    }).then(setRobustPreview).catch(error => setRobustPreviewError(String(error)))
+  }
 
   const submit = () => {
     setError(''); setProgress(null)
@@ -168,25 +213,28 @@ export function StrategyOptimizerPage() {
       commission_pct: commissionPct, stamp_tax_pct: stampTaxPct,
       symbols: symbolsText.trim() ? symbolsText.split(',').map(value => value.trim()).filter(Boolean) : null,
       matching, mode, holding_days: holdingDays,
+      evaluation_mode: evaluationMode,
+      ...(evaluationMode === 'robust' ? { robust_config: { layout: robustLayout, holdout_usage: holdoutUsage, neighbor_budget: neighborBudget } } : {}),
     }).then(value => {
-      setAutoSaveRunId(value.run_id)
       setRun(value)
       setRuns(current => [value, ...current.filter(item => item.run_id !== value.run_id)])
     }).catch(e => setError(String(e)))
   }
 
   return <main className="mx-auto flex max-w-5xl flex-col gap-6 p-4 sm:p-6">
-    <header><h1 className="text-2xl font-semibold">策略优化</h1><p className="mt-1 text-sm text-muted">只生成推荐，不会修改原策略。</p></header>
+    <header><h1 className="text-2xl font-semibold">策略优化</h1><p className="mt-1 text-sm text-muted">优化结果仅作推荐；点击添加后会另存为自定义策略，可用于选股和监控。</p></header>
     {error && <div role="alert" className="rounded border border-red-500 p-3 text-red-500">{error}</div>}
     <section className="grid gap-5 rounded border p-4 sm:p-6">
-      <label className="flex flex-col gap-2">策略分组<select aria-label="策略分组" value={selectedGroup} onChange={e => { setSelectedGroup(e.target.value); setSelected(''); setContract(null); setRun(null); setAutoSaveRunId(''); saveMutation.reset() }} className="rounded border bg-base p-2">
+      <label className="flex flex-col gap-2">策略分组<select aria-label="策略分组" value={selectedGroup} onChange={e => { setSelectedGroup(e.target.value); setSelected(''); setContract(null); setRun(null); saveMutation.reset() }} className="rounded border bg-base p-2">
         <option value="">请先选择策略库分组</option>{groups.map(group => <option key={group.id} value={group.id}>{group.name}</option>)}
       </select></label>
-      <label className="flex flex-col gap-2">策略<select value={selected} disabled={!selectedGroup} onChange={e => { setSelected(e.target.value); setRun(null); setAutoSaveRunId(''); saveMutation.reset() }} className="rounded border bg-base p-2">
+      <label className="flex flex-col gap-2">策略<select value={selected} disabled={!selectedGroup} onChange={e => { setSelected(e.target.value); setRun(null); saveMutation.reset() }} className="rounded border bg-base p-2">
         <option value="">请选择策略</option>{visibleStrategies.map(item => <option key={item.strategy_id} value={item.strategy_id}>{item.name}{item.optimizable ? '' : '（不可优化）'}</option>)}
       </select>{selectedGroup && !visibleStrategies.length && <span className="text-xs text-muted">该分组中没有可选择的策略{requestedIds.length ? '（当前批量选择范围内）' : ''}。</span>}</label>
       {strategy && !strategy.optimizable && <p className="text-sm text-muted">{strategy.reason}</p>}
       {contract && strategy?.optimizable && <>
+        <label className="text-sm">优化模式<select aria-label="优化模式" value={evaluationMode} onChange={event => { setEvaluationMode(event.target.value as typeof evaluationMode); setRobustPreview(null); setRobustPreviewError('') }} className="mt-1 block w-full rounded border bg-base p-2"><option value="legacy">传统优化</option><option value="robust">跨时期稳健</option></select></label>
+        {evaluationMode === 'robust' && <RobustnessConfig layout={robustLayout} holdoutUsage={holdoutUsage} neighborBudget={neighborBudget} preview={robustPreview} previewError={robustPreviewError} onLayoutChange={value => { setRobustLayout(value); setRobustPreview(null) }} onHoldoutUsageChange={value => { setHoldoutUsage(value); setRobustPreview(null) }} onNeighborBudgetChange={value => { setNeighborBudget(value); setRobustPreview(null) }} onPreview={previewRobust} />}
         <div className="grid gap-3 sm:grid-cols-2">
           {contract.parameters.map(param => <fieldset key={param.id} className="rounded border p-3" disabled={!param.optimizable}>
             <legend className="px-1 text-sm">{param.label} <span className="text-muted">默认 {String(param.default)}</span></legend>
@@ -204,7 +252,7 @@ export function StrategyOptimizerPage() {
           <label className="text-sm">开始日期<input type="date" value={start} onChange={e => setStart(e.target.value)} className="mt-1 block w-full rounded border bg-base p-2" /></label>
           <label className="text-sm">结束日期<input type="date" value={end} onChange={e => setEnd(e.target.value)} className="mt-1 block w-full rounded border bg-base p-2" /></label>
         </div>
-        <div className="grid gap-3 sm:grid-cols-2">
+        {evaluationMode === 'legacy' && <div className="grid gap-3 sm:grid-cols-2">
           <label className="text-sm">最大轮数<input type="number" min={1} max={10} value={maxRounds} onChange={e => setMaxRounds(Number(e.target.value))} className="mt-1 block w-full rounded border bg-base p-2" /></label>
           <label className="text-sm">每轮候选数<input type="number" min={1} max={50} value={perRound} onChange={e => setPerRound(Number(e.target.value))} className="mt-1 block w-full rounded border bg-base p-2" /></label>
           <label className="text-sm">最大样本外回撤<input type="number" min={0} max={1} step={0.01} value={maxDrawdown} onChange={e => setMaxDrawdown(Number(e.target.value))} className="mt-1 block w-full rounded border bg-base p-2" /></label>
@@ -221,10 +269,9 @@ export function StrategyOptimizerPage() {
           <label className="text-sm">回测模式<select value={mode} onChange={e => setMode(e.target.value as typeof mode)} className="mt-1 block w-full rounded border bg-base p-2"><option value="position">持仓模式</option><option value="full">完整模式</option></select></label>
           <label className="text-sm">持仓天数<input type="number" min={1} max={500} value={holdingDays} onChange={e => setHoldingDays(Number(e.target.value))} className="mt-1 block w-full rounded border bg-base p-2" /></label>
           <label className="text-sm">随机种子<input type="number" value={seed} onChange={e => setSeed(Number(e.target.value))} className="mt-1 block w-full rounded border bg-base p-2" /></label>
-        </div>
-        <fieldset className="grid gap-3 sm:grid-cols-2"><legend className="text-sm font-medium">评分权重（合计 100%）</legend>{Object.entries(weights).map(([key, value]) => <label key={key} className="text-sm">{key}<input type="number" min={0} max={1} step={0.01} value={value} onChange={e => setWeights(current => ({ ...current, [key]: Number(e.target.value) }))} className="mt-1 block w-full rounded border bg-base p-2" /></label>)}</fieldset>
-        <p className="text-xs text-muted">当前权重合计：{(weightTotal * 100).toFixed(0)}%</p>
-        <button className="w-fit rounded bg-primary px-4 py-2 text-white disabled:opacity-50" disabled={!start || !end || start >= end || Math.abs(weightTotal - 1) > 1e-9 || Object.values(discreteValues).some(values => values.length === 0) || !!run} onClick={submit}>启动优化</button>
+        </div>}
+        {evaluationMode === 'legacy' && <><fieldset className="grid gap-3 sm:grid-cols-2"><legend className="text-sm font-medium">评分权重（合计 100%）</legend>{Object.entries(weights).map(([key, value]) => <label key={key} className="text-sm">{key}<input type="number" min={0} max={1} step={0.01} value={value} onChange={e => setWeights(current => ({ ...current, [key]: Number(e.target.value) }))} className="mt-1 block w-full rounded border bg-base p-2" /></label>)}</fieldset><p className="text-xs text-muted">当前权重合计：{(weightTotal * 100).toFixed(0)}%</p></>}
+        <button className="w-fit rounded bg-primary px-4 py-2 text-white disabled:opacity-50" disabled={!start || !end || start >= end || (evaluationMode === 'legacy' && Math.abs(weightTotal - 1) > 1e-9) || Object.values(discreteValues).some(values => values.length === 0) || !!run || (evaluationMode === 'robust' && !robustPreview?.run_available)} onClick={submit}>{evaluationMode === 'robust' ? '稳健模式暂不可启动' : '启动优化'}</button>
       </>}
     </section>
     {runs.length > 0 && <section className="rounded border p-4"><h2 className="mb-3 font-medium">最近优化任务</h2><ul className="grid gap-2">{runs.slice(0, 10).map(item => {
@@ -248,6 +295,12 @@ export function StrategyOptimizerPage() {
             ? metricRows(metrics.fold_metrics)
             : metricRows(item.folds).map(fold => ((fold.metrics && typeof fold.metrics === 'object') ? fold.metrics : fold) as MetricRow)
           const parameters = (item.parameters && typeof item.parameters === 'object' ? item.parameters : {}) as Record<string, unknown>
+          const rank = index + 1
+          const recommendationId = `custom_opt_${run.run_id.slice(0, 12)}_top${rank}`
+          const isAdded = savedRecommendationIds.has(recommendationId)
+            || strategies.some(strategyItem => strategyItem.strategy_id === recommendationId)
+          const adding = saveMutation.isPending && saveMutation.variables === rank
+          const deleting = deleteMutation.isPending && deleteMutation.variables === recommendationId
           const foldValues = folds.map(fold => Number(fold.total_return)).filter(Number.isFinite)
           const maxFoldAbs = Math.max(...foldValues.map(Math.abs), 0.0001)
           const config = run.config
@@ -273,8 +326,15 @@ export function StrategyOptimizerPage() {
               },
             },
           } } })
+          const removeRecommendation = () => {
+            if (!window.confirm(`确定删除已添加的自定义策略“${contract?.name ?? '优化推荐'}-top${rank}”吗？删除后无法恢复。`)) return
+            setError('')
+            deleteMutation.mutate(recommendationId)
+          }
           return <article key={String(item.candidate_id ?? index)} className="min-w-0 rounded border bg-surface p-4">
-            <div className="flex items-start justify-between gap-3"><div><h3 className="font-medium">推荐 {index + 1}</h3><p className="mt-1 text-xs text-muted">综合评分 {Number(item.score ?? 0).toFixed(3)}</p></div><button type="button" onClick={loadBacktest} className="shrink-0 rounded border border-accent/40 px-2.5 py-1.5 text-xs font-medium text-accent hover:bg-accent/10">载入回测</button></div>
+            <div className="flex flex-wrap items-start justify-between gap-3"><div><h3 className="font-medium">推荐 {rank}</h3><p className="mt-1 text-xs text-muted">综合评分 {Number(item.score ?? 0).toFixed(3)}</p>{isAdded && <span role="status" className="mt-1 inline-block text-xs text-emerald-600">已添加到自定义策略</span>}</div><div className="flex flex-wrap gap-2"><button type="button" onClick={loadBacktest} className="rounded border border-accent/40 px-2.5 py-1.5 text-xs font-medium text-accent hover:bg-accent/10">载入回测</button>{isAdded
+              ? <button type="button" onClick={removeRecommendation} disabled={deleteMutation.isPending} className="rounded border border-red-500/40 px-2.5 py-1.5 text-xs font-medium text-red-500 hover:bg-red-500/10 disabled:opacity-50">{deleting ? '删除中…' : '删除策略'}</button>
+              : <button type="button" onClick={() => { setError(''); saveMutation.mutate(rank) }} disabled={saveMutation.isPending} className="rounded border border-accent/40 px-2.5 py-1.5 text-xs font-medium text-accent hover:bg-accent/10 disabled:opacity-50">{adding ? '添加中…' : '添加到自定义策略'}</button>}</div></div>
             <div className="mt-3 grid grid-cols-2 gap-px overflow-hidden rounded border bg-border sm:grid-cols-4 xl:grid-cols-2 2xl:grid-cols-4">
               {[
                 ['样本外收益', formatPercent(metrics.oos_return)],
@@ -303,7 +363,6 @@ export function StrategyOptimizerPage() {
           </article>
         })}</div>
         {((run.result.top3 as unknown[]) ?? []).length === 0 && <p className="mt-3 text-sm text-muted">没有候选通过硬性筛选门槛，请调整范围或条件后重试。</p>}
-        {run.state === 'succeeded' && ((run.result.top3 as unknown[]) ?? []).length > 0 && <div className="mt-4 flex flex-wrap items-center gap-3 border-t pt-4"><span role="status" className="text-sm text-muted">{saveMutation.isPending ? '正在自动保存前三名到策略库…' : saveMutation.data ? `已自动保存 ${saveMutation.data.saved.length} 个策略${saveMutation.data.saved.length ? `：${saveMutation.data.saved.map(item => item.name).join('、')}` : ''}` : ''}</span>{saveMutation.data?.errors.length ? <button type="button" onClick={() => saveMutation.mutate()} disabled={saveMutation.isPending} className="rounded border px-3 py-1.5 text-sm disabled:opacity-50">重试保存</button> : null}</div>}
       </>}
     </section>}
   </main>

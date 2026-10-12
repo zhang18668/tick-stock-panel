@@ -127,19 +127,23 @@ class OptimizationJobManager:
             record = self._runs[run_id]
             if record["state"] not in {"failed", "interrupted"}:
                 raise ValueError("run is not resumable")
+            config = record.get("config", {})
+            if config.get("evaluation_mode") == "robust":
+                expected = config.get("input_fingerprint")
+                current = config.get("current_input_fingerprint", expected)
+                checkpoint = self._read_checkpoint(run_id, record)
+                checkpoint_fingerprint = (
+                    checkpoint.get("input_fingerprint") if isinstance(checkpoint, dict) else None
+                )
+                if not expected or current != expected or (
+                    checkpoint_fingerprint is not None and checkpoint_fingerprint != expected
+                ):
+                    raise ValueError("strategy snapshot, scoring version or data generation changed")
             record["state"] = RunLifecycle(record["state"]).transition("queued")
             record.pop("error", None)
             record.pop("result", None)
             record["cancel"] = False
-            checkpoints = [
-                event.get("checkpoint")
-                for event in record.get("events", [])
-                if event.get("checkpoint")
-            ]
-            try:
-                checkpoint = self.store.read_json(run_id, "checkpoint.json")
-            except (OSError, ValueError):
-                checkpoint = checkpoints[-1] if checkpoints else None
+            checkpoint = self._read_checkpoint(run_id, record)
             if checkpoint:
                 record["config"]["resume_state"] = checkpoint
             self._cancel_events[run_id] = threading.Event()
@@ -148,6 +152,17 @@ class OptimizationJobManager:
             self._threads[run_id] = thread
             thread.start()
             return copy.deepcopy(record)
+
+    def _read_checkpoint(self, run_id, record):
+        checkpoints = [
+            event.get("checkpoint")
+            for event in record.get("events", [])
+            if event.get("checkpoint")
+        ]
+        try:
+            return self.store.read_json(run_id, "checkpoint.json")
+        except (OSError, ValueError):
+            return checkpoints[-1] if checkpoints else None
 
     def candidate(self, run_id: str, candidate_id: str):
         with self._lock:
@@ -196,7 +211,7 @@ class OptimizationJobManager:
                 else:
                     record["state"] = RunLifecycle(record["state"]).transition("cancelled")
                     self._persist(record)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - record evaluator failures as task state
             with self._lock:
                 target = (
                     "cancelled"

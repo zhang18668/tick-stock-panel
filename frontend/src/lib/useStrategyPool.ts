@@ -21,6 +21,18 @@ function loadUnifiedPool(): string[] {
   return merged
 }
 
+/** Persist a new pool entry from pages that don't render the screener hook. */
+export function persistStrategyPoolAddition(id: string): void {
+  const pool = loadUnifiedPool()
+  if (!pool.includes(id)) storage.strategyPool.set([...pool, id])
+}
+
+/** Remove a pool entry from pages that don't render the screener hook. */
+export function persistStrategyPoolRemoval(id: string): void {
+  const pool = loadUnifiedPool()
+  storage.strategyPool.set(pool.filter(item => item !== id))
+}
+
 /**
  * 策略池 — 日线与分钟策略共用的统一池。
  * 卡片列表可按周期筛选显示, 但池本身只有一份;

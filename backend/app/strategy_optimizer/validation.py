@@ -35,6 +35,8 @@ _FIELDS = {
     "min_trades",
     "train_fraction",
     "convergence_threshold",
+    "evaluation_mode",
+    "robust_config",
 }
 
 

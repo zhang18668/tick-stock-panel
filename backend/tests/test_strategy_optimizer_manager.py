@@ -61,3 +61,28 @@ def test_manager_cancellation_prevents_result_publication(tmp_path):
     manager.cancel(run["run_id"])
     result = wait_for_state(manager, run["run_id"], "cancelled")
     assert "result" not in result
+
+
+def test_robust_resume_rejects_changed_fingerprint(tmp_path):
+    store = OptimizationRunStore(tmp_path)
+    store.create(
+        "robust-run",
+        {
+            "run_id": "robust-run",
+            "state": "failed",
+            "config": {
+                "evaluation_mode": "robust",
+                "input_fingerprint": "frozen-input",
+                "current_input_fingerprint": "changed-input",
+            },
+            "events": [],
+        },
+    )
+    manager = OptimizationJobManager(store, lambda *_args: {})
+
+    try:
+        manager.resume("robust-run")
+    except ValueError as exc:
+        assert "changed" in str(exc)
+    else:
+        raise AssertionError("robust resume should reject a changed input fingerprint")

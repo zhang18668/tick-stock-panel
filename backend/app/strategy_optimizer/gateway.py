@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import threading
+from bisect import bisect_left
 from dataclasses import replace
 from datetime import date, timedelta
 
@@ -15,6 +16,7 @@ from app.backtest.strategy import (
 from .contracts import ParameterSpec, StrategyOptimizationContract
 from .scoring import DEFAULT_WEIGHTS, score_candidates, select_top_candidates
 from .search import AdaptiveSearchService
+from .time_plan import build_time_plan
 
 
 class StrategyOptimizationGateway:
@@ -22,14 +24,113 @@ class StrategyOptimizationGateway:
 
     api_version = 1
 
-    def __init__(self, service: StrategyBacktestService, strategy_engine, *, repository=None):
+    def __init__(
+        self,
+        service: StrategyBacktestService,
+        strategy_engine,
+        *,
+        repository=None,
+        trading_dates_reader=None,
+    ):
         self.service = service
         self.strategy_engine = strategy_engine
         self.repository = repository
+        self.trading_dates_reader = trading_dates_reader
+
+    def preview_robust_config(self, raw: dict) -> dict:
+        try:
+            start = _as_date(raw["start"])
+            end = _as_date(raw["end"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("start and end must be ISO dates") from exc
+        if start > end:
+            raise ValueError("invalid date range")
+        robust_config = raw.get("robust_config") or {}
+        layout = robust_config.get("layout", "holdout")
+        reader = self.trading_dates_reader or self.historical_trading_dates
+        try:
+            calendar = tuple(reader(start, end, raw.get("asset_type", "stock")))
+        except Exception as exc:
+            raise ValueError("historical trading calendar is unavailable") from exc
+        if not calendar:
+            raise ValueError("historical trading calendar returned no dates")
+        if any(not isinstance(day, date) for day in calendar):
+            raise ValueError("authoritative trading calendar returned invalid dates")
+        boundaries = robust_config.get("boundaries")
+        if boundaries is None:
+            boundaries = _default_robust_boundaries(start, end, calendar, layout)
+        else:
+            try:
+                boundaries = tuple(_as_date(day) for day in boundaries)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("robust boundaries must be ISO dates") from exc
+        plan = build_time_plan(start, end, calendar, tuple(boundaries), layout)
+        time_plan = {
+            "development": [_window_payload(window) for window in plan.development],
+            "holdout": _window_payload(plan.holdout) if plan.holdout else None,
+            "diagnostics": [_window_payload(window) for window in plan.diagnostics],
+        }
+        total_candidates = min(500, max(1, int(raw.get("total_candidates", 500))))
+        neighbor_budget = min(200, max(0, int(robust_config.get("neighbor_budget", 200))))
+        references = robust_config.get("reference_strategy_ids", ())
+        if not isinstance(references, (list, tuple)) or len(references) > 2:
+            raise ValueError("at most two fixed reference strategies are supported")
+        windows_for_budget = len(plan.diagnostics)
+        holdout_count = int(plan.holdout is not None)
+        budget = (
+            3 * total_candidates
+            + 3 * neighbor_budget
+            + 3 * (1 + windows_for_budget + holdout_count + len(references))
+        )
+        return {
+            "time_plan": time_plan,
+            "calendar_source": "injected_authoritative_calendar" if self.trading_dates_reader else "normalized_repository_daily_dates",
+            "calendar_coverage": {
+                "requested_start": start.isoformat(),
+                "requested_end": end.isoformat(),
+                "covered_start": calendar[0].isoformat(),
+                "covered_end": calendar[-1].isoformat(),
+                "trading_dates": len(calendar),
+            },
+            "data_generation": self.data_generation(raw.get("asset_type", "stock")),
+            "budgets": {
+                "main_candidates": total_candidates,
+                "neighbor_candidates": neighbor_budget,
+                "estimated_backtests": budget,
+            },
+            "holdout_usage": robust_config.get("holdout_usage", "unknown"),
+            "warnings": [],
+        }
 
     def data_generation(self, asset_type: str) -> str:
         getter = getattr(self.repository, "get_matrix_data_generation", None)
         return str(getter(asset_type)) if callable(getter) else ""
+
+    def historical_trading_dates(self, start: date, end: date, asset_type: str = "stock"):
+        """Read the shared repository's normalized market dates, never a single symbol's rows."""
+        if self.repository is None or not hasattr(self.repository, "execute_all"):
+            raise ValueError("historical trading calendar is unavailable")
+        view = {"stock": "kline_daily", "etf": "kline_etf_daily", "index": "kline_index_daily"}.get(asset_type)
+        if view is None:
+            raise ValueError("unsupported asset type for historical trading calendar")
+        rows = self.repository.execute_all(
+            f"SELECT DISTINCT date FROM {view} WHERE date >= ? AND date <= ? ORDER BY date",
+            [start, end],
+        )
+        return tuple(_as_date(row[0]) for row in rows)
+
+    def calendar_coverage(self, start: date, end: date, asset_type: str = "stock") -> dict:
+        dates = self.historical_trading_dates(start, end, asset_type)
+        if not dates:
+            raise ValueError("historical trading calendar returned no dates")
+        return {
+            "source": "normalized_repository_daily_dates",
+            "requested_start": start.isoformat(),
+            "requested_end": end.isoformat(),
+            "covered_start": dates[0].isoformat(),
+            "covered_end": dates[-1].isoformat(),
+            "trading_dates": dates,
+        }
 
     def list_optimizable_strategies(self):
         result = []
@@ -489,3 +590,46 @@ def _as_tuple(value):
     if isinstance(value, list):
         return tuple(_as_tuple(item) for item in value)
     return value
+
+
+def _as_date(value):
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        return date.fromisoformat(value)
+    raise TypeError("expected a date")
+
+
+def _default_robust_boundaries(start, end, trading_dates, layout):
+    dates = tuple(day for day in trading_dates if start <= day <= end)
+    if layout == "holdout":
+        try:
+            holdout_start = end.replace(year=end.year - 2)
+        except ValueError:
+            holdout_start = end.replace(year=end.year - 2, day=28)
+        holdout_index = bisect_left(dates, holdout_start)
+        development_count = holdout_index
+        if development_count < 3 or holdout_index >= len(dates):
+            raise ValueError("date range cannot form three development windows and a holdout")
+        quotient, remainder = divmod(development_count, 3)
+        lengths = [quotient + (index < remainder) for index in range(3)]
+        first = lengths[0]
+        second = first + lengths[1]
+        return (dates[0], dates[first], dates[second], dates[holdout_index])
+    if layout == "diagnostic":
+        if len(dates) < 3:
+            raise ValueError("date range cannot form three diagnostic windows")
+        quotient, remainder = divmod(len(dates), 3)
+        first = quotient + (remainder > 0)
+        second = first + quotient + (remainder > 1)
+        return (dates[0], dates[first], dates[second])
+    raise ValueError("layout must be 'holdout' or 'diagnostic'")
+
+
+def _window_payload(window):
+    return {
+        "id": window.id,
+        "start": window.start.isoformat(),
+        "end": window.end.isoformat(),
+        "role": window.role,
+    }

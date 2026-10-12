@@ -7,17 +7,17 @@ import json
 import math
 import threading
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.extensions import BACKEND_EXTENSION_API_VERSION, BackendExtensionRegistrar
 from app.strategy.access import can_access_strategy
-from app.user_system.dependencies import require_paid_user
 from app.strategy_optimizer.contracts import ParameterSpec, StrategyOptimizationContract
 from app.strategy_optimizer.manager import OptimizationJobManager
 from app.strategy_optimizer.store import OptimizationRunStore
 from app.strategy_optimizer.validation import validate_run_config
+from app.user_system.dependencies import require_paid_user
 
 
 def _set_literal_assignment(code: str, name: str, value) -> str:
@@ -106,6 +106,8 @@ class RunRequest(BaseModel):
     max_drawdown: float = Field(default=0.5, ge=0, le=1, allow_inf_nan=False)
     min_trades: int = Field(default=5, ge=0, le=100000)
     convergence_threshold: float = Field(default=0.01, gt=0, le=0.25, allow_inf_nan=False)
+    evaluation_mode: str = "legacy"
+    robust_config: dict | None = None
 
     @model_validator(mode="after")
     def validate_execution_and_weights(self):
@@ -115,6 +117,8 @@ class RunRequest(BaseModel):
             raise ValueError("invalid backtest execution options")
         if self.objective not in VALID_OBJECTIVES:
             raise ValueError("unsupported optimization objective")
+        if self.evaluation_mode not in {"legacy", "robust"}:
+            raise ValueError("unsupported evaluation mode")
         expected = {"oos_return", "drawdown_improvement", "win_rate", "trade_count"}
         if set(self.weights) != expected or any(
             not math.isfinite(weight) or weight < 0 for weight in self.weights.values()
@@ -258,8 +262,34 @@ def build_router() -> APIRouter:
         except (ValueError, TypeError) as exc:
             raise HTTPException(404, str(exc)) from exc
 
+    @router.post("/preview")
+    def preview(req: RunRequest, request: Request):
+        if req.evaluation_mode != "robust":
+            raise HTTPException(422, "preview is available only for robust evaluation")
+        try:
+            strategy = strategy_for(request, req.strategy_id)
+            contract_obj = _contract(strategy)
+            validate_run_config(req.model_dump(), contract_obj)
+            source = _optimization_gateway
+            if source is None:
+                raise ValueError("strategy optimization gateway is unavailable")
+            preview_value = source.preview_robust_config(req.model_dump())
+            return {
+                **preview_value,
+                "strategy_id": req.strategy_id,
+                "strategy_snapshot_available": False,
+                "run_available": False,
+                "run_blocker": "strategy snapshot execution is unavailable",
+            }
+        except HTTPException:
+            raise
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(422, str(exc)) from exc
+
     @router.post("/runs", status_code=202)
     def create_run(req: RunRequest, request: Request):
+        if req.evaluation_mode == "robust":
+            raise HTTPException(409, "稳健模式暂不可启动：排队任务的策略源码快照执行尚未实现")
         try:
             contract_obj = _contract(strategy_for(request, req.strategy_id))
             config = validate_run_config(req.model_dump(), contract_obj)
@@ -289,7 +319,11 @@ def build_router() -> APIRouter:
             raise HTTPException(404, "run not found") from exc
 
     @router.post("/runs/{run_id}/save")
-    async def save_recommendations(run_id: str, request: Request):
+    async def save_recommendations(
+        run_id: str,
+        request: Request,
+        rank: int | None = Query(default=None, ge=1, le=3),
+    ):
         try:
             record = owned_run(request, run_id)
         except KeyError as exc:
@@ -306,6 +340,8 @@ def build_router() -> APIRouter:
         candidates = (record.get("result") or {}).get("top3")
         if not isinstance(candidates, list) or not candidates:
             raise HTTPException(409, "没有通过筛选的推荐参数可保存")
+        if rank is not None and rank > min(len(candidates), 3):
+            raise HTTPException(404, "推荐序号不存在")
         from app.api.strategy import (
             StrategyCodeSaveRequest,
             _persist_user_strategy,
@@ -314,15 +350,17 @@ def build_router() -> APIRouter:
 
         saved = []
         errors = []
-        for rank, candidate in enumerate(candidates[:3], start=1):
+        for candidate_rank, candidate in enumerate(candidates[:3], start=1):
+            if rank is not None and candidate_rank != rank:
+                continue
             if not isinstance(candidate, dict) or not isinstance(candidate.get("parameters"), dict):
-                errors.append({"rank": rank, "error": "推荐参数格式无效"})
+                errors.append({"rank": candidate_rank, "error": "推荐参数格式无效"})
                 continue
             parameters = candidate["parameters"]
             specs = {spec.id: spec for spec in contract_obj.parameters}
             if any(key not in specs or not specs[key].validate_value(value)
                    for key, value in parameters.items()):
-                errors.append({"rank": rank, "error": "推荐参数不符合策略契约"})
+                errors.append({"rank": candidate_rank, "error": "推荐参数不符合策略契约"})
                 continue
             buy_signals = candidate.get("buy_signals", config.get("buy_signals", []))
             sell_signals = candidate.get("sell_signals", config.get("sell_signals", []))
@@ -330,10 +368,10 @@ def build_router() -> APIRouter:
                     or any(not isinstance(signal, str) for signal in [*buy_signals, *sell_signals])
                     or not set(buy_signals).issubset(contract_obj.buy_signals)
                     or not set(sell_signals).issubset(contract_obj.sell_signals)):
-                errors.append({"rank": rank, "error": "推荐信号不符合策略契约"})
+                errors.append({"rank": candidate_rank, "error": "推荐信号不符合策略契约"})
                 continue
-            strategy_id = f"custom_opt_{run_id[:12]}_top{rank}"
-            name = f"{contract_obj.name}-top{rank}"
+            strategy_id = f"custom_opt_{run_id[:12]}_top{candidate_rank}"
+            name = f"{contract_obj.name}-top{candidate_rank}"
             try:
                 existing = request.app.state.strategy_engine.get(strategy_id)
             except (KeyError, ValueError):
@@ -355,8 +393,8 @@ def build_router() -> APIRouter:
                 ), request)
                 await _persist_user_strategy(request, result)
                 saved.append({"strategy_id": strategy_id, "name": name, "already_saved": False})
-            except Exception as exc:
-                errors.append({"rank": rank, "error": str(exc)})
+            except Exception as exc:  # noqa: BLE001 - keep failures isolated per recommendation
+                errors.append({"rank": candidate_rank, "error": str(exc)})
         return {"saved": saved, "errors": errors}
 
     @router.get("/runs")
