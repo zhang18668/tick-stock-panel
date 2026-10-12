@@ -38,6 +38,7 @@ import { WatchlistGroupMenu } from '@/components/WatchlistAddMenu'
 import { ScoringEditor } from '@/components/ScoringEditor'
 import { strategyResultCandidate } from './researchCandidates'
 import { buildDailyNavItems, buildTradeKeyMap, buildTradesNavItems, type TradeNavItem } from './tradeNav'
+import { buildStrategyGroupViews, type LibraryStrategyGroup, type StrategyGroupingMode } from './strategyGrouping'
 
 const formatDate = (date: Date) => date.toISOString().slice(0, 10)
 const monthsAgo = (months: number) => {
@@ -193,14 +194,6 @@ const BASIC_FILTER_RANGES = [
   { minKey: 'turnover_min', maxKey: 'turnover_max', label: '换手率', unit: '%', step: '0.5' },
 ]
 type AdvancedSettingsTab = 'params' | 'filter' | 'entry' | 'exit' | 'scoring' | 'risk' | 'range'
-type StrategyGroup = 'all' | 'custom' | 'ai' | 'builtin' | 'composite'
-const STRATEGY_GROUPS: { id: StrategyGroup; label: string }[] = [
-  { id: 'all', label: '全部' },
-  { id: 'custom', label: '自定义' },
-  { id: 'ai', label: 'AI' },
-  { id: 'composite', label: '叠加' },
-  { id: 'builtin', label: '内置' },
-]
 const ADVANCED_TABS: { id: AdvancedSettingsTab; label: string }[] = [
   { id: 'params', label: '策略参数' },
   { id: 'filter', label: '基础过滤' },
@@ -945,16 +938,21 @@ function StockPoolPicker({ value, onChange, assetType = 'stock' }: { value: stri
   )
 }
 
-export function StrategyBacktest({ loadCandidate, onLoadConsumed }: {
+export function StrategyBacktest({ loadCandidate, onLoadConsumed, strategyGroupingMode = 'source', libraryGroups = [], libraryGroupsLoading = false, libraryGroupsError, onRetryLibraryGroups }: {
   /** 候选方案「载入复测」: 回填保存的回测配置 (消费后由父组件清空) */
   loadCandidate?: ResearchCandidate | null
   onLoadConsumed?: () => void
+  strategyGroupingMode?: StrategyGroupingMode
+  libraryGroups?: LibraryStrategyGroup[]
+  libraryGroupsLoading?: boolean
+  libraryGroupsError?: string
+  onRetryLibraryGroups?: () => void
 }) {
   const queryClient = useQueryClient()
   const signalNames = useSignalNames()
   const [saved] = useState(() => storage.strategyBacktestLast.get(null))
   const [selectedStrategy, setSelectedStrategy] = useState<string | null>(saved?.selectedStrategy ?? null)
-  const [strategyGroup, setStrategyGroup] = useState<StrategyGroup>('all')
+  const [strategyGroup, setStrategyGroup] = useState<string>('all')
   const [symbols, setSymbols] = useState(saved?.symbols ?? '')
   const [assetType, setAssetType] = useState<'stock' | 'etf'>(saved?.assetType ?? 'stock')
   const [start, setStart] = useState(saved?.start ?? THREE_MONTHS_AGO)
@@ -1069,9 +1067,20 @@ export function StrategyBacktest({ loadCandidate, onLoadConsumed }: {
     queryFn: () => api.screenerStrategies(assetType, 'all'),
   })
   const strategyList = useMemo(() => strategies.data?.presets ?? [], [strategies.data])
-  const filteredStrategyList = useMemo(() => (
-    strategyGroup === 'all' ? strategyList : strategyList.filter(st => st.source === strategyGroup)
-  ), [strategyGroup, strategyList])
+  const strategyGroupViews = useMemo(
+    () => buildStrategyGroupViews(strategyGroupingMode, strategyList, libraryGroups, !!libraryGroupsError),
+    [strategyGroupingMode, libraryGroups, libraryGroupsError, strategyList],
+  )
+  const filteredStrategyList = useMemo(() => {
+    const visibleIds = new Set(strategyGroupViews.find(group => group.id === strategyGroup)?.strategyIds ?? [])
+    return strategyList.filter(strategy => visibleIds.has(strategy.id))
+  }, [strategyGroupViews, strategyGroup, strategyList])
+  useEffect(() => {
+    if (strategyGroupingMode === 'library' && !libraryGroupsLoading
+      && (libraryGroupsError || !strategyGroupViews.some(group => group.id === strategyGroup))) {
+      setStrategyGroup('all')
+    }
+  }, [strategyGroupingMode, libraryGroupsLoading, libraryGroupsError, strategyGroupViews, strategyGroup])
   // 校验 localStorage 里保存的上次选中策略是否仍存在(本地开发残留的自定义策略
   // 拉新代码后会失效,导致 strategyGet 一直 404/加载中)。列表就绪后若失效,
   // 连带清除其专属的 params/overrides/result(这些是该策略的运行配置/产物,
@@ -1685,13 +1694,22 @@ export function StrategyBacktest({ loadCandidate, onLoadConsumed }: {
             </div>
           )}
           <div className="overflow-hidden rounded-input border border-border bg-surface">
-            <div className="flex border-b border-border/60 bg-base/30 p-0.5">
-              {STRATEGY_GROUPS.map(group => (
+            {strategyGroupingMode === 'library' && libraryGroupsLoading && (
+              <div className="border-b border-border/60 px-2 py-1 text-[10px] text-muted">正在加载策略库分组…</div>
+            )}
+            {strategyGroupingMode === 'library' && libraryGroupsError && (
+              <div role="alert" className="flex items-center gap-2 border-b border-red-300/40 bg-red-400/5 px-2 py-1.5 text-[10px] text-red-500">
+                <span className="min-w-0 flex-1">策略库分组加载失败，暂时显示全部策略：{libraryGroupsError}</span>
+                <button type="button" onClick={onRetryLibraryGroups} className="shrink-0 underline" disabled={!onRetryLibraryGroups}>重试</button>
+              </div>
+            )}
+            <div className={`flex gap-0.5 overflow-x-auto border-b border-border/60 bg-base/30 p-0.5 ${strategyGroupingMode === 'library' ? 'justify-start' : ''}`}>
+              {strategyGroupViews.map(group => (
                 <button
                   key={group.id}
                   type="button"
                   onClick={() => setStrategyGroup(group.id)}
-                  className={`flex-1 rounded-[6px] px-1.5 py-1 text-[10px] font-medium transition-colors ${strategyGroup === group.id
+                  className={`shrink-0 rounded-[6px] px-2 py-1 text-[10px] font-medium transition-colors ${strategyGroupingMode === 'source' ? 'flex-1' : ''} ${strategyGroup === group.id
                     ? 'bg-accent/15 text-accent shadow-sm'
                     : 'text-muted hover:bg-elevated/70 hover:text-secondary'
                   }`}

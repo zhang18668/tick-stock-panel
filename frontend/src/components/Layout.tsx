@@ -584,7 +584,7 @@ export function Layout() {
     || account?.role === 'admin'
     || !!billing?.effective_plan.startsWith('pro_')
   const extensionNav: NavItem[] = getFrontendExtensionNavigation()
-    .filter(item => hasPaidFeatures || !['/strategy-library', '/strategy-optimizer'].includes(item.route.path))
+    .filter(item => hasPaidFeatures || !['/strategy-library', '/strategy-optimizer', '/custom-strategies'].includes(item.route.path))
     .map(item => ({
     to: item.route.path,
     label: item.label,
