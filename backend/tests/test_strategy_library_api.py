@@ -78,6 +78,7 @@ def _client(*, user_id="alice", owned_ids=frozenset(), raise_server_exceptions=T
             request.state.owned_strategy_ids = owned_ids
             request.state.installed_strategy_ids = frozenset()
             request.state.strategy_overrides = {}
+            request.state.is_paid_user = True
         return await call_next(request)
 
     app.state.strategy_engine = FakeEngine()

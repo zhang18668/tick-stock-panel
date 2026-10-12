@@ -77,7 +77,9 @@ export function StrategyOptimizerPage() {
   const [holdoutUsage, setHoldoutUsage] = useState<'used' | 'declared_unused' | 'unknown'>('unknown')
   const [neighborBudget, setNeighborBudget] = useState(200)
   const [robustPreview, setRobustPreview] = useState<RobustPreview | null>(null)
+  const [robustPreviewKey, setRobustPreviewKey] = useState('')
   const [robustPreviewError, setRobustPreviewError] = useState('')
+  const [starting, setStarting] = useState(false)
   const [runs, setRuns] = useState<OptimizerRun[]>([])
   const saveMutation = useMutation({
     mutationFn: (rank: number) => optimizerApi.saveRecommendations(run!.run_id, rank),
@@ -184,47 +186,80 @@ export function StrategyOptimizerPage() {
     return { ...current, [id]: existing.includes(value) ? existing.filter(item => item !== value) : [...existing, value] }
   })
 
+  const currentParameters = () => Object.fromEntries([
+    ...Object.entries(ranges).map(([id, range]) => [id, range]),
+    ...Object.entries(discreteValues).filter(([, values]) => values.length > 0).map(([id, values]) => [id, { values }]),
+  ])
+  const buildRobustPreviewConfig = () => ({
+    evaluation_mode: 'robust', strategy_id: selected, asset_type: contract?.asset_type, start, end,
+    parameters: currentParameters(), buy_signals: buySignals, sell_signals: sellSignals, seed,
+    max_rounds: maxRounds, candidates_per_round: perRound, total_candidates: maxRounds * perRound,
+    robust_config: { layout: robustLayout, holdout_usage: holdoutUsage, neighbor_budget: neighborBudget },
+    symbols: symbolsText.trim() ? symbolsText.split(',').map(value => value.trim()).filter(Boolean) : null,
+    matching, mode: 'position', fees_pct: feesPct, commission_pct: commissionPct,
+    stamp_tax_pct: stampTaxPct, slippage_bps: slippageBps, holding_days: holdingDays,
+  })
+  const currentRobustPreviewKey = evaluationMode === 'robust' ? JSON.stringify(buildRobustPreviewConfig()) : ''
+  useEffect(() => {
+    if (robustPreviewKey && robustPreviewKey !== currentRobustPreviewKey) {
+      setRobustPreview(null)
+      setRobustPreviewKey('')
+    }
+  }, [robustPreviewKey, currentRobustPreviewKey])
+
   const previewRobust = () => {
     setRobustPreview(null)
+    setRobustPreviewKey('')
     setRobustPreviewError('')
-    const parameters = Object.fromEntries([
-      ...Object.entries(ranges).map(([id, range]) => [id, range]),
-      ...Object.entries(discreteValues).filter(([, values]) => values.length > 0).map(([id, values]) => [id, { values }]),
-    ])
-    optimizerApi.preview({
-      evaluation_mode: 'robust', strategy_id: selected, asset_type: contract?.asset_type, start, end,
-      parameters, buy_signals: buySignals, sell_signals: sellSignals, seed,
-      max_rounds: maxRounds, candidates_per_round: perRound, total_candidates: maxRounds * perRound,
-      robust_config: { layout: robustLayout, holdout_usage: holdoutUsage, neighbor_budget: neighborBudget },
-      symbols: symbolsText.trim() ? symbolsText.split(',').map(value => value.trim()).filter(Boolean) : null,
-      matching, mode: 'position', fees_pct: feesPct, commission_pct: commissionPct,
-      stamp_tax_pct: stampTaxPct, slippage_bps: slippageBps, holding_days: holdingDays,
-    }).then(setRobustPreview).catch(error => setRobustPreviewError(String(error)))
+    const config = buildRobustPreviewConfig()
+    const previewKey = JSON.stringify(config)
+    optimizerApi.preview(config).then(value => {
+      setRobustPreview(value)
+      setRobustPreviewKey(previewKey)
+    }).catch(error => setRobustPreviewError(String(error)))
   }
 
-  const submit = () => {
+  const submit = async () => {
+    if (starting) return
+    let robustPreflight = false
+    setStarting(true)
     setError(''); setProgress(null)
     saveMutation.reset()
-    const parameters = Object.fromEntries([
-      ...Object.entries(ranges).map(([id, range]) => [id, range]),
-      ...Object.entries(discreteValues).filter(([, values]) => values.length > 0).map(([id, values]) => [id, { values }]),
-    ])
-    optimizerApi.run({
-      strategy_id: selected, asset_type: contract?.asset_type, start, end, parameters,
-      buy_signals: buySignals, sell_signals: sellSignals, seed,
-      max_rounds: maxRounds, candidates_per_round: perRound, total_candidates: maxRounds * perRound,
-      weights, max_drawdown: maxDrawdown, min_trades: minTrades,
-      train_fraction: trainFraction, test_days: testDays, step_days: stepDays,
-      fees_pct: feesPct, slippage_bps: slippageBps,
-      commission_pct: commissionPct, stamp_tax_pct: stampTaxPct,
-      symbols: symbolsText.trim() ? symbolsText.split(',').map(value => value.trim()).filter(Boolean) : null,
-      matching, mode, holding_days: holdingDays,
-      evaluation_mode: evaluationMode,
-      ...(evaluationMode === 'robust' ? { robust_config: { layout: robustLayout, holdout_usage: holdoutUsage, neighbor_budget: neighborBudget } } : {}),
-    }).then(value => {
+    try {
+      const parameters = currentParameters()
+      if (evaluationMode === 'robust') {
+        let preview = robustPreviewKey === currentRobustPreviewKey ? robustPreview : null
+        if (!preview) {
+          robustPreflight = true
+          setRobustPreviewError('')
+          const config = buildRobustPreviewConfig()
+          preview = await optimizerApi.preview(config)
+          setRobustPreview(preview)
+          setRobustPreviewKey(JSON.stringify(config))
+        }
+        if (!preview.run_available) return
+      }
+      const value = await optimizerApi.run({
+        strategy_id: selected, asset_type: contract?.asset_type, start, end, parameters,
+        buy_signals: buySignals, sell_signals: sellSignals, seed,
+        max_rounds: maxRounds, candidates_per_round: perRound, total_candidates: maxRounds * perRound,
+        weights, max_drawdown: maxDrawdown, min_trades: minTrades,
+        train_fraction: trainFraction, test_days: testDays, step_days: stepDays,
+        fees_pct: feesPct, slippage_bps: slippageBps,
+        commission_pct: commissionPct, stamp_tax_pct: stampTaxPct,
+        symbols: symbolsText.trim() ? symbolsText.split(',').map(value => value.trim()).filter(Boolean) : null,
+        matching, mode: evaluationMode === 'robust' ? 'position' : mode, holding_days: holdingDays,
+        evaluation_mode: evaluationMode,
+        ...(evaluationMode === 'robust' ? { robust_config: { layout: robustLayout, holdout_usage: holdoutUsage, neighbor_budget: neighborBudget } } : {}),
+      })
       setRun(value)
       setRuns(current => [value, ...current.filter(item => item.run_id !== value.run_id)])
-    }).catch(e => setError(String(e)))
+    } catch (reason) {
+      if (evaluationMode === 'robust' && robustPreflight) setRobustPreviewError(String(reason))
+      else setError(String(reason))
+    } finally {
+      setStarting(false)
+    }
   }
 
   return <main className="mx-auto flex max-w-5xl flex-col gap-6 p-4 sm:p-6">
@@ -239,8 +274,8 @@ export function StrategyOptimizerPage() {
       </select>{selectedGroup && !visibleStrategies.length && <span className="text-xs text-muted">该分组中没有可选择的策略{requestedIds.length ? '（当前批量选择范围内）' : ''}。</span>}</label>
       {strategy && !strategy.optimizable && <p className="text-sm text-muted">{strategy.reason}</p>}
       {contract && strategy?.optimizable && <>
-        <label className="text-sm">优化模式<select aria-label="优化模式" value={evaluationMode} onChange={event => { setEvaluationMode(event.target.value as typeof evaluationMode); setRobustPreview(null); setRobustPreviewError('') }} className="mt-1 block w-full rounded border bg-base p-2"><option value="legacy">传统优化</option><option value="robust">跨时期稳健</option></select></label>
-        {evaluationMode === 'robust' && <RobustnessConfig layout={robustLayout} holdoutUsage={holdoutUsage} neighborBudget={neighborBudget} preview={robustPreview} previewError={robustPreviewError} onLayoutChange={value => { setRobustLayout(value); setRobustPreview(null) }} onHoldoutUsageChange={value => { setHoldoutUsage(value); setRobustPreview(null) }} onNeighborBudgetChange={value => { setNeighborBudget(value); setRobustPreview(null) }} onPreview={previewRobust} />}
+        <label className="text-sm">优化模式<select aria-label="优化模式" value={evaluationMode} onChange={event => { setEvaluationMode(event.target.value as typeof evaluationMode); setRobustPreview(null); setRobustPreviewKey(''); setRobustPreviewError('') }} className="mt-1 block w-full rounded border bg-base p-2"><option value="legacy">传统优化</option><option value="robust">跨时期稳健</option></select></label>
+        {evaluationMode === 'robust' && <RobustnessConfig layout={robustLayout} holdoutUsage={holdoutUsage} neighborBudget={neighborBudget} preview={robustPreview} previewError={robustPreviewError} onLayoutChange={value => { setRobustLayout(value); setRobustPreview(null); setRobustPreviewKey('') }} onHoldoutUsageChange={value => { setHoldoutUsage(value); setRobustPreview(null); setRobustPreviewKey('') }} onNeighborBudgetChange={value => { setNeighborBudget(value); setRobustPreview(null); setRobustPreviewKey('') }} onPreview={previewRobust} />}
         <div className="grid gap-3 sm:grid-cols-2">
           {contract.parameters.map(param => <fieldset key={param.id} className="rounded border p-3" disabled={!param.optimizable}>
             <legend className="px-1 text-sm">{param.label} <span className="text-muted">默认 {String(param.default)}</span></legend>
@@ -277,7 +312,7 @@ export function StrategyOptimizerPage() {
           <label className="text-sm">随机种子<input type="number" value={seed} onChange={e => setSeed(Number(e.target.value))} className="mt-1 block w-full rounded border bg-base p-2" /></label>
         </div>}
         {evaluationMode === 'legacy' && <><fieldset className="grid gap-3 sm:grid-cols-2"><legend className="text-sm font-medium">评分权重（合计 100%）</legend>{Object.entries(weights).map(([key, value]) => <label key={key} className="text-sm">{key}<input type="number" min={0} max={1} step={0.01} value={value} onChange={e => setWeights(current => ({ ...current, [key]: Number(e.target.value) }))} className="mt-1 block w-full rounded border bg-base p-2" /></label>)}</fieldset><p className="text-xs text-muted">当前权重合计：{(weightTotal * 100).toFixed(0)}%</p></>}
-        <button className="w-fit rounded bg-primary px-4 py-2 text-white disabled:opacity-50" disabled={!start || !end || start >= end || (evaluationMode === 'legacy' && Math.abs(weightTotal - 1) > 1e-9) || Object.values(discreteValues).some(values => values.length === 0) || !!run || (evaluationMode === 'robust' && !robustPreview?.run_available)} onClick={submit}>{evaluationMode === 'robust' ? '启动稳健优化' : '启动优化'}</button>
+        <button className="w-fit rounded bg-primary px-4 py-2 text-white disabled:opacity-50" disabled={!start || !end || start >= end || (evaluationMode === 'legacy' && Math.abs(weightTotal - 1) > 1e-9) || Object.values(discreteValues).some(values => values.length === 0) || !!run || starting || (evaluationMode === 'robust' && robustPreviewKey === currentRobustPreviewKey && !!robustPreview && !robustPreview.run_available)} onClick={submit}>{starting ? '检查并启动中…' : evaluationMode === 'robust' ? '启动稳健优化' : '启动优化'}</button>
       </>}
     </section>
     {runs.length > 0 && <section className="rounded border p-4"><h2 className="mb-3 font-medium">最近优化任务</h2><ul className="grid gap-2">{runs.slice(0, 10).map(item => {

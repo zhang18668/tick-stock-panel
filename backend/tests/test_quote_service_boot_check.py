@@ -12,11 +12,7 @@
     —— 上游此前对 `boot_check()` 本身**没有任何测试**
       (`test_data_integrity.py` 里那个同名 `boot_check` 是数据修复用的, ⛔ 不是本函数)。
 
-⚠️ 已知差异(本文件用 xfail 显式记录, ⛔ 不改被测代码):
-  当**档位允许**但**偏好为关**时, 上游 `boot_check()` 分支走到底: **不启动、也不打日志**。
-  本机口径要求此处**必须留一行日志**(「静默不启动」正是 2026-09-16 事故难排查的原因)
-  ⇒ 用 `xfail(strict=True)` 编码**期望行为**: 上游修好那天它会变 XPASS ⇒ strict 会让它 FAIL
-  ⇒ 提示「该更新测试了」。(不喜欢这种用法的话, 删掉 `test_..._leaves_a_log` 即可, 其余 4 例独立。)
+当**档位允许**但**偏好为关**时, 服务必须保持关闭并留下一行日志, 以区分用户主动关闭与服务启动失败。
 
 ⚠️ 标点惯例: 本仓 `tests/` 共 288 个文件, 其中 271 个不含 RUF00x(全角标点)告警 ⇒ 本文件随多数派
   在**文档串/注释**里用 ASCII 标点(`(` `)` `,` `:` `;`), 以保持 `ruff check tests` 零新增。
@@ -24,8 +20,6 @@
 from __future__ import annotations
 
 import logging
-
-import pytest
 
 from app.services import preferences
 from app.services.quote_service import QuoteService
@@ -49,7 +43,7 @@ def test_starts_when_preference_enabled(monkeypatch):
 
 
 def test_does_not_start_when_preference_disabled(monkeypatch):
-    """偏好为关 ⇒ 不得启动(这正是 09-16 事故的表象; 根因已由 stop() 修掉)。"""
+    """用户主动关闭并持久化的偏好必须在下次启动时继续生效。"""
     qs, started = _make(monkeypatch, tier_allowed=True, pref_enabled=False)
     qs.boot_check()
     assert started == [], "偏好为关时不应启动"
@@ -75,15 +69,9 @@ def test_demotes_preference_when_tier_disallows(monkeypatch):
     assert saved == [{"realtime_quotes_enabled": False}], f"应把偏好降级写回, 实际={saved}"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="上游此分支仍静默: 档位允许但偏好为关时不打日志(本机已加一行) -- 修好后本用例会 XPASS, 届时删除 xfail",
-)
 def test_preference_disabled_leaves_a_log(monkeypatch, caplog):
-    """⚠️ **期望**行为(上游当前未满足): 偏好为关而档位允许时也应留下日志。
+    """偏好为关且档位允许时不启动, 并留下可诊断日志。"""
 
-    「不启动」本身没有错, 错的是一句话都不说 —— 那让「没行情」与「没权限/没数据/没启动」无法区分。
-    """
     qs, started = _make(monkeypatch, tier_allowed=True, pref_enabled=False)
     with caplog.at_level(logging.INFO, logger="app.services.quote_service"):
         qs.boot_check()

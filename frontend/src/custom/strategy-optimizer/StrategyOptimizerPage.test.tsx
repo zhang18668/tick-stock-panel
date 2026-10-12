@@ -141,3 +141,62 @@ it('opens the latest completed run and shows its optimization window', async () 
   expect(host.textContent).toContain('优化区间：2023-01-01 至 2023-12-31')
   expect(host.textContent).toContain('Window')
 })
+
+it('starts robust optimization from the start button by previewing first', async () => {
+  const requests: string[] = []
+  const submittedConfigs: Array<Record<string, unknown>> = []
+  const preview = {
+    strategy_id: 'demo',
+    time_plan: { development: [{ id: 'd1', start: '2022-01-01', end: '2023-12-31', role: 'development' }], holdout: null, diagnostics: [] },
+    calendar_source: 'normalized_repository_daily_dates',
+    calendar_coverage: { requested_start: '2022-01-01', requested_end: '2026-10-12', covered_start: '2022-01-01', covered_end: '2026-10-12', trading_dates: 1000 },
+    data_generation: 'g1', budgets: { main_candidates: 500, neighbor_candidates: 200, estimated_backtests: 1400 },
+    holdout_usage: 'unknown', warnings: [], strategy_snapshot_available: true, run_available: true, run_blocker: null,
+  }
+  const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input)
+    if (url.endsWith('/api/strategy-library')) return Response.json({
+      groups: [{ id: 'g1', name: 'G1', order: 0, strategy_ids: ['demo'] }],
+      strategies: [{ id: 'demo', name: 'Demo' }], results: {}, tasks: [], latest_trading_day: null, earliest_daily_date: null,
+    })
+    if (url.endsWith('/strategies')) return Response.json([{ strategy_id: 'demo', name: 'Demo', optimizable: true, reason: null }])
+    if (url.endsWith('/contract')) return Response.json({
+      strategy_id: 'demo', name: 'Demo', asset_type: 'stock',
+      parameters: [{ id: 'window', label: 'Window', type: 'int', default: 10, minimum: 2, maximum: 30, step: 1, options: [], optimizable: true }],
+      buy_signals: ['buy_a'], sell_signals: ['sell_a'],
+    })
+    if (url.endsWith('/runs') && !init?.method) return Response.json([])
+    if (url.endsWith('/preview')) {
+      requests.push('preview')
+      return Response.json(preview)
+    }
+    if (url.endsWith('/runs') && init?.method === 'POST') {
+      requests.push('run')
+      const submittedConfig = JSON.parse(String(init.body)) as Record<string, unknown>
+      submittedConfigs.push(submittedConfig)
+      return Response.json({ run_id: 'robust-run', state: 'succeeded', config: submittedConfig, result: {} })
+    }
+    throw new Error(`unexpected request ${url}`)
+  })
+  vi.stubGlobal('fetch', fetchMock)
+  await act(async () => root.render(<QueryClientProvider client={client}><StrategyOptimizerPage /></QueryClientProvider>))
+  await act(async () => { await new Promise(resolve => setTimeout(resolve, 10)) })
+
+  const selectValue = async (select: HTMLSelectElement, value: string) => act(async () => {
+    Object.defineProperty(select, 'value', { value, configurable: true })
+    select.dispatchEvent(new Event('change', { bubbles: true }))
+    await new Promise(resolve => setTimeout(resolve, 10))
+  })
+  await selectValue(host.querySelector<HTMLSelectElement>('[aria-label="策略分组"]')!, 'g1')
+  await selectValue(host.querySelectorAll('select')[1], 'demo')
+  const legacyMode = [...host.querySelectorAll('label')].find(label => label.textContent?.includes('回测模式'))?.querySelector('select')
+  if (legacyMode) await selectValue(legacyMode, 'full')
+  await selectValue(host.querySelector<HTMLSelectElement>('[aria-label="优化模式"]')!, 'robust')
+
+  const start = [...host.querySelectorAll('button')].find(button => button.textContent?.includes('启动稳健优化'))!
+  expect(start.disabled).toBe(false)
+  await act(async () => { start.click(); await new Promise(resolve => setTimeout(resolve, 10)) })
+
+  expect(requests).toEqual(['preview', 'run'])
+  expect(submittedConfigs[0]?.mode).toBe('position')
+})

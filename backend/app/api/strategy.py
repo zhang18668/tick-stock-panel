@@ -904,8 +904,10 @@ def _find_meta_dict(code: str) -> ast.Dict:
 
 
 def _set_meta_string_field(block: str, field: str, value: str) -> str:
+    single_line = len(block.splitlines()) == 1
+    key_prefix = "" if single_line else r"^\s*"
     pattern = re.compile(
-        rf"(?m)^(\s*[\"']{re.escape(field)}[\"']\s*:\s*)([\"'])(?:\\.|[^\n\\])*?\2"
+        rf"(?m)({key_prefix}[\"']{re.escape(field)}[\"']\s*:\s*)([\"'])(?:\\.|[^\n\\])*?\2"
     )
     next_block, count = pattern.subn(
         lambda m: f"{m.group(1)}{_py_string(value)}",
@@ -920,6 +922,19 @@ def _set_meta_string_field(block: str, field: str, value: str) -> str:
 def _insert_meta_field(block: str, field: str, value_repr: str) -> str:
     """在 META 字典末尾(闭合 `}` 之前)插入一个字段。value_repr 已是 Python 源码。"""
     lines = block.splitlines(keepends=True)
+    meta_node = _find_meta_dict(block)
+    if meta_node.lineno == meta_node.end_lineno:
+        # AST columns count UTF-8 bytes. A one-line META assignment must be
+        # edited before the dict's closing brace, not appended as an indented
+        # top-level line (which makes the saved strategy fail to parse).
+        raw = block.encode("utf-8")
+        closing_brace = meta_node.end_col_offset - 1
+        separator = b", " if meta_node.keys else b""
+        field_source = f"{_py_string(field)}: {value_repr}".encode()
+        return (
+            raw[:closing_brace] + separator + field_source + raw[closing_brace:]
+        ).decode("utf-8")
+
     key_indent = None
     for line in lines:
         m = re.match(r"^(\s*)[\"'][^\"']+[\"']\s*:", line)

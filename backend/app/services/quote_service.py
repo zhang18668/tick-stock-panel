@@ -391,8 +391,9 @@ class QuoteService:
                 self._save_enabled(False)
             logger.info("实时行情未启动:当前档位(none)无实时行情权限")
             return
-        # 实时行情是常驻服务。兼容历史版本保存的关闭值, 进程启动后统一恢复;
-        # 实际取数仍由交易时段判断及 pause()/resume() 安全边界控制。
+        if not preferences.get_realtime_quotes_enabled():
+            logger.info("实时行情未启动:用户偏好已关闭")
+            return
         self.start()
 
     def set_repo(self, repo) -> None:
