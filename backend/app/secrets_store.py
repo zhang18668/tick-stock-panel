@@ -34,6 +34,16 @@ def _path() -> Path:
     return p
 
 
+def file_path() -> Path:
+    """secrets.json 绝对路径 (设置页展示用)。
+
+    该文件是 AI 与数据源 Key 的统一配置源, 支持用户用编辑器直接修改;
+    load() 按 mtime 签名缓存失效, 外部保存后下一次请求即读取最新内容,
+    无需重启。
+    """
+    return _path()
+
+
 def load() -> dict:
     """读取 secrets.json (mtime 缓存);多用户请求叠加当前用户通知凭据。"""
     global _cache, _cache_sig

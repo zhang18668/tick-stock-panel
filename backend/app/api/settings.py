@@ -6,9 +6,11 @@ from __future__ import annotations
 
 import logging
 import time
+from pathlib import Path
 from typing import Literal
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, File, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from app import secrets_store
@@ -30,6 +32,13 @@ router = APIRouter(prefix="/api/settings", tags=["settings"])
 # 默认端点 —— endpoints.json 列表第一项,UI"当前使用"始终对齐此项。
 # 注意:Free 模式 SDK 实际走 free-api(免费数据通道),但 UI 显示统一用默认节点。
 DEFAULT_PAID_ENDPOINT = "https://api.tickflow.org"
+
+
+def _require_platform_configuration_access(request: Request) -> None:
+    if getattr(request.state, "current_user", None) is not None:
+        from app.user_system.dependencies import require_admin
+
+        require_admin(request)
 
 
 def _sync_financial_scheduler_caps(app_state, capset) -> None:
@@ -58,15 +67,16 @@ def get_settings(request: Request) -> dict:
     from app.services import preferences
     from app.services.ai_provider import (
         ai_configured,
+        current_ai_context_window,
+        current_ai_max_output_tokens,
         current_ai_model,
+        current_ai_protocol,
+        current_ai_round_checkpoint,
         current_codex_command,
         current_codex_model,
         current_codex_reasoning_effort,
         current_openai_model,
         current_openai_reasoning_effort,
-        current_ai_context_window,
-        current_ai_max_output_tokens,
-        current_ai_round_checkpoint,
     )
 
     key = secrets_store.get_tickflow_key()
@@ -82,8 +92,11 @@ def get_settings(request: Request) -> dict:
         "extras_caps": extras_caps(),
         # 首次使用引导
         "onboarding_completed": preferences.get_onboarding_completed(),
+        # 配置文件位置 (AI 与数据源 Key 统一存放, 支持外部编辑后热加载)
+        "secrets_path": str(secrets_store.file_path()),
         # AI 配置
         "ai_provider": ai_provider,
+        "ai_protocol": current_ai_protocol(),
         "ai_base_url": secrets_store.get_ai_config("ai_base_url", settings.ai_base_url),
         "ai_api_key_masked": secrets_store.mask(secrets_store.get_ai_key()),
         "has_ai_key": bool(secrets_store.get_ai_key()),
@@ -256,6 +269,7 @@ class AiSettingsIn(BaseModel):
     base_url: str = ""
     api_key: str | None = None
     model: str = ""
+    protocol: str = ""              # chat_completions | responses; 空=保持原值
     reasoning_effort: str = Field(default="high", max_length=64)
     codex_command: str = ""
     codex_reasoning_effort: str = ""
@@ -265,24 +279,72 @@ class AiSettingsIn(BaseModel):
     round_checkpoint: int | None = None    # 助手工具轮次检查点; 0=不检查
 
 
-def save_ai_settings(req: AiSettingsIn, request: Request | None = None) -> dict:
+class AiTestIn(BaseModel):
+    """草稿连通性测试入参 — 只读表单值, 与保存完全解耦。"""
+
+    provider: str = "openai_compat"
+    base_url: str = ""
+    api_key: str | None = None      # 留空回退已保存 Key (改模型/协议不必重输)
+    model: str = ""
+    protocol: str = ""
+
+
+@router.post("/ai/test")
+async def test_ai_settings(req: AiTestIn) -> dict:
+    """用当前表单值发一次最小请求验证连通性, 不保存/不修改任何配置。
+
+    与 POST /ai (保存) 解耦: 测试失败不影响已保存配置, 状态栏也不会把
+    未验证的草稿展示为已生效。错误保留 200 包体 (ok=false), 由前端内联
+    展示在测试结果徽章, 不触发全局 toast。
+    """
+    from app.services.ai_provider import (
+        RESPONSES_PROTOCOL,
+        _format_openai_error,
+        _is_openai_transport_error,
+        probe_ai_config,
+    )
+
+    provider = req.provider or "openai_compat"
+    api_key = (req.api_key or "").strip() or (secrets_store.get_ai_key() or "")
+    protocol = req.protocol if req.protocol == RESPONSES_PROTOCOL else ""
+    try:
+        text = await probe_ai_config(
+            provider=provider,
+            api_key=api_key,
+            base_url=req.base_url.strip(),
+            model=req.model.strip(),
+            protocol=protocol,
+        )
+    except Exception as exc:  # noqa: BLE001 — 连通性测试: 任何异常都转为结果回报
+        detail = str(exc) or repr(exc)
+        if _is_openai_transport_error(exc):
+            detail = _format_openai_error(exc)
+        return {"ok": False, "error": detail, "error_type": type(exc).__name__}
+    return {"ok": True, "model": req.model.strip() or provider, "response": text[:80]}
+
+
+@router.post("/ai")
+def save_ai_settings(req: AiSettingsIn, request: Request = None) -> dict:
     """保存 AI 配置（全部持久化到 secrets.json）"""
     if request is not None:
         _require_platform_configuration_access(request)
     from app.config import settings
     from app.services.ai_provider import (
+        CHAT_COMPLETIONS_PROTOCOL,
         OPENAI_PROVIDER,
+        RESPONSES_PROTOCOL,
         ai_configured,
+        current_ai_context_window,
+        current_ai_max_output_tokens,
         current_ai_model,
+        current_ai_protocol,
         current_ai_provider,
+        current_ai_round_checkpoint,
         current_codex_command,
         current_codex_model,
         current_codex_reasoning_effort,
         current_openai_model,
         current_openai_reasoning_effort,
-        current_ai_context_window,
-        current_ai_max_output_tokens,
-        current_ai_round_checkpoint,
         normalize_codex_command,
         normalize_codex_model,
         normalize_codex_reasoning_effort,
@@ -308,6 +370,12 @@ def save_ai_settings(req: AiSettingsIn, request: Request | None = None) -> dict:
         if req.base_url:
             updates["ai_base_url"] = req.base_url
             settings.ai_base_url = req.base_url
+        if req.protocol:
+            # 协议仅对 openai/openai_compat 有意义; 非法值 fail-loud, 避免静默落错协议。
+            if req.protocol not in (CHAT_COMPLETIONS_PROTOCOL, RESPONSES_PROTOCOL):
+                raise HTTPException(status_code=400, detail=f"不支持的协议: {req.protocol}")
+            updates["ai_protocol"] = req.protocol
+            settings.ai_protocol = req.protocol
         if req.api_key is not None:
             if req.api_key:
                 updates["ai_api_key"] = req.api_key
@@ -350,6 +418,7 @@ def save_ai_settings(req: AiSettingsIn, request: Request | None = None) -> dict:
     return {
         "ok": True,
         "ai_provider": provider,
+        "ai_protocol": current_ai_protocol(),
         "ai_model": current_ai_model(),
         "ai_openai_model": current_openai_model(),
         "ai_reasoning_effort": current_openai_reasoning_effort(),
@@ -387,9 +456,10 @@ def clear_ai_settings(request: Request) -> dict:
         "ai_codex_command",
         "ai_codex_reasoning_effort",
     )
-    secrets_store.clear("ai_provider", "ai_base_url", "ai_api_key", "ai_model", "ai_codex_command", "ai_codex_reasoning_effort", "ai_max_output_tokens", "ai_context_window")
+    secrets_store.clear("ai_provider", "ai_protocol", "ai_base_url", "ai_api_key", "ai_model", "ai_codex_command", "ai_codex_reasoning_effort", "ai_max_output_tokens", "ai_context_window")
     # 同步重置运行时内存(provider 回默认值,其余置空)
     settings.ai_provider = "openai_compat"
+    settings.ai_protocol = "chat_completions"
     settings.ai_base_url = ""
     settings.ai_api_key = ""
     settings.ai_model = ""
@@ -407,6 +477,10 @@ async def list_sponsor_models() -> dict:
 
     其网关按 Origin 头过滤: 浏览器跨域请求只会拿到国产模型子集,
     服务端请求无 Origin 头可取全量, 故由后端代理转发。
+
+    /v1/models 除 id 外还携带 pricing (discountRate/分层单价) 与
+    context_length; 精简为 items 下发供前端展示折扣徽章与价格,
+    models 保持纯 id 列表向后兼容。
     """
     import httpx
 
@@ -417,11 +491,52 @@ async def list_sponsor_models() -> dict:
             data = res.json()
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"获取模型列表失败: {exc}") from exc
-    models = sorted({
-        item.get("id") for item in data.get("data", [])
-        if isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"]
-    })
-    return {"models": models}
+
+    def _amount(pricing: dict, dim: str) -> float | None:
+        value = (pricing.get(dim) or {}).get("amount")
+        return float(value) if isinstance(value, (int, float)) else None
+
+    def _rate(band: dict | None) -> float | None:
+        if not isinstance(band, dict):
+            return None
+        value = band.get("discountRate")
+        return float(value) if isinstance(value, (int, float)) else None
+
+    items: list[dict] = []
+    for raw in data.get("data", []):
+        if not isinstance(raw, dict):
+            continue
+        model_id = raw.get("id")
+        if not isinstance(model_id, str) or not model_id:
+            continue
+        pricing = raw.get("pricing") if isinstance(raw.get("pricing"), dict) else {}
+        rate = pricing.get("discountRate")
+        context_length = raw.get("context_length")
+        # 忙闲时定价: 上游把两档折扣放在 pricing.timePricing.timeBands。
+        # 顶层 discountRate 为忙时价, 忙闲时展示需单独透传。
+        time_pricing = pricing.get("timePricing")
+        time_pricing = time_pricing if isinstance(time_pricing, dict) else {}
+        bands = time_pricing.get("timeBands")
+        bands = [b for b in bands if isinstance(b, dict)] if isinstance(bands, list) else []
+        busy = next((b for b in bands if b.get("code") == "BUSY"), None)
+        offpeak = next((b for b in bands if b.get("code") == "OFF_PEAK"), None)
+        current_band = time_pricing.get("currentBand")
+        current = next((b for b in bands if b.get("code") == current_band), None) if isinstance(current_band, str) else None
+        items.append({
+            "id": model_id,
+            "context_length": context_length if isinstance(context_length, int) else None,
+            "discount_rate": float(rate) if isinstance(rate, (int, float)) else 1.0,
+            "input_price": _amount(pricing, "input"),
+            "output_price": _amount(pricing, "output"),
+            # 忙闲时 (无 timePricing 的模型为 None, 前端回退单一折扣)
+            "busy_discount_rate": _rate(busy),
+            "offpeak_discount_rate": _rate(offpeak),
+            "offpeak_label": offpeak.get("label") if isinstance(offpeak, dict) and isinstance(offpeak.get("label"), str) else None,
+            "current_band": current_band if isinstance(current_band, str) else None,
+            "current_discount_rate": _rate(current),
+        })
+    items.sort(key=lambda x: x["id"])
+    return {"models": [item["id"] for item in items], "items": items}
 
 
 # ===== 偏好设置 =====
@@ -435,7 +550,7 @@ def _realtime_allowed() -> bool:
 def _minute_history_days() -> int | None:
     """当前分钟源的 1 分钟历史深度(交易日); None = 深历史(tickflow 基准)。
 
-    provider 可选类属性 minute_history_days 声明 (如 stock-sdk = 5,
+    provider 可选类属性 minute_history_days 声明 (如浅源 = 5,
     免费分时接口只保留最近 5 个交易日); 未声明或走 tickflow 时视为深历史。
     前端分时档位/默认值据此收窄。
     """
@@ -574,6 +689,8 @@ def get_preferences() -> dict:
         "instruments_schedule": preferences.get_instruments_schedule(),
         "enriched_batch_size": preferences.get_enriched_batch_size(),
         "index_daily_batch_size": preferences.get_index_daily_batch_size(),
+        "daily_batch_symbols": preferences.get_daily_batch_symbols(),
+        "minute_batch_symbols": preferences.get_minute_batch_symbols(),
         "watchlist_columns": preferences.get_watchlist_columns(),
         "screener_result_columns": preferences.get_screener_result_columns(),
         "sse_refresh_pages": preferences.get_sse_refresh_pages(),
@@ -599,12 +716,18 @@ def get_preferences() -> dict:
         "nav_hidden": preferences.get_nav_hidden(),
         "dashboard_layout": preferences.get_dashboard_layout(),
         "screener_auto_run": preferences.get_screener_auto_run(),
+        "assistant_auto_approve_actions": preferences.get_assistant_auto_approve_actions(),
+        "assistant_mask_enabled": preferences.get_assistant_mask_enabled(),
         "limit_ladder_monitor_enabled": preferences.get_limit_ladder_monitor_enabled(),
         "depth_polling_interval": preferences.get_depth_polling_interval(),
         "depth_finalize_time": preferences.get_depth_finalize_time(),
         "review_schedule": preferences.get_review_schedule(),
         "review_push_channels": preferences.get_review_push_channels(),
         "review_push_mode": preferences.get_review_push_mode(),
+        "market_recap_system_prompt": preferences.get_market_recap_system_prompt(),
+        # 界面偏好 (通知弹窗/声效/语音播报/外链模板/界面缩放): 历史只存 localStorage,
+        # 桌面版端口变化后 origin 改变导致读取不到 — 后端保存权威副本, 前端启动时回填。
+        "ui_prefs": preferences.get_ui_prefs(),
         **preferences.get_mining_schedule(),
     }
 
@@ -963,6 +1086,27 @@ def get_screener_result_columns() -> dict:
     return {"columns": cols}
 
 
+class UiPrefsIn(BaseModel):
+    """界面偏好增量更新; 值为 null = 删除该项 (回前端默认)。"""
+
+    model_config = ConfigDict(extra="allow")
+
+
+@router.put("/preferences/ui-prefs")
+def update_ui_prefs(req: UiPrefsIn) -> dict:
+    """保存界面偏好 (通知弹窗/声效/语音播报/外链模板/界面缩放)。
+
+    键集合由 services.preferences 的白名单约束 (未知键忽略); 用 extra=allow 的
+    透传模型而非逐字段声明, 新增一项只需前后端各加一个键, 不产生两处易漂移的清单。
+    """
+    from app.services import preferences
+    try:
+        saved = preferences.set_ui_prefs(req.model_dump())
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {"ui_prefs": saved}
+
+
 @router.put("/preferences/screener-result-columns")
 def update_screener_result_columns(req: dict) -> dict:
     """保存策略结果列表列配置。"""
@@ -1079,8 +1223,14 @@ def update_realtime_quotes(req: RealtimeQuotesPrefs, request: Request) -> dict:
                 issues = []
             earliest = data_integrity.earliest_issue_day(issues)
             if issues and data_integrity.within_auto_repair_window(earliest):
+                symbols = sorted({
+                    s
+                    for i in issues
+                    if i.table == "kline_daily" and i.kind == "snapshot"
+                    for s in i.symbols
+                }) or None
                 job_id, is_new = data_integrity.launch_integrity_repair(
-                    request.app.state, earliest, "realtime_gate",
+                    request.app.state, earliest, "realtime_gate", symbols=symbols,
                 )
                 if job_id is not None:
                     detail = (
@@ -1090,6 +1240,16 @@ def update_realtime_quotes(req: RealtimeQuotesPrefs, request: Request) -> dict:
                         + f"（任务 {job_id}）"
                     )
                     raise HTTPException(status_code=409, detail=detail)
+                backoff = data_integrity.repair_backoff_remaining_s(
+                    repo.store.data_dir, earliest,
+                )
+                if backoff > 0:
+                    raise HTTPException(status_code=409, detail=(
+                        f"检测到{data_integrity.describe_issues(issues)}；"
+                        f"上次自动修复未成功（多为数据源拉取失败），"
+                        f"{int(backoff // 60) + 1} 分钟后将自动重试，"
+                        "也可到 数据→修正数据 手动执行"
+                    ))
 
     preferences.save({"realtime_quotes_enabled": req.realtime_quotes_enabled})
     if qs:
@@ -1108,6 +1268,42 @@ def update_realtime_quote_scope(req: RealtimeQuoteScopePrefs) -> dict:
     from app.services import preferences
     cfg = req.model_dump(exclude_none=True)
     return preferences.set_realtime_quote_scope(cfg)
+
+
+class AssistantAutoApproveIn(BaseModel):
+    """AI 助手动作工具免确认开关。"""
+
+    enabled: bool
+
+
+@router.put("/preferences/assistant-auto-approve")
+def update_assistant_auto_approve(req: AssistantAutoApproveIn) -> dict:
+    """保存 AI 助手「动作工具免确认」开关。
+
+    打开后 create_signal_strategy / run_backtest / add_to_watchlist / sync_data
+    不再弹确认卡, 直接执行。默认关闭; 轮次检查点不受影响。
+    """
+    from app.services import preferences
+    saved = preferences.set_assistant_auto_approve_actions(req.enabled)
+    return {"assistant_auto_approve_actions": saved}
+
+
+class AssistantMaskIn(BaseModel):
+    """AI 助手毛玻璃遮罩开关。"""
+
+    enabled: bool
+
+
+@router.put("/preferences/assistant-mask")
+def update_assistant_mask(req: AssistantMaskIn) -> dict:
+    """保存 AI 助手「毛玻璃遮罩」开关 (默认开启)。
+
+    开启时助手抽屉背后覆盖毛玻璃遮罩, 点击遮罩关闭助手;
+    关闭则恢复非模态体验 (页面主体可正常交互)。纯视觉偏好, 无副作用。
+    """
+    from app.services import preferences
+    saved = preferences.set_assistant_mask_enabled(req.enabled)
+    return {"assistant_mask_enabled": saved}
 
 
 class WatchlistGroupsInNavPrefs(BaseModel):
@@ -1238,6 +1434,48 @@ class MainlineFilterIn(BaseModel):
     exclude_st: bool | None = None
 
 
+class EmotionScoreConfigIn(BaseModel):
+    """情绪评分口径 (维度权重 / 子项权重与归一化区间 / 档位阈值)。
+
+    config 为整棵树或 null — 传 null 表示恢复出厂口径。不做逐字段白名单:
+    结构由 emotion_score.merge_config 归一化 (未知 key 丢弃、缺项补默认、
+    阈值乱序自动重排), 用户改坏权重也不会让看板算不出分。
+    """
+
+    config: dict | None = None
+
+
+@router.get("/emotion-score/config")
+def get_emotion_score_config() -> dict:
+    """情绪评分口径: 当前配置 + 出厂默认 + 维度顺序 + 档位名。
+
+    看板「情绪雷达」卡片的配置对话框一次拉全 —— 前端不硬编码任何权重/区间/
+    阈值字面量, 表单全部由本接口返回的结构渲染。
+    """
+    from app.services import preferences
+    from app.services.emotion_score import public_config
+
+    payload = public_config(preferences.get_emotion_score_config())
+    payload["customized"] = preferences.get_emotion_score_config() is not None
+    return payload
+
+
+@router.put("/emotion-score/config")
+def update_emotion_score_config(req: EmotionScoreConfigIn) -> dict:
+    """保存情绪评分口径; config 传 null/{} = 恢复出厂。
+
+    形状校验在 preferences 层 (经 emotion_score.merge_config), 值的合法性
+    (负权重/区间倒置/阈值乱序) 由计算时归一化兜底, 故此处不做逐字段白名单。
+    """
+    from app.services import preferences
+    from app.services.emotion_score import public_config
+
+    saved = preferences.set_emotion_score_config(req.config)
+    payload = public_config(saved)
+    payload["customized"] = saved is not None
+    return payload
+
+
 @router.put("/preferences/mainline-filter")
 def update_mainline_filter(req: MainlineFilterIn) -> dict:
     """更新市场主线过滤配置。部分更新; 修改后需重算主线(POST /api/regime/mainline/recompute)生效。
@@ -1290,8 +1528,7 @@ def update_feishu_webhook(req: FeishuWebhookPrefsIn) -> dict:
     - url: 传入空串表示清空配置; 非空则需为合法的飞书自定义机器人地址。
     - secret: 机器人启用了「签名校验」时填密钥, 留空表示不验签。
     """
-    from app.services import preferences
-    from app.services import webhook_adapter
+    from app.services import preferences, webhook_adapter
 
     url = (req.url or "").strip()
     if url and not webhook_adapter.is_valid_feishu_url(url):
@@ -1320,8 +1557,7 @@ def update_wecom_webhook(req: WecomWebhookPrefsIn) -> dict:
     - url: 传入空串表示清空配置; 非空需为合法企业微信群推送 Webhook 地址, 或纯 key。
     - 用户可只填 key (webhook/send?key=xxx 的 xxx 部分), 后端自动补全为完整 URL。
     """
-    from app.services import preferences
-    from app.services import webhook_adapter
+    from app.services import preferences, webhook_adapter
 
     url = (req.url or "").strip()
     if url and not webhook_adapter.is_valid_wecom_url(url):
@@ -1426,8 +1662,7 @@ def test_webhook(req: WebhookTestIn) -> dict:
     未配置 / 地址非法 / 发送失败均返回 HTTP 200 + {ok: False}，
     前端统一读 detail 渲染绿/红，不抛 400。
     """
-    from app.services import preferences
-    from app.services import webhook_adapter
+    from app.services import preferences, webhook_adapter
 
     title = "TickFlow Stock Panel 推送测试"
     body = "如果你看到这条消息，说明推送配置正确 🎉"
@@ -1877,6 +2112,24 @@ def update_index_daily_batch_size(req: IndexDailyBatchSizeIn) -> dict:
     return {"index_daily_batch_size": size}
 
 
+class BatchSymbolsIn(BaseModel):
+    size: int
+
+
+@router.put("/preferences/daily-batch-symbols")
+def update_daily_batch_symbols(req: BatchSymbolsIn) -> dict:
+    """保存 daily-batch 单请求标的数上限 (同时是前端分块大小)。"""
+    from app.services import preferences
+    return {"daily_batch_symbols": preferences.set_daily_batch_symbols(req.size)}
+
+
+@router.put("/preferences/minute-batch-symbols")
+def update_minute_batch_symbols(req: BatchSymbolsIn) -> dict:
+    """保存 minute-batch 单请求标的数上限 (同时是前端分块大小)。"""
+    from app.services import preferences
+    return {"minute_batch_symbols": preferences.set_minute_batch_symbols(req.size)}
+
+
 # ── 五档盘口 sealed 配置 ──────────────────────────────
 
 class LimitLadderMonitorIn(BaseModel):
@@ -1990,7 +2243,7 @@ def update_review_schedule(req: ReviewScheduleIn, request: Request) -> dict:
     sched = preferences.set_review_schedule(req.enabled, req.hour, req.minute)
 
     # 动态操作 APScheduler job
-    from app.jobs.daily_pipeline import _register_review_job, REVIEW_JOB_ID
+    from app.jobs.daily_pipeline import REVIEW_JOB_ID, _register_review_job
     scheduler = getattr(request.app.state, "scheduler", None)
     if scheduler:
         if sched["enabled"]:
@@ -2030,6 +2283,35 @@ def update_review_push(req: ReviewPushIn) -> dict:
     return {"review_push_channels": saved, "review_push_mode": mode}
 
 
+class MarketRecapPromptIn(BaseModel):
+    prompt: str  # 自定义系统提示词全文; 空串 = 恢复内置默认模板
+
+
+@router.get("/preferences/market-recap-prompt")
+def get_market_recap_prompt() -> dict:
+    """复盘系统提示词: 自定义值 + 内置默认全文。
+
+    默认全文单独按需拉取 (约 2.4k 字符), 不塞进 GET /preferences 大 dict。
+    """
+    from app.services import preferences
+    from app.services.market_recap import _SYSTEM_PROMPT
+
+    custom = preferences.get_market_recap_system_prompt()
+    return {"custom": custom, "default": _SYSTEM_PROMPT, "customized": bool(custom)}
+
+
+@router.put("/preferences/market-recap-prompt")
+def update_market_recap_prompt(req: MarketRecapPromptIn) -> dict:
+    """保存自定义复盘系统提示词; 空串恢复默认模板。超长返回 400。"""
+    from app.services import preferences
+
+    try:
+        saved = preferences.set_market_recap_system_prompt(req.prompt)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {"custom": saved, "customized": bool(saved)}
+
+
 # ================================================================
 # API Token 管理 (open-platform-plan §4) — 仅 UI 会话可达
 # (挂在 /api/settings 前缀下, 受访问密码保护; Token 通道无对应 scope,
@@ -2066,3 +2348,95 @@ def api_tokens_revoke(token_id: str, request: Request) -> dict:
     if not svc.revoke_token(request.app.state.repo.store.data_dir, token_id):
         raise HTTPException(status_code=404, detail=f"Token '{token_id}' 不存在")
     return {"status": "revoked", "id": token_id}
+
+
+# ── 声效语音包: 用户上传自定义提示音 (data/sound_packs), 前端以 custom:<文件名> 选择 ──
+
+_SOUND_PACK_DIR = "sound_packs"
+# 浏览器 <audio> 即取即播, 单文件无需过大; 过大的文件上传慢且占磁盘
+_SOUND_PACK_MAX_BYTES = 4 * 1024 * 1024
+_SOUND_PACK_EXTS = {".mp3", ".wav", ".ogg", ".m4a", ".aac", ".flac", ".opus", ".webm"}
+_SOUND_PACK_MEDIA_TYPES = {
+    ".mp3": "audio/mpeg", ".wav": "audio/wav", ".ogg": "audio/ogg",
+    ".m4a": "audio/mp4", ".aac": "audio/aac", ".flac": "audio/flac",
+    ".opus": "audio/ogg", ".webm": "audio/webm",
+}
+
+
+def _sound_pack_dir(request: Request) -> Path:
+    return request.app.state.repo.store.data_dir / _SOUND_PACK_DIR
+
+
+def _safe_pack_path(pack_dir: Path, name: str) -> Path:
+    """名字 → 目录内路径; 拒绝穿越/非法名。"""
+    if not name or "/" in name or "\\" in name or ".." in name or name != name.strip():
+        raise HTTPException(status_code=400, detail="语音包名称非法")
+    path = (pack_dir / name).resolve()
+    if path.parent != pack_dir.resolve():
+        raise HTTPException(status_code=400, detail="语音包名称非法")
+    return path
+
+
+@router.get("/sound-packs")
+def sound_packs_list(request: Request) -> dict:
+    pack_dir = _sound_pack_dir(request)
+    packs: list[dict] = []
+    if pack_dir.is_dir():
+        for f in sorted(pack_dir.iterdir()):
+            if f.is_file() and f.suffix.lower() in _SOUND_PACK_EXTS:
+                packs.append({
+                    "name": f.name,
+                    "size": f.stat().st_size,
+                    "ext": f.suffix.lower().lstrip("."),
+                })
+    return {"packs": packs}
+
+
+@router.post("/sound-packs")
+async def sound_packs_upload(request: Request, file: UploadFile = File(...)) -> dict:
+    import re
+
+    raw = file.filename or ""
+    suffix = Path(raw).suffix.lower()
+    if suffix not in _SOUND_PACK_EXTS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"不支持的音频格式 '{suffix or '(无后缀)'}', 可选: {', '.join(sorted(_SOUND_PACK_EXTS))}",
+        )
+    # 词干只保留安全字符 (中文/字母/数字/_-.), 其余替换为 _; 控制长度防文件名失控
+    stem = re.sub(r"[^\w\-.()\u4e00-\u9fff]", "_", Path(raw).stem).strip("._")[:40] or "pack"
+    name = f"{stem}{suffix}"
+
+    data = await file.read()
+    if len(data) > _SOUND_PACK_MAX_BYTES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"文件超过 {_SOUND_PACK_MAX_BYTES // 1024 // 1024}MB 上限 (当前 {len(data) / 1024 / 1024:.1f}MB)",
+        )
+    if not data:
+        raise HTTPException(status_code=400, detail="空文件")
+
+    pack_dir = _sound_pack_dir(request)
+    pack_dir.mkdir(parents=True, exist_ok=True)
+    target = _safe_pack_path(pack_dir, name)
+    # 同名重传 = 替换 (用户自定义音的自然语义)
+    target.write_bytes(data)
+    return {"status": "saved", "pack": {"name": name, "size": len(data), "ext": suffix.lstrip(".")}}
+
+
+@router.delete("/sound-packs/{name}")
+def sound_packs_delete(name: str, request: Request) -> dict:
+    path = _safe_pack_path(_sound_pack_dir(request), name)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail=f"语音包 '{name}' 不存在")
+    path.unlink()
+    return {"status": "deleted", "name": name}
+
+
+@router.get("/sound-packs/{name}/file")
+def sound_packs_file(name: str, request: Request) -> FileResponse:
+    path = _safe_pack_path(_sound_pack_dir(request), name)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail=f"语音包 '{name}' 不存在")
+    media_type = _SOUND_PACK_MEDIA_TYPES.get(path.suffix.lower(), "application/octet-stream")
+    return FileResponse(path, media_type=media_type)

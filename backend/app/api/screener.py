@@ -110,7 +110,7 @@ def _coverage_warnings(
 ) -> list[str]:
     """数据充足性提示 (#303): enriched 覆盖低于暖机需求时给出人话警告。
 
-    advisory 元数据: 任何计算失败都静默返回 [], 绝不影响选股主流程。
+    advisory 元数据: 任何计算失败都静默返回 [], 绝不影响策略主流程。
     引擎/服务无该方法时 (测试 Fake) 同样跳过, 与 build_shared_matrix 的
     可选能力探测同风格。
     """
@@ -159,7 +159,8 @@ def _safe_ext_value(value: Any) -> Any:
 # 用底层 parquet 文件的 (路径, mtime) 签名做 memoize: 文件未变则复用上次的 map,
 # parquet 被重写 (mtime 变化) 时自动失效重算。仅缓存基于 config 的快照/时序路径,
 # 无 config 的 DuckDB view 回退路径不缓存 (少见)。
-_ext_value_map_cache: dict[tuple[str, str], tuple[Any, dict[str, Any]]] = {}
+# 键含目标日期: 同一扩展列的「结果日分区」与「最新分区」是两个独立映射, 不可混用。
+_ext_value_map_cache: dict[tuple[str, str, str], tuple[Any, dict[str, Any]]] = {}
 
 
 def _ext_parquet_signature(cfg, data_dir) -> Optional[tuple]:
@@ -175,11 +176,18 @@ def _ext_parquet_signature(cfg, data_dir) -> Optional[tuple]:
         return None
 
 
-def _load_ext_value_maps(repo, ext_columns: Optional[str]) -> dict[str, dict[str, Any]]:
+def _load_ext_value_maps(
+    repo, ext_columns: Optional[str], as_of: Optional[str] = None
+) -> dict[str, dict[str, Any]]:
     """按请求加载扩展列，返回 {输出列名: {symbol: value}}。
 
     策略结果缓存是共享文件，不能被不同 ext_columns 组合污染；因此扩展列只在
     返回前通过该投影映射追加到结果副本中。
+
+    as_of 给定时, timeseries 扩展表按该日期的分区取值 —— 与策略结果同日,
+    保证「结果里展示的扩展值(如人气)」与「策略过滤时实际使用的值」同一口径;
+    该日期无分区 (扩展表上线前的历史日期等) 时回退最新分区。
+    as_of=None 维持"当前值"语义 (自选/个股详情/告警等实时场景), 取最新分区。
 
     基于 config 的路径按 parquet 文件 mtime 签名 memoize, 文件未变时跳过磁盘重读。
     """
@@ -190,18 +198,19 @@ def _load_ext_value_maps(repo, ext_columns: Optional[str]) -> dict[str, dict[str
     import polars as pl
 
     from app.api.ext_data import _read_ext_dataframe
-    from app.services.ext_data import ExtConfigStore
+    from app.services.ext_data import ExtConfigStore, collapse_ext_rows_at
 
     db = repo.store.db
     data_dir = repo.store.data_dir
     ext_store = ExtConfigStore(data_dir)
     configs = {c.id: c for c in ext_store.load_all()}
     value_maps: dict[str, dict[str, Any]] = {}
+    want_date = str(as_of) if as_of else None
 
-    for config_id, field_name in ext_specs:
+    for config_id, field_name, at in ext_specs:
         out_col = f"{config_id}__{field_name}"
         cfg = configs.get(config_id)
-        cache_key = (config_id, field_name)
+        cache_key = (config_id, field_name, want_date or "", at or "")
         sig = _ext_parquet_signature(cfg, data_dir) if cfg else None
         try:
             if cfg:
@@ -210,8 +219,15 @@ def _load_ext_value_maps(repo, ext_columns: Optional[str]) -> dict[str, dict[str
                 if cached is not None and sig is not None and cached[0] == sig:
                     value_maps[out_col] = cached[1]
                     continue
-                # 时序扩展表只取最新分区，避免历史分区把同一 symbol JOIN 放大。
-                ext_df, _ = _read_ext_dataframe(cfg, data_dir)
+                if want_date and cfg.mode == "timeseries":
+                    # 与结果同日的历史分区: 展示口径 == 过滤口径
+                    ext_df, _ = _read_ext_dataframe(cfg, data_dir, snapshot_date=want_date)
+                    if ext_df.is_empty():
+                        # 该日期无分区 → 回退最新, 避免整列空白
+                        ext_df, _ = _read_ext_dataframe(cfg, data_dir)
+                else:
+                    # 时序扩展表默认只取最新分区，避免历史分区把同一 symbol JOIN 放大。
+                    ext_df, _ = _read_ext_dataframe(cfg, data_dir)
             else:
                 view_name = f"ext_{config_id}"
                 ext_df = pl.from_arrow(db.query(
@@ -221,7 +237,10 @@ def _load_ext_value_maps(repo, ext_columns: Optional[str]) -> dict[str, dict[str
             if ext_df.is_empty() or "symbol" not in ext_df.columns or field_name not in ext_df.columns:
                 continue
 
-            ext_df = ext_df.select(["symbol", field_name]).unique(subset=["symbol"], keep="last")
+            # 日内多盘: @时刻 → 该时刻或之前最近一盘; 缺省 → 末盘。
+            # 收敛须在 select 之前 — 时间列被裁掉后 collapse 检测不到会静默回退末行
+            time_field = cfg.pull.time_field if cfg and cfg.pull else None
+            ext_df = collapse_ext_rows_at(ext_df, at, time_field).select(["symbol", field_name])
             vmap = {
                 str(row["symbol"]): _safe_ext_value(row.get(field_name))
                 for row in ext_df.to_dicts()
@@ -234,6 +253,26 @@ def _load_ext_value_maps(repo, ext_columns: Optional[str]) -> dict[str, dict[str
             logger.debug("screener ext column join skipped for %s.%s: %s", config_id, field_name, e)
 
     return value_maps
+
+
+def _ext_maps_for_dates(
+    repo, ext_columns: Optional[str], dates
+) -> dict[Optional[str], dict[str, dict[str, Any]]]:
+    """按日期集合构建多份 ext 投影映射 (缓存 payload 的结果/今日曾命中可能跨日)。
+
+    无 ext_columns 时返回 {} (调用方视为"无投影")。None 键 = 无日期结果, 取最新分区。
+    """
+    if not ext_columns:
+        return {}
+    keys = {str(d) if d else None for d in dates}
+    return {k: _load_ext_value_maps(repo, ext_columns, as_of=k) for k in keys}
+
+
+def _maps_for_date(
+    maps_by_date: dict[Optional[str], dict[str, dict[str, Any]]], date
+) -> dict[str, dict[str, Any]]:
+    key = str(date) if date else None
+    return maps_by_date.get(key) or maps_by_date.get(None) or {}
 
 
 def _row_with_ext(row: dict, ext_values: dict[str, dict[str, Any]], symbol: Optional[str] = None) -> dict:
@@ -262,12 +301,20 @@ def _results_with_ext(results: dict[str, dict], ext_values: dict[str, dict[str, 
     return {sid: _result_with_ext(r, ext_values) for sid, r in results.items()}
 
 
-def _cache_payload_with_ext(cached: dict, ext_values: dict[str, dict[str, Any]]) -> dict:
-    if not ext_values:
+def _cache_payload_with_ext(
+    cached: dict, maps_by_date: dict[Optional[str], dict[str, dict[str, Any]]]
+) -> dict:
+    """把 ext 投影按各自日期合并进缓存 payload (结果行与今日曾命中行各用其 date)。"""
+    if not maps_by_date:
         return cached
 
     payload = dict(cached)
-    payload["results"] = _results_with_ext(cached.get("results", {}), ext_values)
+    results = cached.get("results") or {}
+    payload["results"] = {
+        sid: _result_with_ext(r, _maps_for_date(maps_by_date, r.get("as_of")))
+        if isinstance(r, dict) else r
+        for sid, r in results.items()
+    }
 
     ever_rows = cached.get("today_ever_rows")
     if isinstance(ever_rows, dict):
@@ -276,7 +323,7 @@ def _cache_payload_with_ext(cached: dict, ext_values: dict[str, dict[str, Any]])
             if not isinstance(sym_map, dict):
                 continue
             enriched_ever[sid] = {
-                sym: _row_with_ext(row, ext_values, symbol=sym)
+                sym: _row_with_ext(row, _maps_for_date(maps_by_date, row.get("date")), symbol=sym)
                 for sym, row in sym_map.items()
                 if isinstance(row, dict)
             }
@@ -285,12 +332,144 @@ def _cache_payload_with_ext(cached: dict, ext_values: dict[str, dict[str, Any]])
     return payload
 
 
+# 被实时行情覆盖的展示字段。
+#
+# 策略结果缓存只记录「计算那一刻」的价格: 盘中运行 run_all 后, 列表里的
+# close/change_pct 会一直停在那时, 而点开详情走的是实时 enriched 缓存 ——
+# 同一个票在两个地方显示不同涨幅 (实测 13:27 的扫描结果到收盘差了 2 个点)。
+# 这里在返回前用当前实时快照覆盖这些纯展示字段; 指标列 (ma20/score/signal_*)
+# 保持计算时点值不动, 否则等于用新价格重算了一个过期策略结果。
+_LIVE_QUOTE_FIELDS: tuple[str, ...] = (
+    "open", "high", "low", "close",
+    "prev_close", "volume", "amount",
+    "change_pct", "change_amount", "turnover_rate",
+    "raw_close", "raw_high", "raw_low", "quote_ts",
+)
+
+
+def _live_quote_overlay(repo) -> tuple[dict[str, dict[str, Any]], str | None]:
+    """当前实时 enriched 快照的展示字段: ({symbol: row}, 日期字符串)。
+
+    缓存为空 (启动预热中) 或 repo 不支持该接口时返回空映射, 调用方原样返回
+    策略结果 —— 拿不到实时数据时不能伪造新价格。
+    """
+    loader = getattr(repo, "get_enriched_latest", None)
+    if not callable(loader):
+        return {}, None
+    try:
+        frame, cache_date = loader()
+    except Exception:  # noqa: BLE001 — 展示层增强绝不打断缓存读取
+        logger.debug("live quote overlay unavailable", exc_info=True)
+        return {}, None
+    if frame is None or frame.is_empty() or cache_date is None:
+        return {}, None
+    columns = [c for c in ("symbol", *_LIVE_QUOTE_FIELDS) if c in frame.columns]
+    if "symbol" not in columns:
+        return {}, None
+    return {
+        str(row["symbol"]): row
+        for row in frame.select(columns).to_dicts()
+    }, str(cache_date)
+
+
+def _quote_date_matches(row: dict, live_date: str | None, result_as_of: Any = None) -> bool:
+    """结果日期与实时快照同日才可覆盖。
+
+    历史日期结果 (例如回看昨天/上周) 必须保留当时价格, 不能用今天的行情覆盖。
+    优先用结果级 as_of (策略结果整体属于哪一天), 行级 date 作兜底 —— 个别
+    策略输出行不带 date 字段, 只看行日期会误覆盖历史结果。
+    """
+    if live_date is None:
+        return False
+    for candidate in (result_as_of, row.get("date")):
+        if candidate is None:
+            continue
+        return str(candidate)[:10] == live_date
+    # 结果与行都没有日期: 视为「最新」(与 as_of=None 的缓存语义一致)
+    return True
+
+
+def _rows_with_live_quotes(
+    rows: list[dict],
+    overlay: dict[str, dict[str, Any]],
+    live_date: str | None,
+    result_as_of: Any = None,
+) -> list[dict]:
+    if not overlay:
+        return rows
+    merged: list[dict] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            merged.append(row)
+            continue
+        live = overlay.get(str(row.get("symbol") or ""))
+        if live is None or not _quote_date_matches(row, live_date, result_as_of):
+            merged.append(row)
+            continue
+        next_row = dict(row)
+        for key, value in live.items():
+            if key == "symbol":
+                continue
+            next_row[key] = value
+        merged.append(next_row)
+    return merged
+
+
+def _cached_with_live_quotes(request: Request) -> dict:
+    """盘后缓存 + 监控实时结果 + 当前行情展示字段覆盖。
+
+    与 `_cached_with_realtime` 的区别: 后者只覆盖「加入监控的策略」(每轮行情
+    重算结果), 未加监控的策略仍显示计算时点价格。这里对所有策略只覆盖价格类
+    展示字段, 行情轮询期间列表与详情保持一致。
+    """
+    cached = _cached_with_realtime(request)
+    results = cached.get("results") or {}
+    ever_rows = cached.get("today_ever_rows")
+    if not results and not ever_rows:
+        return cached
+
+    overlay, live_date = _live_quote_overlay(request.app.state.repo)
+    if not overlay:
+        return cached
+
+    payload = dict(cached)
+    payload["results"] = {
+        sid: (
+            {
+                **result,
+                "rows": _rows_with_live_quotes(
+                    result.get("rows") or [], overlay, live_date, result.get("as_of"),
+                ),
+            }
+            if isinstance(result, dict) else result
+        )
+        for sid, result in results.items()
+    }
+
+    if isinstance(ever_rows, dict):
+        # 「今日曾命中」行是逐行的历史快照 (各自带 date), 一律按行日期判断
+        payload["today_ever_rows"] = {
+            sid: (
+                {
+                    symbol: _rows_with_live_quotes([row], overlay, live_date)[0]
+                    for symbol, row in sym_map.items()
+                    if isinstance(row, dict)
+                }
+                if isinstance(sym_map, dict) else sym_map
+            )
+            for sid, sym_map in ever_rows.items()
+        }
+    return payload
+
+
 def _update_cache_strategy(data_dir, as_of: str, strategy_id: str, safe_data: dict) -> None:
     """单跑后更新缓存中该策略的结果，保持缓存与最新计算一致。"""
     from app.services import strategy_cache
     cached = strategy_cache.read_cache(data_dir)
     if cached and cached.get("as_of") == as_of:
-        results = cached.get("results", {})
+        # read_cache 返回进程内共享镜像, 先拷贝再改 (write_cache 的 read-merge-write
+        # 以这份拷贝为准, 不污染镜像)
+        results = dict(cached.get("results") or {})
         results[strategy_id] = {
             "total": safe_data.get("total", 0),
             "as_of": as_of,
@@ -353,7 +532,8 @@ def run_custom(req: CustomRequest, request: Request):
     warnings = _coverage_warnings(svc, as_of)
     if warnings:
         safe_data["warnings"] = warnings
-    ext_values = _load_ext_value_maps(repo, req.ext_columns)
+    # 投影取结果日分区 (与过滤同口径), 而非最新分区
+    ext_values = _load_ext_value_maps(repo, req.ext_columns, as_of=str(as_of))
     return _result_with_ext(safe_data, ext_values)
 
 
@@ -367,7 +547,7 @@ def run_preset(req: PresetRequest, request: Request):
 
     # 加载用户保存的策略配置
     data_dir = request.app.state.repo.store.data_dir
-    ext_values = _load_ext_value_maps(repo, req.ext_columns)
+    ext_values = _load_ext_value_maps(repo, req.ext_columns, as_of=str(as_of))
     overrides = _strategy_override(request, req.strategy_id)
     engine = getattr(request.app.state, "strategy_engine", None)
     if not engine:
@@ -457,15 +637,31 @@ def get_cached(
     - 监控引擎内存结果 (latest_strategy_results): 实时行情每轮对「加入监控的策略」算出,
       不落盘 (避免与 read_cache 的 mtime 校验冲突), 在此直接叠加覆盖盘后结果。
       被监控的策略拿到新鲜数据, 非监控策略仍用盘后缓存。
+    - 价格类展示字段统一用当前实时快照覆盖 (同日才覆盖), 避免列表显示扫描时刻
+      价格、详情显示实时价格造成的"同一只票两个涨幅"。
     """
-    cached = _filter_cached_strategies(request, _cached_with_realtime(request))
+    cached = _filter_cached_strategies(request, _cached_with_live_quotes(request))
 
     # 无任何数据 (盘后缓存空 + 无实时结果) → 返回空标记, 前端据此提示
     if not cached.get("results") and cached.get("as_of") is None:
         return {"as_of": None, "results": {}, "updated_at": None}
 
-    ext_values = _load_ext_value_maps(request.app.state.repo, ext_columns)
-    return _cache_payload_with_ext(cached, ext_values)
+    # 结果与「今日曾命中」可能跨日期 (盘后缓存 + 监控实时叠加) → 按各自日期取
+    # ext 投影, 保证展示的扩展值与结果计算/过滤所用同日。
+    result_dates = {
+        r.get("as_of") for r in (cached.get("results") or {}).values()
+        if isinstance(r, dict)
+    }
+    ever_rows = cached.get("today_ever_rows")
+    if isinstance(ever_rows, dict):
+        for sym_map in ever_rows.values():
+            if isinstance(sym_map, dict):
+                result_dates.update(
+                    row.get("date") for row in sym_map.values() if isinstance(row, dict)
+                )
+    result_dates.add(None)  # 无日期的结果 → 最新分区兜底
+    maps_by_date = _ext_maps_for_dates(request.app.state.repo, ext_columns, result_dates)
+    return _cache_payload_with_ext(cached, maps_by_date)
 
 
 @router.get("/cached-summary")
@@ -497,11 +693,23 @@ def get_cached_summary(request: Request):
             if isinstance(row, dict) and row.get("symbol")
         }
         ever_counts[sid] = len(set((ever_rows.get(sid) or {}).keys()) | current_symbols)
+
+    # 分钟策略结果不落 strategy_cache (日线语义), 渐进式转后台算完后在这里
+    # 以 handle 快照合入 (仅 as_of 与日线缓存同日的), 前端轮询本端点点亮卡片。
+    minute_pending: list[str] = []
+    for m in strategy_run_queue.MANAGER.minute_summaries():
+        if m.get("as_of") != cached_as_of:
+            continue
+        for sid, item in (m.get("results") or {}).items():
+            summary[sid] = item
+        minute_pending.extend(m.get("pending") or [])
+
     return {
         "as_of": cached_as_of,
         "results": summary,
         "today_ever_counts": ever_counts,
         "updated_at": cached.get("updated_at"),
+        "minute_pending": minute_pending,
     }
 
 
@@ -514,7 +722,7 @@ def get_cached_result(
     """按需返回单个策略的完整明细及其今日失效行。"""
     if not _strategy_accessible(request, strategy_id, ""):
         raise HTTPException(status_code=404, detail=f"strategy {strategy_id} not found")
-    cached = _filter_cached_strategies(request, _cached_with_realtime(request))
+    cached = _filter_cached_strategies(request, _cached_with_live_quotes(request))
     raw_result = (cached.get("results") or {}).get(strategy_id)
     if not isinstance(raw_result, dict):
         return {
@@ -524,7 +732,10 @@ def get_cached_result(
             "updated_at": cached.get("updated_at"),
         }
 
-    ext_values = _load_ext_value_maps(request.app.state.repo, ext_columns)
+    # 结果行按该策略结果的 as_of 日取值 (与过滤同口径); 今日曾命中行按行日期取值
+    repo = request.app.state.repo
+    result_date = raw_result.get("as_of")
+    ext_values = _load_ext_value_maps(repo, ext_columns, as_of=str(result_date) if result_date else None)
     result = {
         "as_of": raw_result.get("as_of"),
         "strategy": strategy_id,
@@ -537,8 +748,13 @@ def get_cached_result(
     if cached.get("as_of") == result["as_of"]:
         strategy_ever_rows = (cached.get("today_ever_rows") or {}).get(strategy_id)
         if isinstance(strategy_ever_rows, dict):
+            ever_maps = _ext_maps_for_dates(
+                repo, ext_columns,
+                {row.get("date") for row in strategy_ever_rows.values() if isinstance(row, dict)}
+                | {result_date},
+            )
             ever_rows = {
-                symbol: _row_with_ext(row, ext_values, symbol=symbol)
+                symbol: _row_with_ext(row, _maps_for_date(ever_maps, row.get("date")), symbol=symbol)
                 for symbol, row in strategy_ever_rows.items()
                 if isinstance(row, dict)
             }
@@ -682,14 +898,16 @@ def _run_all_progressive(
                     payload["warnings"] = w
             all_results[sid] = payload
             elapsed_map[sid] = (time.perf_counter() - t0) * 1000
-            # 逐策略增量落盘 (write_cache 同日按 sid 合并), 前端轮询即可逐个看到
-            try:
-                strategy_cache.write_cache(data_dir, str(as_of), {sid: payload})
-            except Exception:
-                logger.warning("run_all 渐进写入缓存失败: %s", sid, exc_info=True)
+            # 逐策略增量落盘 (write_cache 同日按 sid 合并), 前端轮询即可逐个看到。
+            # 分钟结果不落盘 (strategy_cache 为日线语义), 改经 handle 快照合入 summary
+            if timeframe == "1d":
+                try:
+                    strategy_cache.write_cache(data_dir, str(as_of), {sid: payload})
+                except Exception:
+                    logger.warning("run_all 渐进写入缓存失败: %s", sid, exc_info=True)
             handle.complete(sid, {k: v for k, v in payload.items() if k != "rows"})
-        # 收尾: 与旧版口径一致的整体重写 + 耗时落盘供下次排序
-        if all_results:
+        # 收尾: 与旧版口径一致的整体重写 + 耗时落盘供下次排序 (分钟不落盘)
+        if all_results and timeframe == "1d":
             with contextlib.suppress(Exception):
                 strategy_cache.write_cache(data_dir, str(as_of), all_results)
         strategy_run_queue.record_run_timings(data_dir, elapsed_map)
@@ -757,15 +975,23 @@ def run_all(request: Request, body: Optional[dict] = None):
     data_dir = request.app.state.repo.store.data_dir
 
     requested_ids = body.get("strategy_ids")
+    skipped_unknown: list[str] = []
     if requested_ids and isinstance(requested_ids, list):
         all_ids = [str(sid) for sid in requested_ids]
-        unknown = [
+        # 宽容降级: 策略池可能残留已不存在的策略 ID (如内置策略移除后的
+        # 旧数据目录) —— 跳过未知项继续跑, 响应带回 skipped_unknown 供前端
+        # 清池; 全部未知才整体 404 (避免空跑被当成成功)。
+        skipped_unknown = [
             sid
             for sid in all_ids
             if not engine.has(sid) or engine.get(sid).meta.get("research_only")
         ]
-        if unknown:
-            raise HTTPException(status_code=404, detail=f"unknown strategies: {unknown}")
+        if skipped_unknown:
+            if len(skipped_unknown) == len(all_ids):
+                raise HTTPException(status_code=404, detail=f"unknown strategies: {skipped_unknown}")
+            known = [sid for sid in all_ids if sid not in set(skipped_unknown)]
+            logger.warning("run_all: 跳过 %d 个不存在/不可用的策略 ID: %s", len(skipped_unknown), skipped_unknown)
+            all_ids = known
     else:
         all_ids = [
             meta["id"]
@@ -791,10 +1017,11 @@ def run_all(request: Request, body: Optional[dict] = None):
 
     # 渐进式返回 (页面首屏路径): 按历史耗时升序执行, 首返时限内算完的随响应
     # 返回, 慢策略转后台继续算并逐个写入策略缓存, 前端轮询 cached-summary 点亮。
-    # 仅日线 + summary_only (策略页卡片) 启用; 分钟/明细请求保持整段阻塞。
+    # 日线与分钟都启用: 分钟策略结果不落盘, 后台算完经 handle 快照合入
+    # cached-summary (见 get_cached_summary) — 请求不再整段占用线程等计算。
     first_return_s = settings.strategy_run_all_first_return_s
-    if body.get("summary_only") and timeframe == "1d" and first_return_s > 0:
-        return _run_all_progressive(
+    if body.get("summary_only") and first_return_s > 0:
+        progressive = _run_all_progressive(
             repo=repo,
             engine=engine,
             svc=svc,
@@ -807,6 +1034,9 @@ def run_all(request: Request, body: Optional[dict] = None):
             first_return_s=first_return_s,
             t_total=t_total,
         )
+        if skipped_unknown:
+            progressive["skipped_unknown"] = skipped_unknown
+        return progressive
 
     try:
         context = svc.build_strategy_context(
@@ -859,10 +1089,16 @@ def run_all(request: Request, body: Optional[dict] = None):
                 sid: {"total": result["total"], "as_of": result["as_of"]}
                 for sid, result in results.items()
             },
+            "skipped_unknown": skipped_unknown,
         }
 
-    ext_values = _load_ext_value_maps(repo, body.get("ext_columns"))
-    return {"as_of": str(as_of), "results": _results_with_ext(results, ext_values)}
+    # ext 投影取本次结果日分区 (与过滤同口径)
+    ext_values = _load_ext_value_maps(repo, body.get("ext_columns"), as_of=str(as_of))
+    return {
+        "as_of": str(as_of),
+        "results": _results_with_ext(results, ext_values),
+        "skipped_unknown": skipped_unknown,
+    }
 
 
 @router.get("/limit-ladder")
@@ -1046,28 +1282,32 @@ def limit_ladder(
         db = repo.store.db
         data_dir = repo.store.data_dir
         from app.api.ext_data import _read_ext_dataframe
-        from app.services.ext_data import ExtConfigStore
+        from app.services.ext_data import ExtConfigStore, collapse_ext_rows_at
 
         ext_store = ExtConfigStore(data_dir)
         configs = {c.id: c for c in ext_store.load_all()}
 
-        def _dedup_ext(frame: pl.DataFrame, field: str, out_col: str) -> pl.DataFrame | None:
-            """(symbol, 字段) 两列并按 symbol 去重; 缺列时返回 None。"""
+        def _dedup_ext(
+            frame: pl.DataFrame, field: str, out_col: str,
+            at: str | None, time_field: str | None,
+        ) -> pl.DataFrame | None:
+            """(symbol, 字段) 两列收敛为每标的一行; @时刻取该时刻或之前最近一盘
+            (与 _load_ext_value_maps 同口径), 缺列时返回 None。"""
             if frame.is_empty() or "symbol" not in frame.columns or field not in frame.columns:
                 return None
+            # 收敛在 select 之前: 时间列被裁掉后 collapse 会静默回退末行
             return (
-                frame
+                collapse_ext_rows_at(frame, at, time_field)
                 .select(["symbol", field])
-                .unique(subset=["symbol"], keep="last")
                 .rename({field: out_col})
             )
 
-        for config_id, field_name in ext_specs:
+        for config_id, field_name, at in ext_specs:
             view_name = f"ext_{config_id}"
             ext_col_name = f"{config_id}__{field_name}"
             try:
                 # 扩展时序数据必须只取最新分区; 否则一个 symbol 会按历史分区数被 JOIN 放大
-                # (ext_{id} 视图覆盖 timeseries/**), 与自选股列表同口径。
+                # (ext_{id} 视图覆盖 timeseries/**), 与自选列表同口径。
                 cfg = configs.get(config_id)
                 if cfg:
                     ext_df, _ = _read_ext_dataframe(cfg, data_dir)
@@ -1075,7 +1315,8 @@ def limit_ladder(
                     ext_df = pl.from_arrow(db.query(
                         f"SELECT symbol, {quote_ident(field_name)} FROM {view_name}"
                     ).arrow())
-                joined = _dedup_ext(ext_df, field_name, ext_col_name)
+                time_field = cfg.pull.time_field if cfg and cfg.pull else None
+                joined = _dedup_ext(ext_df, field_name, ext_col_name, at, time_field)
                 if joined is not None:
                     df = df.join(joined, on="symbol", how="left")
                     ext_col_names.append(ext_col_name)
@@ -1084,7 +1325,8 @@ def limit_ladder(
                 if cfg:
                     try:
                         ext_df, _ = _read_ext_dataframe(cfg, data_dir)
-                        joined = _dedup_ext(ext_df, field_name, ext_col_name)
+                        time_field = cfg.pull.time_field if cfg.pull else None
+                        joined = _dedup_ext(ext_df, field_name, ext_col_name, at, time_field)
                         if joined is not None:
                             df = df.join(joined, on="symbol", how="left")
                             ext_col_names.append(ext_col_name)
@@ -1134,19 +1376,32 @@ def limit_ladder(
     }
 
 
-def _parse_ext_columns(ext_columns: str) -> list[tuple[str, str]]:
-    """解析 'config_id1.field1,config_id2.field2' 为 [(config_id, field_name), ...]。"""
+def _parse_ext_columns(ext_columns: str) -> list[tuple[str, str, str | None]]:
+    """解析 'config_id1.field1@09:20,config_id2.field2' 为 [(config_id, field_name, at), ...]。
+
+    可选 "@HH:MM[:SS]" 后缀: 日内多盘表取「该时刻或之前最近一盘」的值;
+    时刻非法时整条 spec 丢弃 (fail-closed, 不静默回退末盘造成口径混淆)。
+    """
+    from app.services.ext_data import norm_ext_snapshot_at
+
     result = []
     for part in ext_columns.split(","):
         part = part.strip()
         if "." not in part:
             continue
         config_id, field_name = part.split(".", 1)
+        at: str | None = None
+        if "@" in field_name:
+            field_name, at_raw = field_name.rsplit("@", 1)
+            try:
+                at = norm_ext_snapshot_at(at_raw)
+            except ValueError:
+                continue
         config_id = config_id.strip()
         field_name = field_name.strip()
         if not config_id or not field_name:
             continue
         if not is_valid_ext_ident(config_id) or "\x00" in field_name:
             continue
-        result.append((config_id, field_name))
+        result.append((config_id, field_name, at))
     return result

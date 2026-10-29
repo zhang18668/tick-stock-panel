@@ -40,6 +40,8 @@ _PERSONAL_SETTINGS_PATHS = {
     "/api/settings/preferences/indices-nav-pinned",
     "/api/settings/preferences/realtime-monitor",
     "/api/settings/preferences/system-notify",
+    "/api/settings/preferences/assistant-auto-approve",
+    "/api/settings/preferences/assistant-mask",
     "/api/settings/preferences/feishu-webhook",
     "/api/settings/preferences/wecom-webhook",
     "/api/settings/preferences/wecom-bot",

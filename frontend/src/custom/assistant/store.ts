@@ -1,9 +1,10 @@
 /**
  * AI 助手前端状态 — 会话/消息/发送编排, useSyncExternalStore 单例 store。
  *
- * 后端无状态, 会话历史仅存 localStorage(最近 20 个会话); 每轮请求把可见的
- * user/assistant 消息回传, 由后端负责截断。工具往返(footprint)只用于本地
- * 展示, 不进入请求历史。
+ * 会话历史双写: localStorage 即时缓存 (启动秒开/离线兜底) + 服务端同步
+ * (/api/custom/assistant/sessions, 防抖 1.5s fire-and-forget) — 换设备可见。
+ * 每轮请求把可见的 user/assistant 消息回传, 由后端负责截断。工具往返
+ * (footprint)只用于本地展示, 不进入请求历史。
  */
 import { useSyncExternalStore } from 'react'
 import {
@@ -14,6 +15,8 @@ import {
   type AssistantEvent,
   type ChatHistoryMessage,
 } from './client'
+import { mergeSessions } from './sessionsMerge'
+import { hydrateUiPrefs, setUiPref } from '@/lib/uiPrefs'
 
 /**
  * running=执行中; awaiting=动作工具等待用户确认; approved/denied=用户已点
@@ -56,23 +59,45 @@ interface AssistantState {
   activeId: string
   open: boolean
   sending: boolean
+  /** 悬浮球是否显示 (纯 UI 偏好, 经 uiPrefs 双写持久化, 不随聊天会话同步) */
+  fabVisible: boolean
 }
 
 const STORAGE_KEY = 'assistant.sessions.v1'
+const SESSIONS_URL = '/api/custom/assistant/sessions'
+const SERVER_SYNC_DEBOUNCE_MS = 1500
 const MAX_SESSIONS = 20
 const MAX_SESSION_MESSAGES = 200
 const MAX_INPUT_CHARS = 4000
+
+const FAB_STORAGE_KEY = 'assistant.fab.enabled'
+
+function loadFabVisible(): boolean {
+  try { return localStorage.getItem(FAB_STORAGE_KEY) !== '0' } catch { return true }
+}
 
 let state: AssistantState = {
   sessions: [],
   activeId: '',
   open: false,
   sending: false,
+  fabVisible: loadFabVisible(),
 }
 
 const listeners = new Set<() => void>()
 let abortController: AbortController | null = null
 let pageContext: AssistantContext = {}
+let serverSyncTimer: ReturnType<typeof setTimeout> | null = null
+
+// 悬浮球显隐跨端口持久化: localStorage 只是同步读取的本地缓存, 后端 ui_prefs
+// 才是权威副本 (桌面版 _find_free_port 换端口即换 origin, 纯 localStorage 的
+// 偏好在换端口后读不到, 表现为「关了过一会又自己开启」)。hydrate 把后端值回填
+// localStorage 后刷新内存态 — hydrateUiPrefs 幂等且共享 Promise, 与 main.tsx
+// 的调用谁先谁后都等到同一次回填完成。
+void hydrateUiPrefs().then(() => {
+  const v = loadFabVisible()
+  if (v !== state.fabVisible) setState({ fabVisible: v }, false)
+})
 
 function emit() {
   for (const listener of listeners) listener()
@@ -84,13 +109,54 @@ function setState(partial: Partial<AssistantState>, persist = true) {
   emit()
 }
 
+function trimmedSessions() {
+  return state.sessions
+    .slice(0, MAX_SESSIONS)
+    .map(session => ({ ...session, messages: session.messages.slice(-MAX_SESSION_MESSAGES) }))
+}
+
 function persistSessions() {
   try {
-    const trimmed = state.sessions
-      .slice(0, MAX_SESSIONS)
-      .map(session => ({ ...session, messages: session.messages.slice(-MAX_SESSION_MESSAGES) }))
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ sessions: trimmed, activeId: state.activeId }))
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ sessions: trimmedSessions(), activeId: state.activeId }))
   } catch { /* 存储满/隐私模式时静默降级为内存态 */ }
+  scheduleServerSync()
+}
+
+/** 服务端同步 (防抖 fire-and-forget): 消息边界触发, 流式 delta 不落盘不触发;
+ *  失败静默 — 旧后端无此端点/离线时退化为纯本地行为。 */
+function scheduleServerSync() {
+  if (serverSyncTimer) clearTimeout(serverSyncTimer)
+  serverSyncTimer = setTimeout(() => {
+    serverSyncTimer = null
+    void fetch(SESSIONS_URL, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessions: trimmedSessions(), activeId: state.activeId }),
+    }).catch(() => { /* 静默降级 */ })
+  }, SERVER_SYNC_DEBOUNCE_MS)
+}
+
+/** 启动同步: 本地先渲染 (秒开), 再拉服务端合并 (换设备可见对方历史)。
+ *  拉取期间用户已开始交互 (会话被改动) 则放弃合并 — 本地更新会经防抖写回服务端。 */
+async function syncFromServer() {
+  const sessionsBefore = state.sessions
+  const sendingBefore = state.sending
+  try {
+    const resp = await fetch(SESSIONS_URL)
+    if (!resp.ok) return // 旧后端(404)/网关错误 → 保持本地
+    const data = await resp.json() as { sessions?: unknown; activeId?: unknown }
+    if (!Array.isArray(data.sessions)) return
+    if (state.sending || state.sessions !== sessionsBefore || sendingBefore) return
+    const remote = (data.sessions as AssistantSession[])
+      .filter(s => s && typeof s.id === 'string' && Array.isArray(s.messages))
+    if (!remote.length) return
+    const merged = mergeSessions(state.sessions, state.activeId, remote, typeof data.activeId === 'string' ? data.activeId : '', MAX_SESSIONS)
+    const unchanged = merged.sessions.length === state.sessions.length
+      && merged.sessions.every((s, i) => s === state.sessions[i])
+      && merged.activeId === state.activeId
+    if (unchanged) return
+    setState({ sessions: merged.sessions, activeId: merged.activeId })
+  } catch { /* 网络不可达: 保持本地 */ }
 }
 
 function loadSessions() {
@@ -153,13 +219,23 @@ function buildHistory(messages: ChatMessage[]): ChatHistoryMessage[] {
     .map(m => ({ role: m.role, content: m.content }))
 }
 
+/** 一轮生成中的滚动游标: 当前正在写入的足迹卡与正文段。
+ *
+ * 工具调用发生在正文中间时, 就地把已生成的正文段"封口", 新开一张足迹卡 +
+ * 新正文段 —— 这样渲染出来的顺序与事件到达顺序一致 (工具卡显示在它被调用的
+ * 那个位置), 而不是整回合一张累积卡固定堆在正文上方。
+ */
+interface TurnCursor {
+  footprintId: string
+  assistantId: string
+}
+
 /** 一轮生成的完整编排: 建占位 → 流事件落库 → 终态收敛。 */
 async function runGeneration() {
   const history = buildHistory(activeMessages())
-  const assistantId = uid()
-  const footprintId = uid()
-  appendMessage({ id: footprintId, role: 'footprint', calls: [], ts: Date.now() })
-  appendMessage({ id: assistantId, role: 'assistant', content: '', ts: Date.now(), streaming: true })
+  const cursor: TurnCursor = { footprintId: uid(), assistantId: uid() }
+  appendMessage({ id: cursor.footprintId, role: 'footprint', calls: [], ts: Date.now() })
+  appendMessage({ id: cursor.assistantId, role: 'assistant', content: '', ts: Date.now(), streaming: true })
   setState({ sending: true })
 
   abortController = new AbortController()
@@ -168,7 +244,7 @@ async function runGeneration() {
       { messages: history, context: pageContext },
       abortController.signal,
     )) {
-      applyEvent(event, footprintId, assistantId)
+      applyEvent(event, cursor)
     }
   } catch (error) {
     const aborted = abortController.signal.aborted
@@ -180,18 +256,48 @@ async function runGeneration() {
     abortController = null
     patchActiveSession(session => ({
       ...session,
-      messages: session.messages.map(m => (m.id === assistantId ? { ...m, streaming: false } : m)),
+      messages: session.messages.map(m => (m.role === 'assistant' && m.streaming ? { ...m, streaming: false } : m)),
     }))
     setState({ sending: false })
   }
 }
 
-function applyEvent(event: AssistantEvent, footprintId: string, assistantId: string) {
+/**
+ * 正文段里已有内容时, 在调用工具前把它封口并新开一张足迹卡 + 正文段。
+ * 正文为空 (整轮还没输出文字, 例如连续调用工具) 时沿用当前足迹卡, 不产生空段。
+ */
+function rotateTurn(cursor: TurnCursor) {
+  const session = activeSession()
+  const current = session?.messages.find(
+    m => m.role === 'assistant' && m.id === cursor.assistantId,
+  )
+  const hasText = Boolean(current && current.role === 'assistant' && current.content.trim())
+  if (!hasText) return
+
+  const footprintId = uid()
+  const assistantId = uid()
+  patchActiveSession(s => ({
+    ...s,
+    messages: [
+      ...s.messages.map(m => (m.id === cursor.assistantId && m.role === 'assistant'
+        ? { ...m, streaming: false }
+        : m)),
+      { id: footprintId, role: 'footprint' as const, calls: [], ts: Date.now() },
+      { id: assistantId, role: 'assistant' as const, content: '', ts: Date.now(), streaming: true },
+    ],
+  }))
+  cursor.footprintId = footprintId
+  cursor.assistantId = assistantId
+}
+
+function applyEvent(event: AssistantEvent, cursor: TurnCursor) {
   switch (event.type) {
     case 'tool_call':
+      // 工具调用就地把之前的正文封口, 卡片插在它被调用的位置
+      rotateTurn(cursor)
       patchActiveSession(session => ({
         ...session,
-        messages: session.messages.map(m => m.id === footprintId && m.role === 'footprint'
+        messages: session.messages.map(m => m.id === cursor.footprintId && m.role === 'footprint'
           ? {
               ...m,
               calls: [...m.calls, {
@@ -207,7 +313,7 @@ function applyEvent(event: AssistantEvent, footprintId: string, assistantId: str
     case 'tool_result':
       patchActiveSession(session => ({
         ...session,
-        messages: session.messages.map(m => m.id === footprintId && m.role === 'footprint'
+        messages: session.messages.map(m => m.id === cursor.footprintId && m.role === 'footprint'
           ? {
               ...m,
               calls: m.calls.map(c => c.callId === event.call_id
@@ -226,7 +332,7 @@ function applyEvent(event: AssistantEvent, footprintId: string, assistantId: str
     case 'action_confirm':
       patchActiveSession(session => ({
         ...session,
-        messages: session.messages.map(m => m.id === footprintId && m.role === 'footprint'
+        messages: session.messages.map(m => m.id === cursor.footprintId && m.role === 'footprint'
           ? {
               ...m,
               calls: m.calls.map(c => c.callId === event.call_id
@@ -244,7 +350,7 @@ function applyEvent(event: AssistantEvent, footprintId: string, assistantId: str
       // 轮次检查点: 以合成足迹记录承载「继续/停止」卡, 决策走同一端点。
       patchActiveSession(session => ({
         ...session,
-        messages: session.messages.map(m => m.id === footprintId && m.role === 'footprint'
+        messages: session.messages.map(m => m.id === cursor.footprintId && m.role === 'footprint'
           ? {
               ...m,
               calls: [...m.calls, {
@@ -265,7 +371,7 @@ function applyEvent(event: AssistantEvent, footprintId: string, assistantId: str
       // 逐字流式高频到达: 只更新内存态, 由生成结束时的 setState({sending:false}) 统一落盘。
       patchActiveSession(session => ({
         ...session,
-        messages: session.messages.map(m => (m.id === assistantId && m.role === 'assistant'
+        messages: session.messages.map(m => (m.id === cursor.assistantId && m.role === 'assistant'
           ? { ...m, content: m.content + event.content }
           : m)),
       }), { persist: false })
@@ -324,6 +430,12 @@ export function openAssistant() {
 
 export function closeAssistant() {
   setState({ open: false }, false)
+}
+
+/** 设置悬浮球可见性并持久化 (localStorage 缓存 + 后端 ui_prefs 权威副本, 默认开启)。 */
+export function setFabVisible(visible: boolean) {
+  setUiPref(FAB_STORAGE_KEY, visible ? '1' : '0')
+  setState({ fabVisible: visible }, false)
 }
 
 export function toggleAssistant() {
@@ -394,3 +506,4 @@ export function useAssistantStore(): AssistantState {
 }
 
 loadSessions()
+void syncFromServer()

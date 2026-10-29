@@ -102,10 +102,10 @@ const TOOL_LABELS: Record<string, string> = {
   get_abnormal: '查询异动监控',
   get_lots: '查询持仓提醒',
   list_signals: '检索信号库',
-  run_strategy: '执行选股策略',
+  run_strategy: '执行策略',
   get_factor_values: '查询因子排名',
   create_signal_strategy: '创建自定义信号',
-  add_to_watchlist: '加入自选股',
+  add_to_watchlist: '加入自选',
   check_data_coverage: '检查数据完整性',
   __rounds: '轮次检查点',
   list_ext_tables: '检索扩展数据表',
@@ -315,9 +315,26 @@ const ERROR_TITLES: Record<string, string> = {
   network: '网络错误',
 }
 
-export const NoticeMessage = memo(function NoticeMessage({ content }: { content: string }) {
+export const NoticeMessage = memo(function NoticeMessage({
+  content,
+  onRetry,
+}: {
+  content: string
+  onRetry?: () => void
+}) {
+  // 无 onRetry 的 notice (服务端通知等) 保持纯文本; 中断提示传 onRetry 时
+  // 渲染为可点按钮 —— 文案承诺"可点击重试", 渲染层必须兑现
+  if (!onRetry) {
+    return <div className="text-center text-xs text-muted">{content}</div>
+  }
   return (
-    <div className="text-center text-xs text-muted">{content}</div>
+    <button
+      type="button"
+      onClick={onRetry}
+      className="mx-auto block text-center text-xs text-muted hover:text-accent cursor-pointer transition-colors"
+    >
+      {content}
+    </button>
   )
 })
 
@@ -332,7 +349,7 @@ export function AssistantMessageView({ message, onRetry }: { message: ChatMessag
     case 'error':
       return <ErrorBubble kind={message.kind} message={message.message} hint={message.hint} onRetry={onRetry} />
     case 'notice':
-      return <NoticeMessage content={message.content} />
+      return <NoticeMessage content={message.content} onRetry={onRetry} />
     default:
       return null
   }

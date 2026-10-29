@@ -4,7 +4,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { motion, AnimatePresence } from 'framer-motion'
 import { ArrowUpRight, Check, Database, Gauge, GripVertical, Info, Loader2, Play, RefreshCw, RotateCcw, Sparkles, Timer } from 'lucide-react'
 import { DatePicker } from '@/components/DatePicker'
-import { api, type AlertEvent } from '@/lib/api'
+import { api, type AlertEvent, type DataStatus } from '@/lib/api'
 import { QK } from '@/lib/queryKeys'
 import { DimensionMembersDialog, type DimensionMembersTarget } from '@/components/DimensionMembersDialog'
 import { useDataStatus, useCapabilities, useSettings, usePreferences } from '@/lib/useSharedQueries'
@@ -19,6 +19,19 @@ import { AddWidgetPanel } from '@/components/dashboard/AddWidgetPanel'
 import { useDashboardLayout } from '@/components/dashboard/useDashboardLayout'
 import { DEFAULT_LAYOUT, widgetDef, type WidgetCtx } from '@/components/dashboard/registry'
 import { cloneItems, GRID_COLS, type WidgetType } from '@/components/dashboard/layout'
+
+/** 兼容旧后端的预热标志; 同步/自动修复也会使统计暂不可用。 */
+export function isDataStatusPending(ds?: DataStatus): boolean {
+  return ds?.stats_pending === true || ds?.indicators_ready === false
+}
+
+/** 无本地数据判定: enriched/daily 交易日均为 0 才算无数据。
+ *  预热/同步/修复期间的 null 是未知态, 必须等真实统计就绪再判。 */
+export function resolveHasNoData(ds?: DataStatus): boolean {
+  if (!ds) return false
+  if (isDataStatusPending(ds)) return false
+  return (ds.enriched?.trading_days ?? 0) === 0 && (ds.daily?.trading_days ?? 0) === 0
+}
 
 /** 打开个股预览的来源榜 (用于行高亮与切股导航列表) */
 type PreviewSource = 'gain' | 'loss' | 'amount' | 'active' | 'concept' | 'industry' | 'alert'
@@ -59,7 +72,11 @@ export function Dashboard() {
   }, [dashItems, setDashItems])
   // 首次使用(无数据 + 未完成引导)自动弹窗: 同一会话只弹一次
   const [showWelcomeModal, setShowWelcomeModal] = useState(false)
-  const dataStatus = useDataStatus({ staleTime: 60_000 })
+  // 统计暂不可用时持续重查, 同步/自动修复结束后恢复真实统计并停止轮询。
+  const dataStatus = useDataStatus({
+    staleTime: 60_000,
+    refetchInterval: (q: any) => (isDataStatusPending(q.state.data) ? 5_000 : false),
+  })
   const overview = useQuery({
     queryKey: QK.overviewMarket(selectedDate),
     queryFn: () => api.overviewMarket(selectedDate),
@@ -89,11 +106,10 @@ export function Dashboard() {
   ].find(s => s.name === activeProvider)?.display_name
     ?.replace(/（.*?）|\(.*?\)/g, '').trim() || activeProvider
   // 无本地数据(enriched/daily 都没有)→ 常驻引导卡片
-  // 注: 后端 status 的 rows 为性能刻意返回 0, 用 trading_days 判断是否有数据
+  // 注: 后端 status 的 rows 为性能刻意返回 0, 用 trading_days 判断是否有数据;
+  // 统计暂不可用时不算无数据 (见 resolveHasNoData)
   const ds = dataStatus.data
-  const hasNoData = !!ds
-    && (ds.enriched?.trading_days ?? 0) === 0
-    && (ds.daily?.trading_days ?? 0) === 0
+  const hasNoData = resolveHasNoData(ds)
 
   // ===== 盘后管道触发(看板内一键获取数据) =====
   const [fetchJobId, setFetchJobId] = useState<string | null>(null)
@@ -302,13 +318,13 @@ export function Dashboard() {
         </div>
       </div>
 
-      {/* 自选实时模式提示: 大盘看板为盘后数据, 仅自选股实时。避免用户误读为全市场实时。 */}
+      {/* 自选实时模式提示: 大盘看板为盘后数据, 仅自选实时。避免用户误读为全市场实时。 */}
       {quoteMode === 'watchlist' && (
         <div className="mb-1.5 flex items-start gap-2 rounded-card border border-amber-500/30 bg-amber-500/8 px-3 py-1.5 text-[11px] leading-relaxed">
           <Info className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-500" />
           <div className="min-w-0 flex-1 text-secondary">
             当前为「自选实时」模式,看板展示的大盘数据为<strong className="text-foreground">盘后快照</strong>(最新有数据日),并非盘中实时;
-            仅自选股({data.quote_status?.watchlist_symbol_count ?? 0} 只)支持实时监控。
+            仅自选({data.quote_status?.watchlist_symbol_count ?? 0} 只)支持实时监控。
             <span className="ml-1 text-accent">全市场实时依赖数据源支持</span>
           </div>
         </div>
@@ -371,7 +387,7 @@ function FetchDataCard({
               : `将从当前数据源「${providerLabel}」拉取近 1 年全 A 股日K`}(约 5500 只),预计 1-3 分钟,期间可继续浏览其他页面。
           </p>
           <p className="mt-1 text-[11px] text-warning/80 leading-relaxed">
-            ⓘ 获取数据后即可进行策略定制、回测验证、选股扫描等本地分析功能。
+            ⓘ 获取数据后即可进行策略定制、回测验证、策略扫描等本地分析功能。
           </p>
           <p className="mt-1 text-[11px] text-muted leading-relaxed">
             💡 配置 fuyao(同花顺 REST) Key 可解锁财务四表 / 龙虎榜 / 盘前风向标 / 竞价异动:

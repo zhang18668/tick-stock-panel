@@ -192,3 +192,25 @@ def test_save_strategy_code_ok_when_custom_signal_defined(tmp_path):
     assert result["ok"] is True
     loaded = request.app.state.strategy_engine.get("custom_with_sig")
     assert "csg_oversold_macd_about_to_golden" in loaded.required_features
+
+
+def test_assistant_strategy_creation_respects_account_limit(tmp_path):
+    from uuid import uuid4
+
+    from app.custom.assistant.tools import ToolContext, _create_strategy
+    from app.user_system.context import CurrentUser
+
+    request = _request(tmp_path)
+    request.state = SimpleNamespace(
+        current_user=CurrentUser(
+            id=uuid4(), email="user@example.com", role="user", session_id=uuid4(),
+        ),
+        entitlements={"max_strategies": 0},
+        owned_strategy_ids=frozenset(),
+    )
+    ctx = ToolContext.build(
+        engine=request.app.state.strategy_engine, data_dir=tmp_path, request=request,
+    )
+    with pytest.raises(ValueError, match="strategy limit reached"):
+        _create_strategy({"name": "quota test", "code": _code("ai_quota")}, ctx)
+    assert not list((tmp_path / "strategies").rglob("*.py"))

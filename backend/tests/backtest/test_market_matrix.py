@@ -223,3 +223,11 @@ def test_lightweight_portfolio_keeps_stats_without_curves_or_monte_carlo(monkeyp
     assert "mc_maxdd_p50" not in light.stats
     for name in ("total_return", "annual_return", "max_drawdown", "sharpe", "sortino"):
         assert light.stats[name] == full.stats[name]
+
+
+def test_conditional_stop_survives_shared_matrix_encoding():
+    panel = pl.DataFrame([_row("A", 0, 10), _row("A", 1, 11)])
+    matrix = build_market_matrix(
+        panel, None, None, conditional_stops=pl.Series([False, True]),
+    )
+    assert matrix.conditional_stop[:, 0].tolist() == [False, True]

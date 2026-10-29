@@ -29,6 +29,7 @@ EXPECTED_OPEN_ENDPOINTS: set[str] = {
     "GET /api/ext-data",
     "POST /api/ext-data/{config_id}/ingest",
     "GET /api/ext-data/{config_id}/rows",
+    "GET /api/ext-data/{config_id}/series",
     "GET /api/ext-data/{config_id}/values",
     "GET /api/ext-data/schema-all",
     "GET /api/ext-data/schema/{config_id}",
@@ -44,6 +45,7 @@ EXPECTED_OPEN_ENDPOINTS: set[str] = {
     "GET /api/kline/minute",
     "GET /api/kline/minute-range",
     "GET /api/overview/market",
+    "DELETE /api/paper/account",
     "GET /api/paper/account",
     "POST /api/paper/account",
     "GET /api/paper/accounts",
@@ -61,6 +63,7 @@ EXPECTED_OPEN_ENDPOINTS: set[str] = {
     "GET /api/paper/overview",
     "GET /api/paper/positions",
     "POST /api/paper/rebuild",
+    "GET /api/paper/rounds",
     "POST /api/paper/settings",
     "GET /api/paper/stats",
     "GET /api/paper/trades",
@@ -81,6 +84,8 @@ EXPECTED_OPEN_ENDPOINTS: set[str] = {
     "GET /api/strategies/ai/status",
     "GET /api/strategies/{strategy_id}",
     "GET /api/strategies/{strategy_id}/source",
+    # 策略包导出 (bundle): 与 /source 同敏感级, 同为开放层
+    "GET /api/strategies/{strategy_id}/bundle",
 }
 
 

@@ -250,7 +250,7 @@ export interface AiStockReport {
 // ===== Kline =====
 export interface MinuteKlineRow {
   datetime: string
-  /** 分钟开盘价; 部分数据源(stock-sdk 历史日)无真实分钟 open, 为 null */
+  /** 分钟开盘价; 部分数据源历史日无真实分钟 open, 为 null */
   open: number | null
   high: number
   low: number
@@ -263,6 +263,18 @@ export interface MinuteKlineSession {
   date: string
   prev_close: number | null
   rows: MinuteKlineRow[]
+}
+
+/** 分钟数据缺口体检的一行: 某标的某交易日分钟 K 不完整 */
+export interface MinuteGapRow {
+  symbol: string
+  date: string
+  actual_bars: number
+  expected_bars: number
+  missing_bars: number
+  /** 现有数据的首/末分钟 (HH:MM), 用于显示"仅到 13:49" */
+  first_time: string | null
+  last_time: string | null
 }
 
 export interface PriceLimitInfo {
@@ -423,6 +435,8 @@ export interface ScreenerCachedSummary {
   results: Record<string, ScreenerResultSummary>
   today_ever_counts: Record<string, number>
   updated_at: number | null
+  /** 分钟策略后台批量计算中尚未完成的策略 (结果不落盘, 由 handle 快照合入) */
+  minute_pending?: string[]
 }
 
 /** run_all 渐进式返回: 快策略已算完, 慢策略后台继续算 */
@@ -437,6 +451,8 @@ export interface ScreenerRunAllSummary {
   error?: string | null
   /** 本次执行起点 (Unix ms, 后端时钟), 用于判断缓存结果是否属于本轮 */
   started_at?: number | null
+  /** 已跳过的失效策略 ID (策略池残留, 前端应从池中移除) */
+  skipped_unknown?: string[]
 }
 
 export interface ScreenerCachedResult {
@@ -708,6 +724,40 @@ export interface MainlineFilter {
   exclude_st: boolean
 }
 
+// ===== 情绪评分口径 (看板「情绪雷达」配置对话框) =====
+
+/** 一个子项: 原始指标 → [low, high] 归一化到 0..100, 再按 weight 参与维度合成 */
+export interface EmotionScoreTerm {
+  key: string
+  label: string
+  weight: number
+  low: number
+  high: number
+  unit: string
+}
+
+/** 一个维度: 由若干子项加权得到 0..100; invert = 逆向指标 (分越高盘面越差, 取反) */
+export interface EmotionScoreDimension {
+  label: string
+  weight: number
+  invert?: boolean
+  terms: EmotionScoreTerm[]
+}
+
+export interface EmotionScoreConfig {
+  dimensions: Record<string, EmotionScoreDimension>
+  /** 档位阈值: score ≥ strong → 强势, ≥ warm → 偏暖, … 递减 */
+  thresholds: Record<string, number>
+}
+
+export interface EmotionScoreConfigPayload {
+  config: EmotionScoreConfig
+  defaults: EmotionScoreConfig
+  dimension_order: string[]
+  labels: { key: string; name: string }[]
+  customized: boolean
+}
+
 export interface MainlineResult {
   rows: MainlineRow[]
   leaders: MainlineLeader[]
@@ -786,6 +836,44 @@ export interface AuctionBenchmarkPayload {
 }
 
 // ===== Strategy Engine =====
+/** 参数级联显隐条件 (UI 元数据, 后端原样透传)。三种形态可递归组合:
+ *  { param, in } — values[param] ∈ in;  { all: [...] } — 全部成立;  { any: [...] } — 任一成立 */
+export interface ParamVisibleIf {
+  param?: string
+  in?: (string | number | boolean)[]
+  all?: ParamVisibleIf[]
+  any?: ParamVisibleIf[]
+}
+
+/** 仓位策略定义 (设置 → 定义 → 仓位策略 / 回测设置引用) */
+export interface PositionPolicyMeta {
+  id: string
+  label: string
+  description: string
+  params: StrategyParamDef[]
+}
+export interface PositionPolicyInfo {
+  id: string
+  label: string
+  description: string
+  params: StrategyParamDef[]
+  source_file: string
+}
+export interface PositionPolicyTemplate {
+  key: string
+  label: string
+  description: string
+  meta: { id: string; label: string; description: string; params: StrategyParamDef[] }
+  code: string
+}
+export interface PositionPolicySavePayload {
+  id?: string
+  label: string
+  description?: string
+  params?: StrategyParamDef[]
+  code: string
+}
+
 export interface StrategyParamDef {
   id: string
   label: string
@@ -795,6 +883,12 @@ export interface StrategyParamDef {
   max?: number
   step?: number
   options?: string[]
+  /** UI 元数据: 分组节标题 (相同组名的相邻参数归并) */
+  group?: string
+  /** UI 元数据: 级联显隐 — 条件成立时显示 (见 ParamVisibleIf) */
+  visible_if?: ParamVisibleIf
+  /** UI 元数据: select 各选项被选中时批量应用的参数值 (如标的池预设 → 开关+默认值) */
+  option_applies?: Record<string, Record<string, string | number | boolean>>
 }
 
 export interface CompositeChildInfo {
@@ -809,7 +903,7 @@ export interface StrategyDetail {
   name: string
   description: string
   tags: string[]
-  source: 'builtin' | 'custom' | 'ai' | 'composite'
+  source: 'custom' | 'ai' | 'composite'
   research_only?: boolean
   execution_backend: 'polars_expr' | 'matrix_native' | 'python_history_legacy' | 'composite' | 'minute_filter'
   asset_types: string[]
@@ -822,6 +916,8 @@ export interface StrategyDetail {
   scoring_directions: Record<string, ScoringDirection>
   entry_signals: string[]
   exit_signals: string[]
+  // 叠加条件 (每策略 overlay 硬过滤); 无覆盖时空数组
+  overlay_filter?: CustomSignalCondition[]
   minute_exit_trigger_supported_signals: string[]
   stop_loss: number | null
   take_profit: number | null
@@ -880,7 +976,7 @@ export interface AiIterateResult {
 export interface CustomSignalCondition {
   left: string     // 字段名
   op: string       // > >= < <= == !=
-  right: string    // "field:xxx" 或数字字符串
+  right: string | number  // "field:xxx" 或数字常量 (迁移的历史信号常量为 number, 后端两者均合法)
   leftDays?: number   // 左字段取几日前 (0=当日, 默认)
   rightDays?: number  // 右字段取几日前 (仅 right 为字段时有意义)
 }
@@ -891,6 +987,10 @@ export interface CustomSignal {
   kind: 'entry' | 'exit' | 'both'
   conditions: CustomSignalCondition[]
   enabled: boolean
+  timeframe?: 'daily' | 'intraday'
+  min_bars?: number
+  /** 显式输出列名 (缺省 csg_{id}); 迁移自内置的定义沿用 signal_* 原列名, 编辑保存须原样回传 */
+  column?: string
 }
 
 export interface CustomSignalFieldGroup {
@@ -1119,6 +1219,21 @@ export interface PaperCompareRow {
   day_change_pct?: number | null
   auto_rules?: Array<{ name: string; match_kind: string; match_id: string; side: 'buy' | 'sell'; enabled: boolean }>
   auto_enabled?: number
+  /** 盘中实时估算 (后端增量, 当日快照就绪才有): live_* 为快照价口径 */
+  live_total?: number | null
+  live_pnl_pct?: number | null
+  estimating?: boolean
+}
+
+/** FIFO 配对回合 (GET /api/paper/rounds): 开仓成本含买入费, 平仓净额扣卖出费 */
+export interface PaperRound {
+  symbol: string
+  open_date: string
+  close_date: string
+  qty: number
+  pnl: number
+  pnl_pct: number
+  holding_days: number
 }
 
 /** 对比批量创建的单个来源 (POST /api/paper/arena/batch_create) */
@@ -1126,11 +1241,13 @@ export interface PaperArenaSource {
   name?: string
   match_kind: 'strategy' | 'rule'
   match_id: string
-  side?: 'buy' | 'sell'
+  side?: 'buy' | 'sell' | 'auto'
   size_mode?: 'fixed_amount' | 'pct_equity'
   size_value?: number
   order_type?: 'market' | 'next_open' | 'close'
   cooldown_days?: number
+  /** 最大同时持仓标的数 (0 = 不限); 对齐回测 max_positions 口径 */
+  max_positions?: number
 }
 
 export interface PaperHolding {
@@ -1192,11 +1309,14 @@ export interface PaperAutoRule {
   name: string
   match_kind: 'strategy' | 'rule'
   match_id: string
-  side: 'buy' | 'sell'
+  /** auto = 跟随策略信号方向 (入场/进池买入, 出场/移出全平); 仅 match_kind=strategy 支持 */
+  side: 'buy' | 'sell' | 'auto'
   size_mode: 'fixed_amount' | 'pct_equity'
   size_value: number
   order_type: 'market' | 'next_open' | 'close'
   cooldown_days: number
+  /** 最大同时持仓标的数 (仅约束买入开新仓, 0 = 不限); 对齐回测 max_positions 口径 */
+  max_positions?: number
   enabled: boolean
   created_at: string
 }
@@ -1369,6 +1489,8 @@ export interface FactorLibraryItem {
   pit: boolean
   asset_types: string[]
   stability: FactorStability
+  /** 完整生命周期状态; 内置因子无盘上定义 → null (stability 是它的二元投影) */
+  status: 'draft' | 'active' | 'watch' | 'retired' | null
   scale_free: boolean
   dependencies: string[]
 }
@@ -1510,6 +1632,26 @@ export interface MiningAvailability {
   effective_start: string | null
   effective_end: string | null
   suggested_start: string | null
+}
+
+/** 挖掘锁诊断 (撞锁降级模式的持有者线索 + 强制释放判定)。 */
+export interface MiningLockStatus {
+  held: boolean
+  mine: boolean
+  holder: {
+    pid: number
+    started_at?: string
+    role?: string
+    host?: string
+    schema_version?: number
+  } | null
+  holder_alive: boolean
+  pid_consistent: boolean
+  active_runs: number
+  store_idle_seconds: number | null
+  stale_after_seconds: number
+  force_releasable: boolean
+  reason: string | null
 }
 
 export interface MiningRequestV1 {
@@ -1845,6 +1987,25 @@ export interface EndpointManifest {
   source?: 'remote' | 'fallback'
 }
 
+/** 赞助商模型条目 — /v1/models 的 pricing/context_length 精简视图 */
+export interface SponsorModelItem {
+  id: string
+  context_length?: number | null
+  discount_rate?: number
+  input_price?: number | null
+  output_price?: number | null
+  /** 忙时折扣率 (timePricing 的 BUSY 档); 无忙闲时定价的模型为 null */
+  busy_discount_rate?: number | null
+  /** 闲时折扣率 (timePricing 的 OFF_PEAK 档) */
+  offpeak_discount_rate?: number | null
+  /** 闲时时段说明, 上游原文 (如 "00:00-09:00、12:00-14:00、18:00-00:00") */
+  offpeak_label?: string | null
+  /** 上游判定的当前时段: BUSY / OFF_PEAK */
+  current_band?: string | null
+  /** 当前时段对应的折扣率 */
+  current_discount_rate?: number | null
+}
+
 export interface SettingsState {
   mode: 'none' | 'free' | 'api_key'
   tickflow_api_key_masked: string
@@ -1856,8 +2017,11 @@ export interface SettingsState {
   extras_caps: string[]
   // 首次使用引导
   onboarding_completed: boolean
+  // 配置文件位置 (secrets.json: AI 与数据源 Key 统一存放)
+  secrets_path?: string
   // AI 配置
   ai_provider: string
+  ai_protocol?: string
   ai_base_url: string
   ai_api_key_masked: string
   has_ai_key: boolean
@@ -1907,6 +2071,10 @@ export interface PluginDataSourceItem {
   homepage?: string        // 插件官网/申请地址 (manifest 可选声明)
   api_key_env?: string     // 声明后设置页提供 Key 输入框 (先探后存)
   api_key_masked?: string  // 当前生效 Key 的脱敏串 (secrets.json 优先, .env 兜底; 与 TickFlow Key 同一展示契约)
+  billing?: string         // 计费标识 (可选): "points" → 能力芯片/适配行标注「积分」
+  billing_note?: string    // 计费提示 (可选): 积分消耗与频率/范围的关系, 按警示样式展示
+  usage_notes?: string[]   // 使用要点 (可选): 各能力规模/节奏, 详情卡以列表展示
+  key_manage_url?: string  // Key/账务管理页 (可选): Key 配置区展示入口链接
 }
 
 /** 数据源路由偏好字段 (每个能力一个, 与后端能力注册表一一对应) */
@@ -2033,6 +2201,93 @@ export interface ApiTokenRecord {
   revoked: boolean
 }
 
+/** 声效语音包 (用户上传的自定义提示音) */
+export interface SoundPack {
+  name: string
+  size: number
+  ext: string
+}
+
+/** 配置备份 — 预览 (inspect) 与导入结果 (apply), 对应后端 config_backup */
+export interface ConfigBackupCategoryCount {
+  key: string
+  label: string
+  count: number
+  conflicts: number
+}
+
+export interface ConfigBackupInspect {
+  created_at: string
+  app_version: string
+  has_secrets: boolean
+  categories: ConfigBackupCategoryCount[]
+  total_files: number
+  conflict_files: number
+  out_of_scope_files: number
+}
+
+export interface ConfigBackupApplyCategory {
+  key: string
+  label: string
+  imported: number
+  skipped_conflict: number
+  failed: { file: string; error: string }[]
+  /** 导入即冒烟 (仅 custom_signals/custom_factors): 逐条校验+编译+依赖检查结果 */
+  smoke?: (DefinitionSmokeResult & { file: string })[]
+}
+
+/** 统一定义目录项 (GET /api/definitions) — 信号+因子统一视图 */
+export interface DefinitionsCatalogItem {
+  kind: 'signal' | 'factor'
+  id: string
+  label: string
+  enabled?: boolean
+  timeframe?: string
+  lang: string
+  status?: string
+  group?: string
+  dependencies?: string[]
+  warmup_bars?: number | null
+  /** 目录不因单个坏定义失败 — 坏条目携带错误原因 (隔离要求) */
+  error?: string
+}
+
+/** 导入冒烟结果 (POST /api/definitions/smoke) */
+export interface DefinitionSmokeResult {
+  ok: boolean
+  issues: { code: string; message: string }[]
+  dependencies: string[]
+  warmup_bars: number | null
+}
+
+export interface ConfigBackupApplyResult {
+  categories: ConfigBackupApplyCategory[]
+  preferences_merged: boolean
+  secrets_merged: boolean
+  skipped_unselected: number
+  out_of_scope_files: number
+  reload_hints: Record<string, boolean>
+}
+
+/** 策略包条目预览 (POST /api/strategies/bundle/inspect) */
+export interface StrategyBundleEntry {
+  path: string
+  kind: 'strategies' | 'strategy_overrides' | 'custom_signals' | 'custom_factors'
+  id: string
+  action: 'create' | 'conflict'
+  bytes: number
+}
+
+export interface StrategyBundleInspect {
+  strategy_id: string
+  label: string
+  created_at?: string
+  counts: Record<string, number>
+  warnings: string[]
+  missing_deps: string[]
+  entries: StrategyBundleEntry[]
+}
+
 export interface Preferences {
   realtime_quotes_enabled: boolean
   watchlist_groups_in_nav: boolean
@@ -2068,12 +2323,18 @@ export interface Preferences {
   instruments_schedule: { hour: number; minute: number }
   enriched_batch_size: number
   index_daily_batch_size: number
+  /** daily-batch 单请求标的数上限, 同时是前端分块大小 (系统设置 → 批量请求) */
+  daily_batch_symbols: number
+  /** minute-batch 单请求标的数上限, 同时是前端分块大小 */
+  minute_batch_symbols: number
   limit_ladder_monitor_enabled: boolean
   depth_polling_interval: number
   depth_finalize_time: { hour: number; minute: number }
   review_schedule: { enabled: boolean; hour: number; minute: number }
   review_push_channels: string[]
   review_push_mode?: 'auto' | 'manual'
+  /** 用户自定义复盘系统提示词；空串 = 使用内置默认模板 */
+  market_recap_system_prompt?: string
   sse_refresh_pages: Record<string, boolean>
   strategy_monitor_enabled: boolean
   strategy_monitor_ids: string[]
@@ -2095,6 +2356,10 @@ export interface Preferences {
   /** 看板自定义布局; null/缺省 = 未自定义(前端内置默认布局) */
   dashboard_layout: { v: number; items: Array<{ i: string; t: string; x: number; y: number; w: number; h: number; p?: Record<string, string> }> } | null
   screener_auto_run: boolean
+  /** AI 助手动作工具是否免确认直接执行 (默认 false) */
+  assistant_auto_approve_actions: boolean
+  /** AI 助手打开时是否显示毛玻璃遮罩, 点击遮罩关闭 (默认 true) */
+  assistant_mask_enabled: boolean
   minute_intraday_refresh: boolean
   minute_intraday_refresh_interval: number
   monitor_ext_fields: { concept: MonitorExtFieldItem | null; industry: MonitorExtFieldItem | null }
@@ -2205,6 +2470,162 @@ export interface SectorRotationUniverseItem {
   n_members_with_bars: number
   /** 被自动活跃榜过滤 (排除名单/成员数超限); 仅影响自动选取, 仍可手动加入自定义 */
   excluded?: boolean
+}
+
+/** 页面插件元数据 — data/ext_pages/{id}/page.json, 后端源 app/services/ext_pages.py */
+export interface RuntimePagePack {
+  id: string
+  enabled: boolean
+  label: string
+  path: string
+  size: number
+  sha256: string
+  uploaded_at: number
+  error: string
+}
+
+// ===== 升级保护 (二次开发) =====
+/** 报告文件分类: restorable=新版没动可恢复 / conflict=双方都改需手工合并 /
+ *  match=内容已一致 / added_lost=用户新建文件新版没有 */
+export type UpgradeGuardCategory = 'restorable' | 'conflict' | 'match' | 'added_lost'
+
+export interface UpgradeGuardReportFile {
+  relpath: string
+  category: UpgradeGuardCategory
+  current_exists: boolean
+}
+
+export interface UpgradeGuardReport {
+  id: string
+  from_version: string
+  to_version: string
+  created_at: string
+  counts: Record<UpgradeGuardCategory, number>
+  files: UpgradeGuardReportFile[]
+  dir: string
+}
+
+export interface UpgradeGuardStatus {
+  enabled: boolean
+  reason?: string
+  scanning?: boolean
+  program_root?: string
+  manifest_version?: string | null
+  current_version?: string
+  last_scan?: string
+  modified?: string[]
+  added?: string[]
+  backup_dir?: string
+  reports_dir?: string
+  pending_report?: UpgradeGuardReport | null
+}
+
+// ===== 策略守护 (发布后持续复验) =====
+export interface GuardianConfig {
+  guardian_schedule_enabled: boolean
+  guardian_watch_pct: number
+  guardian_retire_pct: number
+  guardian_k_max: number
+  lab_mined_slot_limit: number
+}
+
+export interface GuardianRun {
+  run_id: string
+  status: string
+  request: Record<string, any>
+  created_at: string | null
+  updated_at: string | null
+  started_at: string | null
+  finished_at: string | null
+  error: string | null
+  progress: { done?: number; total?: number; strategy_id?: string; verdict?: string } | null
+}
+
+export interface GuardianProfile {
+  strategy_id: string
+  name: string | null
+  status: 'pending' | 'healthy' | 'watch' | 'retired'
+  status_reason: string | null
+  status_since: string | null
+  baseline: {
+    kind: 'mining_gate' | 'trailing_reference' | null
+    data_as_of: string | null
+    objective: string | null
+    score: number | null
+    n_trades: number | null
+    max_drawdown: number | null
+  }
+  checks_count: number
+  consecutive_watch: number
+  alert: boolean
+  last_check: {
+    checked_at: string | null
+    verdict: 'healthy' | 'watch' | 'retired' | null
+    skipped: boolean
+    reason: string | null
+    error: string | null
+    degradation_pct: number | null
+    objective: string | null
+    window_start: string | null
+    window_end: string | null
+    k: number | null
+    reasons: string[]
+  } | null
+  updated_at: string | null
+}
+
+export interface GuardianCombinationSuggestion {
+  a: string
+  b: string
+  corr: number
+  common_days: number
+}
+
+export interface GuardianCombinations {
+  schema_version?: number
+  generated_at?: string
+  window_start?: string
+  window_end?: string
+  pairs_evaluated?: number
+  suggestions: GuardianCombinationSuggestion[]
+}
+
+export interface GuardianOverview {
+  items: GuardianProfile[]
+  config: GuardianConfig
+  active_run: GuardianRun | null
+  combinations: GuardianCombinations | null
+}
+
+export interface LabReport {
+  generated_at: string
+  mining: {
+    last_run: {
+      run_id: string
+      status: string
+      created_at: string | null
+      finished_at: string | null
+      algorithm_version?: string | null
+      confidence?: string | null
+      candidate_count?: number | null
+      valid_fold_count?: number | null
+      refinement?: Record<string, any> | null
+      trials_used?: number | null
+    } | null
+  }
+  guardian: {
+    profiles: number
+    by_status: Record<string, number>
+    alerts: number
+    last_run: { run_id: string; status: string; created_at: string | null; finished_at: string | null } | null
+  }
+  combinations: { generated_at?: string | null; suggestions: GuardianCombinationSuggestion[] }
+  slots: {
+    active_mined: number
+    active_mined_ids: string[]
+    limit: number
+    full: boolean
+  }
 }
 
 // ===== API surface =====
@@ -2331,8 +2752,8 @@ export const api = {
     ),
 
   /** 保存 AI 配置 */
-  saveAiSettings: (ai: { provider?: string; base_url?: string; api_key?: string; model?: string; reasoning_effort?: string; codex_command?: string; codex_reasoning_effort?: string; user_agent?: string; max_output_tokens?: number; context_window?: number; round_checkpoint?: number }) =>
-    request<{ ok: boolean; ai_provider?: string; ai_model?: string; ai_openai_model?: string; ai_reasoning_effort?: string; ai_codex_model?: string; ai_codex_command?: string; ai_codex_reasoning_effort?: string; ai_configured?: boolean; ai_max_output_tokens?: number; ai_context_window?: number; ai_round_checkpoint?: number }>('/api/settings/ai', {
+  saveAiSettings: (ai: { provider?: string; base_url?: string; api_key?: string; model?: string; protocol?: string; reasoning_effort?: string; codex_command?: string; codex_reasoning_effort?: string; user_agent?: string; max_output_tokens?: number; context_window?: number; round_checkpoint?: number }) =>
+    request<{ ok: boolean; ai_provider?: string; ai_protocol?: string; ai_model?: string; ai_openai_model?: string; ai_reasoning_effort?: string; ai_codex_model?: string; ai_codex_command?: string; ai_codex_reasoning_effort?: string; ai_configured?: boolean; ai_max_output_tokens?: number; ai_context_window?: number; ai_round_checkpoint?: number }>('/api/settings/ai', {
       method: 'POST',
       body: JSON.stringify(ai),
     }),
@@ -2341,9 +2762,29 @@ export const api = {
   clearAiSettings: () =>
     request<{ ok: boolean }>('/api/settings/ai', { method: 'DELETE' }),
 
+  /** 草稿连通性测试 — 只验证当前表单值, 不保存任何配置 */
+  testAiSettings: (
+    ai: { provider?: string; base_url?: string; api_key?: string; model?: string; protocol?: string },
+    opts?: { timeoutMs?: number },
+  ) =>
+    request<{ ok: boolean; model?: string; response?: string; error?: string; error_type?: string }>('/api/settings/ai/test', {
+      method: 'POST',
+      body: JSON.stringify(ai),
+      ...(opts?.timeoutMs != null ? { timeoutMs: opts.timeoutMs } : {}),
+    }),
+
+  upgradeGuardStatus: () => request<UpgradeGuardStatus>('/api/upgrade-guard/status'),
+  upgradeGuardScan: () => request<UpgradeGuardStatus>('/api/upgrade-guard/scan', { method: 'POST' }),
+  upgradeGuardRestore: (reportId: string, relpath: string) =>
+    request<{ ok: boolean; restored: string }>('/api/upgrade-guard/restore', {
+      method: 'POST',
+      body: JSON.stringify({ report_id: reportId, relpath }),
+    }),
+  upgradeGuardDismiss: () => request<{ ok: boolean }>('/api/upgrade-guard/dismiss-report', { method: 'POST' }),
+
   /** 赞助商(RunningHub)模型列表(后端代理, 规避其网关按 Origin 过滤) */
   sponsorModels: () =>
-    request<{ models: string[] }>('/api/settings/ai/sponsor-models'),
+    request<{ models: string[]; items?: SponsorModelItem[] }>('/api/settings/ai/sponsor-models'),
 
   // ===== API Token 管理 (开放层; 仅 UI 会话可达) =====
   apiTokensList: () =>
@@ -2388,14 +2829,13 @@ export const api = {
       { method: 'DELETE' },
     ),
   savePluginKey: (plugin: string, apiKey: string) => {
-    // 先探后存: 后端会用候选 Key 实探一次, 探测超时 10s + 余量
-    const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), 30_000)
+    // 先探后存: 后端用候选 Key 实探一次。HTTP 型源秒级; 子进程实探型源(如 TdxQuant
+    // 冷启动 DLL + 预热 + 实探)实测 ~35s, 超时给到 75s 兼顾最坏情况, 报错可读。
     return request<PluginKeyResult>('/api/settings/plugin-key', {
       method: 'POST',
       body: JSON.stringify({ plugin, api_key: apiKey }),
-      signal: controller.signal,
-    }).finally(() => clearTimeout(timer))
+      timeoutMs: 75_000,
+    })
   },
   clearPluginKey: (plugin: string) =>
     request<PluginKeyResult>(`/api/settings/plugin-key/${encodeURIComponent(plugin)}`, { method: 'DELETE' }),
@@ -2474,6 +2914,26 @@ export const api = {
       next_round_at?: number | null
       last_error?: string | null
     }>('/api/settings/minute-refresh/status'),
+
+  /** 分钟数据缺口体检: 列出本地分区中分钟 K 不完整的 (标的, 交易日)。
+   *  只发现不补齐 — 超出上游历史窗口的缺口补不回来, 前端据此标注。 */
+  minuteGaps: (params?: { symbols?: string[]; dates?: string[]; limit?: number }) => {
+    const q = new URLSearchParams()
+    if (params?.symbols?.length) q.set('symbols', params.symbols.join(','))
+    if (params?.dates?.length) q.set('dates', params.dates.join(','))
+    if (params?.limit) q.set('limit', String(params.limit))
+    const qs = q.toString()
+    return request<{
+      status: string
+      scanned_dates: number
+      scanned_symbols: number
+      complete_dates: string[]
+      gaps: MinuteGapRow[]
+      summary_by_date: { date: string; gap_symbols: number; missing_bars: number; expected_bars: number }[]
+      truncated: boolean
+      limit?: number
+    }>(`/api/kline/minute-gaps${qs ? `?${qs}` : ''}`)
+  },
   updatePipelinePullTypes: (cfg: Partial<Pick<Preferences, 'pipeline_pull_a_share' | 'pipeline_pull_etf' | 'pipeline_pull_index'>>) =>
     request<{
       pipeline_pull_a_share: boolean
@@ -2573,6 +3033,18 @@ export const api = {
       method: 'PUT',
       body: JSON.stringify({ enabled }),
     }),
+  /** AI 助手「动作工具免确认」开关 (默认关闭) */
+  updateAssistantAutoApprove: (enabled: boolean) =>
+    request<{ assistant_auto_approve_actions: boolean }>('/api/settings/preferences/assistant-auto-approve', {
+      method: 'PUT',
+      body: JSON.stringify({ enabled }),
+    }),
+  /** AI 助手「毛玻璃遮罩」开关 (默认开启) */
+  updateAssistantMask: (enabled: boolean) =>
+    request<{ assistant_mask_enabled: boolean }>('/api/settings/preferences/assistant-mask', {
+      method: 'PUT',
+      body: JSON.stringify({ enabled }),
+    }),
   updateFeishuWebhook: (url: string, secret?: string) =>
     request<{ feishu_webhook_url: string; feishu_webhook_secret: string }>('/api/settings/preferences/feishu-webhook', {
       method: 'PUT',
@@ -2638,6 +3110,15 @@ export const api = {
       method: 'PUT',
       body: JSON.stringify({ channels, mode: mode ?? null }),
     }),
+  /** 复盘系统提示词: 自定义值 + 内置默认全文(按需拉取, 供「填入默认模板」) */
+  getMarketRecapPrompt: () =>
+    request<{ custom: string; default: string; customized: boolean }>('/api/settings/preferences/market-recap-prompt'),
+  /** 保存自定义复盘系统提示词; 空串 = 恢复内置默认模板 */
+  updateMarketRecapPrompt: (prompt: string) =>
+    request<{ custom: string; customized: boolean }>('/api/settings/preferences/market-recap-prompt', {
+      method: 'PUT',
+      body: JSON.stringify({ prompt }),
+    }),
   updateDepthPollingInterval: (interval: number) =>
     request<{ depth_polling_interval: number }>('/api/settings/preferences/depth-polling-interval', {
       method: 'PUT',
@@ -2687,6 +3168,35 @@ export const api = {
     request<{ index_daily_batch_size: number }>('/api/settings/preferences/index-daily-batch-size', {
       method: 'PUT',
       body: JSON.stringify({ size }),
+    }),
+  updateDailyBatchSymbols: (size: number) =>
+    request<{ daily_batch_symbols: number }>('/api/settings/preferences/daily-batch-symbols', {
+      method: 'PUT',
+      body: JSON.stringify({ size }),
+    }),
+  updateMinuteBatchSymbols: (size: number) =>
+    request<{ minute_batch_symbols: number }>('/api/settings/preferences/minute-batch-symbols', {
+      method: 'PUT',
+      body: JSON.stringify({ size }),
+    }),
+
+  // 声效语音包 (自定义提示音, data/sound_packs)
+  listSoundPacks: () =>
+    request<{ packs: SoundPack[] }>('/api/settings/sound-packs'),
+
+  uploadSoundPack: (file: File) => {
+    const fd = new FormData()
+    fd.append('file', file)
+    return request<{ status: string; pack: SoundPack }>('/api/settings/sound-packs', {
+      method: 'POST',
+      body: fd,
+      timeoutMs: 30_000,
+    })
+  },
+
+  deleteSoundPack: (name: string) =>
+    request<{ status: string }>(`/api/settings/sound-packs/${encodeURIComponent(name)}`, {
+      method: 'DELETE',
     }),
 
   // 自选列表列配置
@@ -2751,7 +3261,11 @@ export const api = {
       stock_info?: { name?: string; total_shares?: number; float_shares?: number }
       date: string | null
       rows: MinuteKlineRow[]
-      source?: 'local' | 'live' | 'none'
+      /** local=完整; local_partial=本地有但不完整(见 expected/actual); live=源实时; none=无数据 */
+      source?: 'local' | 'local_partial' | 'live' | 'none'
+      /** local_partial 时: 该交易日应有根数 / 实有根数 */
+      expected?: number
+      actual?: number
       asset_type?: 'stock' | 'etf' | 'index'
       price_limit?: PriceLimitInfo | null
       prev_close?: number | null
@@ -2947,10 +3461,14 @@ export const api = {
 
   // timeframe='all' 时不传参数 → 后端不过滤周期, 返回日线+分钟合并列表
   screenerStrategies: async (assetType?: 'stock' | 'etf' | 'index', timeframe: '1d' | '1m' | 'all' = '1d') => {
-    const data = await request<{ strategies: StrategyDetail[]; load_errors?: StrategyLoadError[] }>(
+    const data = await request<{
+      strategies: StrategyDetail[]
+      load_errors?: StrategyLoadError[]
+      legacy_migration?: { seeded_signals?: number; seeded_strategies?: number; archived_files?: string[] }
+    }>(
       `/api/strategies?${assetType ? `asset_type=${assetType}&` : ''}${timeframe !== 'all' ? `timeframe=${timeframe}` : ''}`,
     )
-    return { presets: data.strategies, load_errors: data.load_errors }
+    return { presets: data.strategies, load_errors: data.load_errors, legacy_migration: data.legacy_migration }
   },
   screenerRunPreset: (strategy_id: string, pool?: string[], asOf?: string, extColumns?: string, assetType: 'stock' | 'etf' = 'stock', timeframe: '1d' | '1m' = '1d') =>
     request<ScreenerResult>('/api/screener/run_preset', {
@@ -3031,6 +3549,17 @@ export const api = {
     request<MainlineFilter>('/api/settings/preferences/mainline-filter', {
       method: 'PUT',
       body: JSON.stringify(payload),
+    }),
+
+  /** 情绪评分口径: 当前配置 + 出厂默认 (表单完全由返回值渲染, 前端不硬编码权重) */
+  emotionScoreConfig: () =>
+    request<EmotionScoreConfigPayload>('/api/settings/emotion-score/config'),
+
+  /** 保存情绪评分口径; config 传 null = 恢复出厂口径 */
+  emotionScoreConfigUpdate: (config: EmotionScoreConfig | null) =>
+    request<EmotionScoreConfigPayload>('/api/settings/emotion-score/config', {
+      method: 'PUT',
+      body: JSON.stringify({ config }),
     }),
 
   limitLadder: (asOf?: string, extColumns?: string, direction?: 'up' | 'down') => {
@@ -3172,12 +3701,22 @@ export const api = {
     fees_pct?: number
     slippage_bps?: number
     asset_type?: 'stock' | 'etf' | 'index'
-  }) =>
+  }, signal?: AbortSignal) =>
     request<FactorBatchResult>('/api/backtest/factor/batch', {
       method: 'POST',
       timeoutMs: COMPUTE_REQUEST_TIMEOUT_MS,
       body: JSON.stringify(payload),
+      // 调用方持有 signal (界面「取消」按钮) 时由其自行中止, 跳过默认超时
+      ...(signal ? { signal } : {}),
     }),
+
+  miningLockStatus: () =>
+    request<MiningLockStatus>('/api/backtest/mining/lock', { quiet: true }),
+
+  miningForceReleaseLock: () =>
+    request<{ released: boolean; terminated_pid: number; reacquired: boolean }>(
+      '/api/backtest/mining/lock/force-release', { method: 'POST' },
+    ),
 
   miningRuns: () =>
     request<{ items: MiningRun[] }>('/api/backtest/mining/runs'),
@@ -3282,7 +3821,9 @@ export const api = {
     slippage_bps?: number
     max_positions?: number
     initial_capital?: number
-    position_sizing?: 'equal' | 'score_weight'
+    position_sizing?: 'equal' | 'score_weight' | 'policy'
+    position_policy?: string | null
+    position_policy_params?: Record<string, number | boolean | string> | null
     asset_type?: 'stock' | 'etf' | 'index'
     minute_fill?: boolean
   }) =>
@@ -3290,6 +3831,34 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
+
+  positionPolicyList: () => request<{
+    policies: PositionPolicyInfo[]
+    errors: Record<string, string>
+  }>('/api/backtest/position-policies'),
+  positionPolicyTemplates: () => request<{ templates: PositionPolicyTemplate[] }>(
+    '/api/backtest/position-policies/templates',
+  ),
+  positionPolicyGet: (id: string) => request<{ id: string; meta: PositionPolicyMeta; code: string }>(
+    `/api/backtest/position-policies/${id}`,
+  ),
+  positionPolicyValidate: (payload: PositionPolicySavePayload) => request<{
+    ok: boolean
+    issues: string[]
+    smoke: { weights: number[]; budget_scale: number } | null
+  }>('/api/backtest/position-policies/validate', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  }),
+  positionPolicySave: (payload: PositionPolicySavePayload) => request<{ ok: boolean; id: string; issues: string[] }>(
+    '/api/backtest/position-policies', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    },
+  ),
+  positionPolicyDelete: (id: string) => request<{ ok: boolean }>(
+    `/api/backtest/position-policies/${id}`, { method: 'DELETE' },
+  ),
 
   pipelineRun: () => request<{ job_id: string; reused: boolean }>(
     '/api/pipeline/run', { method: 'POST' },
@@ -3386,6 +3955,104 @@ export const api = {
   analysisMenus: () =>
     request<{ items: AnalysisMenu[] }>('/api/analysis-menus'),
 
+  // ===== 页面插件 (运行时扩展页面, 见 docs/page-sdk.md) =====
+  extPagesList: () =>
+    request<RuntimePagePack[]>('/api/ext-pages'),
+
+  extPagesUpload: (id: string, file: File) => {
+    const fd = new FormData()
+    fd.append('id', id)
+    fd.append('file', file)
+    return request<RuntimePagePack>('/api/ext-pages/upload', { method: 'POST', body: fd })
+  },
+
+  extPagesPutManifest: (id: string, body: { label: string; path: string; error: string }) =>
+    request<RuntimePagePack>(`/api/ext-pages/${encodeURIComponent(id)}/manifest`, {
+      method: 'PUT',
+      body: JSON.stringify(body),
+    }),
+
+  extPagesPutEnabled: (id: string, enabled: boolean) =>
+    request<RuntimePagePack>(`/api/ext-pages/${encodeURIComponent(id)}/enabled`, {
+      method: 'PUT',
+      body: JSON.stringify({ enabled }),
+    }),
+
+  extPagesDelete: (id: string) =>
+    request<{ ok: boolean }>(`/api/ext-pages/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+
+  // ===== 源码导入: .tsx → 后端 esbuild 编译+契约适配 → 标准页面插件 =====
+  // 编译可能耗时数秒 (全依赖自包含打包), 走计算型超时; 仅源码/桌面部署可用 (409)
+  extPagesImportSource: (file: File, id?: string) => {
+    const fd = new FormData()
+    fd.append('file', file)
+    if (id) fd.append('id', id)
+    return request<RuntimePagePack>('/api/ext-pages/import-source', {
+      method: 'POST',
+      body: fd,
+      timeoutMs: COMPUTE_REQUEST_TIMEOUT_MS,
+    })
+  },
+
+  extPagesImportFromProject: (namespace: string) =>
+    request<RuntimePagePack>('/api/ext-pages/import-source/from-project', {
+      method: 'POST',
+      body: JSON.stringify({ namespace }),
+      timeoutMs: COMPUTE_REQUEST_TIMEOUT_MS,
+    }),
+
+  extPagesSourceNamespaces: () =>
+    request<string[]>('/api/ext-pages/import-source/namespaces'),
+
+  // ===== 页面管理 — 源码扩展页删除 =====
+  // 物理删除 frontend/src/custom/<ns>/; 后端先备份 zip 到 data/backups/pages/ 再删,
+  // 返回备份文件名。仅源码部署可用 (Docker/桌面产物部署后端 409)。
+  pageAdminDeleteSourceExtension: (namespace: string) =>
+    request<{ deleted: string; backup: string }>(`/api/pages-admin/source-extensions/${encodeURIComponent(namespace)}`, { method: 'DELETE' }),
+
+  // 备份下载走浏览器原生下载 (同源 /api, dev 由 Vite 代理), 存到用户下载文件夹
+  pageAdminBackupUrl: (filename: string) =>
+    `/api/pages-admin/backups/${encodeURIComponent(filename)}`,
+
+  // 配置备份 (切换设备迁移配置; 导出直链下载, 导入先 inspect 预览再 apply)
+  // categories: 勾选的类别键 (后端 config_backup._CATEGORY_LABELS 的键);
+  // 含 'secrets' 才导出/导入密钥, 不含则该类别跳过。
+  configBackupExportUrl: (categoryKeys: readonly string[]) =>
+    `/api/config-backup/export?categories=${encodeURIComponent(categoryKeys.join(','))}`,
+
+  configBackupInspect: (file: File) => {
+    const fd = new FormData()
+    fd.append('file', file)
+    return request<ConfigBackupInspect>('/api/config-backup/inspect', {
+      method: 'POST',
+      body: fd,
+    })
+  },
+
+  configBackupApply: (file: File, allowOverwrite: boolean, categoryKeys: readonly string[]) => {
+    const fd = new FormData()
+    fd.append('file', file)
+    fd.append('allow_overwrite', allowOverwrite ? 'true' : 'false')
+    fd.append('categories', categoryKeys.join(','))
+    return request<ConfigBackupApplyResult>('/api/config-backup/apply', {
+      method: 'POST',
+      body: fd,
+      timeoutMs: 120_000,
+    })
+  },
+
+  // ── 统一定义目录 / 导入冒烟 (P4) ──
+
+  definitionsList: () =>
+    request<{ items: DefinitionsCatalogItem[] }>('/api/definitions'),
+
+  /** 逐条冒烟: 按 id 复检已存定义 (definition 与 id 二选一) */
+  definitionsSmoke: (kind: 'signal' | 'factor', id: string) =>
+    request<DefinitionSmokeResult & { file?: string }>('/api/definitions/smoke', {
+      method: 'POST',
+      body: JSON.stringify({ kind, id }),
+    }),
+
   analysisMenu: (id: string) =>
     request<AnalysisMenu>(`/api/analysis-menus/${encodeURIComponent(id)}`),
 
@@ -3447,15 +4114,30 @@ export const api = {
     ),
 
   extDataSchemaAll: () =>
-    request<{ items: { id: string; label: string; mode: string; columns: { name: string; type: string; label: string }[] }[] }>('/api/ext-data/schema-all'),
+    request<{ items: { id: string; label: string; mode: string; time_field?: string | null; granularity?: 'intraday' | 'daily' | null; columns: { name: string; type: string; label: string }[] }[] }>('/api/ext-data/schema-all'),
+
+  /** 日内多盘序列 (列表迷你图列): 每标的一天的 [HH:MM:SS, value] 点列 */
+  extDataSeries: (configId: string, field: string, date?: string | null, symbols?: string[], days?: number) =>
+    request<{ config_id: string; field: string; date: string | null; granularity?: 'intraday' | 'daily'; days?: number; items: Record<string, [string, number][]> }>(
+      `/api/ext-data/${configId}/series?field=${encodeURIComponent(field)}`
+        + (date ? `&date=${date}` : '')
+        + (symbols?.length ? `&symbols=${encodeURIComponent(symbols.join(','))}` : '')
+        + (days ? `&days=${days}` : ''),
+    ),
 
   extDataPullConfig: (id: string, body: {
     url: string; method?: string; headers?: Record<string, string>; body?: string;
     response_path?: string; field_map?: Record<string, string>;
     schedule_minutes?: number; enabled?: boolean;
+    schedule_time?: string | null;
+    schedule_period?: 'daily' | 'weekly' | 'monthly' | null;
+    schedule_day?: number | null;
+    schedule_trading_only?: boolean;
     time_window_start?: string | null; time_window_end?: string | null;
     date_param?: string | null;
     time_field?: string | null;
+    since_param?: string | null;
+    granularity?: 'auto' | 'intraday' | 'daily';
     auth?: ExtPullAuth;
     timeout_seconds?: number;
     page_param?: string | null;
@@ -3500,13 +4182,6 @@ export const api = {
     request<ExtDataBackfillResult>(
       `/api/ext-data/${encodeURIComponent(id)}/backfill?start=${start}&end=${end}`,
       { method: 'POST', timeoutMs: timeoutMs ?? 600_000 },
-    ),
-
-  // 内置预设 (概念/行业) 手动获取数据: 走结构转换, 保证 schema 一致
-  extDataPresetFetch: (id: string) =>
-    request<{ status: string; rows: number }>(
-      `/api/ext-data/presets/${id}/fetch`,
-      { method: 'POST' },
     ),
 
   extDataDetectFields: (file: File) => {
@@ -3854,6 +4529,70 @@ export const api = {
       { method: 'POST', body: JSON.stringify({ as_of: asOf ?? null }) },
     ),
 
+  /** 稳健优化折预览: 运行前查看 K 段验证窗切分与告警 (不回测)。 */
+  robustOptimizePreview: (start: string, end: string, kSegments: number) =>
+    request<{ k_segments: number; windows: { start: string; end: string; days: number }[]; warnings: string[] }>(
+      `/api/backtest/optimize-robust/preview?${new URLSearchParams({ start, end, k_segments: String(kSegments) })}`,
+    ),
+
+  /** 滚动样本外检验折预览: 运行前查看折数/窗口切分与告警 (不回测)。 */
+  walkforwardPreview: (start: string, end: string, trainDays: number, testDays: number, stepDays: number) =>
+    request<{ n_folds: number; folds: { index: number; train_start: string; train_end: string; test_start: string; test_end: string }[]; warnings: string[] }>(
+      `/api/backtest/walkforward/preview?${new URLSearchParams({
+        start, end,
+        train_days: String(trainDays), test_days: String(testDays), step_days: String(stepDays),
+      })}`,
+    ),
+
+  // ── 策略守护 (发布后持续复验) ──────────────────────────────
+  guardianOverview: () =>
+    request<GuardianOverview>('/api/backtest/guardian/overview'),
+
+  guardianAdopt: (strategyId: string, objective: string) =>
+    request<{ ok: boolean; strategy_id: string; run_id: string }>(
+      `/api/backtest/guardian/${encodeURIComponent(strategyId)}/adopt`,
+      { method: 'POST', body: JSON.stringify({ objective }) },
+    ),
+
+  guardianDrop: (strategyId: string) =>
+    request<{ ok: boolean; strategy_id: string }>(
+      `/api/backtest/guardian/${encodeURIComponent(strategyId)}/drop`,
+      { method: 'POST' },
+    ),
+
+  guardianRerun: (strategyId: string) =>
+    request<{ ok: boolean; strategy_id: string; run_id: string }>(
+      `/api/backtest/guardian/${encodeURIComponent(strategyId)}/rerun`,
+      { method: 'POST' },
+    ),
+
+  guardianRunAll: () =>
+    request<{ ok: boolean; run_id: string }>('/api/backtest/guardian/run', { method: 'POST' }),
+
+  guardianRuns: (limit = 20) =>
+    request<{ items: GuardianRun[] }>(`/api/backtest/guardian/runs?limit=${limit}`),
+
+  guardianConfig: () => request<GuardianConfig>('/api/backtest/guardian/config'),
+
+  guardianPatchConfig: (
+    patch: Partial<Pick<GuardianConfig, 'guardian_schedule_enabled' | 'guardian_watch_pct' | 'guardian_retire_pct' | 'guardian_k_max' | 'lab_mined_slot_limit'>>,
+  ) =>
+    request<GuardianConfig>('/api/backtest/guardian/config', {
+      method: 'PATCH',
+      body: JSON.stringify(patch),
+    }),
+
+  guardianScanCombinations: () =>
+    request<{ ok: boolean; run_id: string }>('/api/backtest/guardian/combinations/scan', { method: 'POST' }),
+
+  guardianCreateCombination: (a: string, b: string) =>
+    request<{ ok: boolean; strategy_id: string; created: boolean }>('/api/backtest/guardian/combinations/create', {
+      method: 'POST',
+      body: JSON.stringify({ a, b }),
+    }),
+
+  labReport: () => request<LabReport>('/api/backtest/lab/report'),
+
   strategySaveConfig: (strategyId: string, overrides: Record<string, any>) =>
     request<{ ok: boolean }>('/api/strategies/config', {
       method: 'POST',
@@ -3982,11 +4721,18 @@ export const api = {
   paperStats: (account?: string) =>
     request<{ rounds: number; win_rate: number; profit_loss_ratio: number | null; avg_holding_days: number; realized_pnl: number; max_drawdown: number | null }>(accUrl('/api/paper/stats', account)),
 
+  paperRounds: (account?: string) =>
+    request<{ rounds: PaperRound[] }>(accUrl('/api/paper/rounds', account)),
+
   paperCompare: () =>
     request<{ accounts: PaperCompareRow[] }>('/api/paper/compare'),
 
   paperFreeze: (frozen: boolean, account?: string) =>
     request<{ account: PaperAccount }>(accUrl('/api/paper/freeze?frozen=' + frozen, account), { method: 'POST' }),
+
+  /** 删除账户及其全部数据 (不可恢复); 有持仓/待成交订单时后端拒绝, force=true 强删 */
+  paperDeleteAccount: (force: boolean, account?: string) =>
+    request<{ ok: boolean; deleted: string; holdings?: number; pending_orders?: number }>(accUrl(`/api/paper/account?force=${force}`, account), { method: 'DELETE' }),
 
   paperAutoRules: (account?: string) =>
     request<{ rules: PaperAutoRule[] }>(accUrl('/api/paper/auto_rules', account)),
@@ -4078,6 +4824,32 @@ export const api = {
   /** 获取策略源文件内容 */
   strategyGetSource: (id: string) =>
     request<{ code: string; source: string }>(`/api/strategies/${id}/source`),
+
+  // 策略包 (bundle): 依赖感知的导出/导入 — 策略 .py + 引用的信号/因子定义 + 用户调参。
+  // 导出走浏览器原生下载 (同配置备份直链模式)。
+  strategyBundleExportUrl: (strategyId: string) =>
+    `/api/strategies/${encodeURIComponent(strategyId)}/bundle`,
+
+  strategyBundleInspect: (file: File) => {
+    const fd = new FormData()
+    fd.append('file', file)
+    return request<StrategyBundleInspect>('/api/strategies/bundle/inspect', {
+      method: 'POST',
+      body: fd,
+    })
+  },
+
+  strategyBundleApply: (file: File, allowOverwrite: boolean) => {
+    const fd = new FormData()
+    fd.append('file', file)
+    fd.append('allow_overwrite', allowOverwrite ? 'true' : 'false')
+    return request<ConfigBackupApplyResult>('/api/strategies/bundle/apply', {
+      method: 'POST',
+      body: fd,
+      timeoutMs: 120_000,
+    })
+  },
+
   strategyBuild: (step: number, payload: Record<string, any>) =>
     request<StrategyBuildResult>(
       '/api/strategies/build',
@@ -4263,12 +5035,14 @@ export interface DataStatus {
     ext_data_files?: number
     ext_data_size_mb?: number
     total_size_mb: number
-  }
+  } | null  // busy 降级 (预热/同步/修复期间) 且冷启动缓存未热时为 null, 不代表无数据
   next_pipeline_run: string | null
   next_instruments_run: string | null
   last_pipeline_run: string | null
   last_instruments_run: string | null
   checked_at: string
+  /** 预热/同步/修复期间统计暂不可用或仅为旧缓存, 空值不代表无数据。 */
+  stats_pending?: boolean
   indicators_ready?: boolean
 }
 
@@ -4290,6 +5064,12 @@ export interface ExtPullAuth {
   type: 'none' | 'bearer' | 'header' | 'query'
   header?: string
   param?: string
+  /**
+   * 复用已有凭据而非本表专属 Key: 值为 secrets.json 的字段名
+   * (如 "fuyao_api_key")。UI 不暴露, 但保存时必须原样带回, 否则会把
+   * 出厂配方里的凭据引用抹掉。
+   */
+  key_ref?: string
 }
 
 export interface PullConfig {
@@ -4301,6 +5081,14 @@ export interface PullConfig {
   field_map?: Record<string, string>
   schedule_minutes: number
   enabled: boolean
+  /** 每日固定拉取时刻 "HH:MM" (北京时间): 配置后忽略间隔, 每天该时刻拉一次; null=间隔制 */
+  schedule_time?: string | null
+  /** 固定时刻重复周期: daily=每天 | weekly=每周 | monthly=每月 (仅 schedule_time 生效) */
+  schedule_period?: 'daily' | 'weekly' | 'monthly' | null
+  /** weekly: 1=周一..7=周日; monthly: 1..31 (短月无该日则该月跳过) */
+  schedule_day?: number | null
+  /** 仅交易日: 跳过周六日 (节假日无法离线判定, 仍会按期尝试) */
+  schedule_trading_only?: boolean
   last_run?: string | null
   last_status?: string | null
   last_message?: string | null
@@ -4314,6 +5102,10 @@ export interface PullConfig {
   date_format?: string
   /** 日内序列表时间列名 (如 "ts"): 配置后同 symbol 允许多行 (按 symbol+时间列去重), 用于集合竞价等多盘数据 */
   time_field?: string | null
+  /** 序列粒度: auto=按数据形态自动判断 | intraday=日内多盘 | daily=日级别 (决定 series 口径与列表迷你图形态) */
+  granularity?: 'auto' | 'intraday' | 'daily'
+  /** 增量续传参数名 (如 "since"): 每次拉取自动带上本地目标日分区时间列最大值, 源只返回其后数据; 需先配置 time_field */
+  since_param?: string | null
   auth?: ExtPullAuth | null
   /** 单次拉取请求超时 (秒), 默认 30 */
   timeout_seconds?: number
@@ -4327,6 +5119,39 @@ export interface PullConfig {
   page_start?: number
   /** 分页安全上限, 默认 20 (防接口永远返回数据拖死循环) */
   max_pages?: number
+  /**
+   * 两级拉取配方 (目录 → 逐条目明细): 数据源只给「类别清单」+「单类别成员」,
+   * 需要扇出请求再反转行方向时使用 (如同花顺概念/行业)。配置后通用拉取
+   * 自动走上这条路径, 无需任何按表硬编码。
+   */
+  fanout?: PullFanout | null
+}
+
+export interface PullFanout {
+  /** 第二级请求地址 */
+  url: string
+  /** 第二级请求的查询参数名, 取值为第一级条目的 id_field */
+  param: string
+  /** 第一级条目中作为第二级参数的字段 */
+  id_field: string
+  /** 第一级条目中作展示名的字段 (可选, 仅用于告警文案) */
+  label_field?: string
+  /** 第二级响应里成员数组的 dot-path (留空 = 响应本身即数组) */
+  items_path?: string
+  /** 成员对象里取标的代码的字段 */
+  member_id_field: string
+  /** 成员对象里取标的名称的字段 (可选) */
+  member_label_field?: string
+  /** 输出列名: 标的代码 */
+  symbol_col: string
+  /** 输出列名: 标的名称 */
+  name_col: string
+  /** 输出列名: 拼接后的类别 */
+  value_col: string
+  /** 多类别拼接符 (概念用 ";", 行业层级用 "-") */
+  separator?: string
+  concurrency?: number
+  retries?: number
 }
 
 export interface ExtDataBackfillResult {
@@ -4373,6 +5198,10 @@ export interface ExtDataConfig {
   updated_at: string
   latest_sync_date?: string | null
   date_range?: string[] | null
+  /** 日内多盘表最新分区的盘次概览; 非多盘表为 null */
+  plate?: { date: string; plates: number; from: string; to: string; granularity: 'intraday' | 'daily' } | null
+  /** 生效序列粒度 (显式声明 > 数据形态判断): intraday | daily; snapshot 表为 null */
+  granularity_effective?: 'intraday' | 'daily' | null
   pull?: PullConfig | null
 }
 
@@ -4431,7 +5260,9 @@ export interface AnalysisMenu {
   label: string
   icon: string
   data_source: string
-  template: 'dimension_rank' | 'ranking' | 'table'
+  template: 'dimension_rank' | 'ranking' | 'table' | 'url'
+  /** url 嵌入型模板: 内嵌的 http(s) 地址 (仅 template='url' 有值) */
+  url?: string | null
   dimension_field?: string | null
   rank_field?: string | null
   group_columns: AnalysisColumn[]

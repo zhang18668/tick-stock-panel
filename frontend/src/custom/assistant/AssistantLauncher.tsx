@@ -9,7 +9,6 @@ import { useEffect } from 'react'
 import type { FrontendSlotContextMap } from '@/extensions/types'
 import { closeAssistant, setPageContext, toggleAssistant, useAssistantStore } from './store'
 import { AssistantFloatingButton } from './ui/AssistantFloatingButton'
-import { AiConfigEntry } from './ui/AiConfigEntry'
 import { AssistantDrawer } from './ui/AssistantDrawer'
 
 // 插槽注册表把组件 props 定为所有插槽上下文的联合类型(保守契约);
@@ -26,9 +25,9 @@ const PAGE_LABELS: Record<string, string> = {
   '/backtest': '回测',
   '/stock-analysis': '个股分析',
   '/limit-ladder': '连板梯队',
-  '/concept-analysis': '概念分析',
-  '/industry-analysis': '行业分析',
-  '/financials': '财务分析',
+  '/concept-analysis': '概念板块',
+  '/industry-analysis': '行业板块',
+  '/financials': '财务概况',
   '/monitor': '监控中心',
   '/regime': '市场环境',
   '/abnormal': '异动监控',
@@ -64,7 +63,6 @@ export function AssistantLauncher(props: AnySlotContext) {
   return (
     <>
       <AssistantFloatingButton />
-      <AiConfigEntry />
       <AssistantDrawer />
     </>
   )

@@ -66,7 +66,7 @@ class FakeRepo:
         return []
 
 
-def _client(*, user_id="alice", owned_ids=frozenset(), raise_server_exceptions=True):
+def _client(*, user_id="alice", owned_ids=frozenset(), raise_server_exceptions=True, is_paid_user=True):
     import app.strategy_library.api as library_api
 
     app = FastAPI()
@@ -75,6 +75,7 @@ def _client(*, user_id="alice", owned_ids=frozenset(), raise_server_exceptions=T
     async def set_user(request, call_next):
         if user_id is not None:
             request.state.current_user = SimpleNamespace(id=user_id, is_admin=False)
+            request.state.is_paid_user = is_paid_user
             request.state.owned_strategy_ids = owned_ids
             request.state.installed_strategy_ids = frozenset()
             request.state.strategy_overrides = {}
@@ -261,3 +262,8 @@ def test_one_year_window_respects_enabled_server_range_guard(monkeypatch):
 
     assert resolved.availability == "unavailable"
     assert resolved.reason == library_api.BACKTEST_SERVER_GUARD_MESSAGE
+
+
+def test_library_rejects_unpaid_account():
+    client, _, _ = _client(is_paid_user=False)
+    assert client.get("/api/strategy-library").status_code == 403

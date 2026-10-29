@@ -4,7 +4,14 @@ import { RouterProvider } from 'react-router-dom'
 import { QueryClient, QueryCache } from '@tanstack/react-query'
 import { PersistQueryClientProvider } from '@tanstack/react-query-persist-client'
 import { initializeFrontendExtensions } from './extensions/bootstrap'
+import { installTspExtBridge, loadRuntimePageExtensions } from './extensions/runtime'
+import { api } from './lib/api'
+import { QK } from './lib/queryKeys'
+import { cn } from './lib/cn'
+import * as format from './lib/format'
 import { createAppPersister, shouldPersistQuery, PERSIST_BUSTER } from './lib/queryPersist'
+import { hydrateUiPrefs } from './lib/uiPrefs'
+import { applyPageZoom, getPageZoom } from './lib/pageZoom'
 // 字体自托管 (@fontsource): 替代 rsms.me / Google Fonts 渲染阻塞外链,
 // 内网/离线部署不再白屏等字体。权重覆盖 tailwind 全部用量 (300-900)。
 import '@fontsource/inter/300.css'
@@ -64,7 +71,16 @@ const queryClient = new QueryClient({
 })
 
 async function bootstrap() {
+  // 界面偏好回填: 桌面版启动端口从 3018 起递增, 端口一变 origin 就变, 只存
+  // localStorage 的设置 (通知/声效/语音/外链模板/缩放) 会读不到。后端保存权威
+  // 副本, 这里异步回填并重放一次缩放 (首帧缩放已由 index.html 内联脚本应用)。
+  // 不 await: 网络慢时不能拖住首屏, 回填完成后的缩放重放会自行生效。
+  void hydrateUiPrefs().then(() => { applyPageZoom(getPageZoom()) })
   await initializeFrontendExtensions()
+  // 页面插件能力桥: 运行时页面插件经 shim 读取宿主 api/QK/cn/format
+  installTspExtBridge({ api, QK, cn, format })
+  // 运行时页面插件: 必须在 router 模块求值(finalize + 建路由表)之前挂载
+  await loadRuntimePageExtensions()
   const { router } = await import('./router')
   ReactDOM.createRoot(document.getElementById('root')!).render(
     <React.StrictMode>
