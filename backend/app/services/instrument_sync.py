@@ -82,14 +82,23 @@ def sync_instruments(data_dir: Path) -> int:
         # 未命中非 tickflow provider → 走 tickflow 直连
         tf = get_client()
         all_rows = []
+        complete = True
         for ex in _EXCHANGES:
             try:
                 items = tf.exchanges.get_instruments(ex, instrument_type="stock")
                 if items:
                     all_rows.extend(_flatten_instruments(items))
                     logger.info("instruments %s: %d stocks", ex, len(items))
-            except Exception as e:
+                else:
+                    complete = False
+                    logger.warning("get_instruments(%s) returned no stocks; keeping existing table", ex)
+            except Exception as e:  # noqa: BLE001
+                complete = False
                 logger.warning("get_instruments(%s) failed: %s", ex, e)
+
+        if not complete:
+            # One exchange failing must not replace the full table with a partial snapshot.
+            return 0
 
     if not all_rows:
         return 0
