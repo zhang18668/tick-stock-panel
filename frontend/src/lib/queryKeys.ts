@@ -8,6 +8,10 @@
 // ===== Query Key 工厂 =====
 
 export const QK = {
+  chanAnalyses: (symbol: string) => ['chan-analysis', symbol] as const,
+  // Full normalized OHLC content is part of the key: revisions of history must
+  // invalidate derived structures even when symbol/date/count are unchanged.
+  chanAnalysis: (symbol: string, period: 'day' | 'week', rows: readonly unknown[]) => ['chan-analysis', symbol, period, rows] as const,
   // 全局 / 共享 (Layout 预取)
   capabilities:   ['capabilities'] as const,
   settings:       ['settings'] as const,

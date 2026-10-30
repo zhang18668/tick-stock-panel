@@ -320,6 +320,43 @@ export interface KlineDailyLatestResponse {
   source: 'live' | 'none'
 }
 
+export interface ChanStructure {
+  id: string
+  kind: 'fractal' | 'stroke' | 'segment' | 'center' | 'signal'
+  start: { date: string; price: number; index: number }
+  end: { date: string; price: number; index: number }
+  confirmedAt: string | null
+  observedAt: string
+  label: string
+  basis: string
+  low?: number
+  high?: number
+  features?: Record<string, number>
+}
+
+export interface ChanBar {
+  date: string
+  open: number
+  high: number
+  low: number
+  close: number
+  volume?: number
+  macd_dif?: number
+  macd_dea?: number
+  macd_hist?: number
+}
+
+export interface ChanAnalysisResponse {
+  symbol: string
+  period: 'day' | 'week'
+  rows: ChanBar[]
+  structures: ChanStructure[]
+  asOf: string | null
+  warnings: string[]
+  ruleVersion: string
+  engine: { name: string; revision: string; config: Record<string, unknown> }
+}
+
 // ===== Watchlist =====
 export interface WatchlistEntry {
   symbol: string
@@ -3229,6 +3266,10 @@ export const api = {
         : `/api/kline/daily?symbol=${encodeURIComponent(symbol)}&days=${days}`)
       + (extColumns ? `&ext_columns=${encodeURIComponent(extColumns)}` : ''),
     ),
+  chanAnalyze: (symbol: string, period: 'day' | 'week', rows: ChanBar[], signal?: AbortSignal) =>
+    request<ChanAnalysisResponse>('/api/custom/chan/analyze', {
+      method: 'POST', body: JSON.stringify({ symbol, period, rows }), signal, quiet: true, timeoutMs: 60_000,
+    }),
   klineDailyLatest: (symbol: string) =>
     request<KlineDailyLatestResponse>(
       `/api/kline/daily/latest?symbol=${encodeURIComponent(symbol)}`,

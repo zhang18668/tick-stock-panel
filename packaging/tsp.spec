@@ -104,6 +104,11 @@ hiddenimports += [
 datas += [(str(ROOT / "backend" / "app" / "custom"), "app/custom")]
 hiddenimports += collect_submodules("app.custom")
 
+# chan.py computation is bundled as modules; retain MIT attribution and pinned
+# provenance as data too (non-Python files are not collected by import analysis).
+for notice in ("LICENSE", "UPSTREAM.json", "README.md"):
+    datas += [(str(ROOT / "backend" / "app" / "vendor" / "chanpy" / notice), "app/vendor/chanpy")]
+
 # ── pywebview 平台后端 (动态导入, PyInstaller 默认抓不到) ────────────
 hiddenimports += collect_submodules("webview")
 hiddenimports += collect_submodules("webview.platforms")

@@ -43,6 +43,18 @@ export interface ChartRange {
   end: string
   label?: string
   color?: string
+  /** Optional price bounds; omitted for legacy full-height time ranges. */
+  low?: number
+  high?: number
+}
+
+export interface ChartStructureLine {
+  id: string
+  points: { date: string; price: number }[]
+  color?: string
+  width?: number
+  dashed?: boolean
+  label?: string
 }
 
 export interface ChartPriceLine {
@@ -324,6 +336,8 @@ interface Props {
   markers?: ChartMarker[]
   ranges?: ChartRange[]
   priceLines?: ChartPriceLine[]
+  structureLines?: ChartStructureLine[]
+  focusRange?: { start: string; end: string }
   height?: number
   showMA?: boolean
   showInfoBar?: boolean
@@ -480,6 +494,7 @@ function buildOption(
   linkedPrice: number | null | undefined,
   volumeCompare: VolumeCompareConfig,
   addedDate: string | null | undefined,
+  structureLines: ChartStructureLine[] | undefined,
 ): EChartsOption {
   const candleData = data.map(d => [d.open, d.close, d.low, d.high])
 
@@ -600,11 +615,14 @@ function buildOption(
   xAxisIndices.push(0)
 
   const markAreaData = (ranges ?? [])
-    .filter(r => dateIndexMap.has(r.start) && dateIndexMap.has(r.end))
+    .filter(r => dateIndexMap.has(r.start) && dateIndexMap.has(r.end) &&
+      ((r.low == null && r.high == null) ||
+        (Number.isFinite(r.low) && Number.isFinite(r.high) && r.low! < r.high!)))
     .map(r => ([
       {
         name: r.label ?? '',
         xAxis: r.start,
+        ...(r.low != null ? { yAxis: r.low } : {}),
         itemStyle: { color: r.color ?? 'rgba(59,130,246,0.08)' },
         label: {
           show: !!r.label,
@@ -620,7 +638,7 @@ function buildOption(
           fontFamily: 'JetBrains Mono, monospace',
         },
       },
-      { xAxis: r.end },
+      { xAxis: r.end, ...(r.high != null ? { yAxis: r.high } : {}) },
     ]))
 
   const markLineData: any[] = (priceLines ?? [])
@@ -685,6 +703,32 @@ function buildOption(
     markArea: markAreaData.length > 0 ? { silent: true, data: markAreaData } : undefined,
     markLine: markLineData.length > 0 ? { silent: true, symbol: 'none', data: markLineData, animation: false } : undefined,
   })
+
+  for (const line of structureLines ?? []) {
+    if (line.points.length < 2 || line.points.some(p => !dateIndexMap.has(p.date) || !Number.isFinite(p.price))) continue
+    const indices = line.points.map(p => dateIndexMap.get(p.date)!)
+    if (indices.some((index, i) => i > 0 && index <= indices[i - 1])) continue
+    // dataZoom's category filter drops sparse endpoints outside the viewport.
+    // Sample the same straight geometry at each trading bar so crossing lines
+    // remain visible while preserving the shared chart's scaling behavior.
+    const sampled: [string, number][] = []
+    for (let i = 1; i < line.points.length; i++) {
+      const a = line.points[i - 1]
+      const b = line.points[i]
+      const first = indices[i - 1]
+      const last = indices[i]
+      for (let index = first + (i > 1 ? 1 : 0); index <= last; index++) {
+        sampled.push([dates[index], a.price + (b.price - a.price) * (index - first) / (last - first)])
+      }
+    }
+    series.push({
+      id: `structure:${line.id}`, name: line.label ?? line.id, type: 'line',
+      data: sampled,
+      xAxisIndex: 0, yAxisIndex: 0, smooth: false, symbol: 'none', animation: false,
+      lineStyle: { color: line.color ?? THEME.ma10, width: line.width ?? 1, type: line.dashed ? 'dashed' : 'solid' },
+      itemStyle: { color: line.color ?? THEME.ma10 }, z: 8,
+    })
+  }
 
   if (hasMA) {
     const maLine = (key: keyof OHLC, color: string, name: string) => ({
@@ -873,6 +917,8 @@ export function EChartsCandlestick({
   markers,
   ranges,
   priceLines,
+  structureLines,
+  focusRange,
   height = 480,
   showMA = true,
   showInfoBar = true,
@@ -1255,6 +1301,7 @@ export function EChartsCandlestick({
       linkedPrice,
       volumeCompare,
       addedDate,
+      structureLines,
     )
 
     chart.setOption(option, true)
@@ -1272,7 +1319,15 @@ export function EChartsCandlestick({
     if (infoEl) {
       infoEl.innerHTML = getInfoBarHTML()
     }
-  }, [data, markers, ranges, priceLines, linkedPrice, showMA, showMarkersProp, activeIndicators, volumeCompare, addedDate, chartHeight, dates, dateIndexMap, initialZoom, getInfoBarHTML, theme])
+  }, [data, markers, ranges, priceLines, structureLines, linkedPrice, showMA, showMarkersProp, activeIndicators, volumeCompare, addedDate, chartHeight, dates, dateIndexMap, initialZoom, getInfoBarHTML, theme])
+
+  useEffect(() => {
+    if (!focusRange) return
+    const start = dateIndexMap.get(focusRange.start)
+    const end = dateIndexMap.get(focusRange.end)
+    if (start == null || end == null || start > end) return
+    chartRef.current?.dispatchAction({ type: 'dataZoom', startValue: start, endValue: end })
+  }, [focusRange, dateIndexMap])
 
   // 渲染信息栏容器 (内容由 JS 直接写入)
   const initialHTML = useMemo(() => {

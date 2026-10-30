@@ -113,3 +113,29 @@ it('切股后鼠标未离开图表, 竖虚线重新命中即恢复「至今/周�
   await act(async () => { surface.dispatchEvent(new MouseEvent('mouseleave')) })
   expect(host.textContent).not.toContain('至今')
 })
+
+it('结构折线和价格中枢使用主图坐标，关闭后清除，兼容旧时间区间', async () => {
+  await act(async () => root.render(
+    <EChartsCandlestick data={rows(10)} symbol="600000"
+      ranges={[{ start: DAYS[2], end: DAYS[8], low: 10, high: 12, label: 'ZS1' }, { start: DAYS[10], end: DAYS[15] }]}
+      structureLines={[{ id: 'bi-1', points: [{ date: DAYS[2], price: 10 }, { date: DAYS[8], price: 12 }], dashed: true }]}
+      focusRange={{ start: DAYS[2], end: DAYS[8] }} />,
+  ))
+  const option = chart.setOption.mock.calls.findLast(c => c[0]?.series?.some((s: any) => s.name === 'K'))?.[0] as any
+  const k = option.series.find((s: any) => s.name === 'K')
+  expect(k.markArea.data[0][0]).toMatchObject({ xAxis: DAYS[2], yAxis: 10 })
+  expect(k.markArea.data[0][1]).toMatchObject({ xAxis: DAYS[8], yAxis: 12 })
+  expect(k.markArea.data[1][0].yAxis).toBeUndefined()
+  const line = option.series.find((s: any) => s.id === 'structure:bi-1')
+  expect(line.data[0]).toEqual([DAYS[2], 10])
+  expect(line.data.at(-1)).toEqual([DAYS[8], 12])
+  // dataZoom filters by category. Interior samples keep a crossing line visible
+  // even when both original endpoints are outside the zoom viewport.
+  expect(line.data[3]).toEqual([DAYS[5], 11])
+  expect(line.lineStyle.type).toBe('dashed')
+  expect(chart.dispatchAction).toHaveBeenCalledWith(expect.objectContaining({ type: 'dataZoom', startValue: 2, endValue: 8 }))
+  await act(async () => root.render(<EChartsCandlestick data={rows(100)} symbol="000001" structureLines={[]} ranges={[]} />))
+  const next = chart.setOption.mock.calls.at(-1)?.[0] as any
+  expect(next.series.some((s: any) => s.id === 'structure:bi-1')).toBe(false)
+  expect(next.series.find((s: any) => s.name === 'K').markArea).toBeUndefined()
+})
