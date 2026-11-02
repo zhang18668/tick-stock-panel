@@ -1,9 +1,10 @@
 import { lazy, Suspense } from 'react'
 import { NavLink } from 'react-router-dom'
-import { ChartNoAxesCombined } from 'lucide-react'
+import { ChartNoAxesCombined, History } from 'lucide-react'
 import type { FrontendExtension } from '@/extensions/types'
 
 const Page = lazy(() => import('./ChanAnalysisPage').then(m => ({ default: m.ChanAnalysisPage })))
+const ReviewPage = lazy(() => import('./ChanReviewPage').then(m => ({ default: m.ChanReviewPage })))
 
 function ChanEntry() {
   return <NavLink to="/chan-analysis" aria-label="打开缠论分析" title="缠论分析"
@@ -18,10 +19,15 @@ function ChanEntry() {
 function ChanRoute() {
   return <Suspense fallback={<div className="p-6 text-sm text-muted">加载缠论分析…</div>}><Page /></Suspense>
 }
+function ReviewRoute() {
+  return <Suspense fallback={<div className="p-6 text-sm text-muted">加载缠论复盘…</div>}><ReviewPage /></Suspense>
+}
 
 const extension: FrontendExtension = {
   id: 'chan.analysis', apiVersion: 1,
-  routes: [{ id: 'chan-analysis', path: '/chan-analysis', component: ChanRoute }],
+  routes: [{ id: 'chan-analysis', path: '/chan-analysis', component: ChanRoute },
+    { id: 'chan-review', path: '/chan-review', component: ReviewRoute }],
+  navigation: [{ id: 'chan-review', routeId: 'chan-review', label: '缠论复盘', icon: History, order: 510 }],
   slots: [{ name: 'layout.header.quick', id: 'chan-shortcut', order: 20, component: ChanEntry }],
 }
 export default extension

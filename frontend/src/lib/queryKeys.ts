@@ -8,6 +8,12 @@
 // ===== Query Key 工厂 =====
 
 export const QK = {
+  chanReview: (owner: string) => ['chan-review', owner] as const,
+  chanReviewSignals: (owner: string, filters: object) => ['chan-review', owner, 'signals', filters] as const,
+  chanReviewRuns: (owner: string) => ['chan-review', owner, 'runs'] as const,
+  chanReviewSnapshot: (owner: string, id: string) => ['chan-review', owner, 'snapshot', id] as const,
+  chanReviewSignal: (owner: string, id: string) => ['chan-review', owner, 'signal', id] as const,
+  chanReviewFollowing: (owner: string, id: string) => ['chan-review', owner, 'following', id] as const,
   chanAnalyses: (symbol: string) => ['chan-analysis', symbol] as const,
   // Full normalized OHLC content is part of the key: revisions of history must
   // invalidate derived structures even when symbol/date/count are unchanged.

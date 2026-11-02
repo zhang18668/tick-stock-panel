@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Iterator
+from copy import deepcopy
 from datetime import date, datetime, timedelta
 from itertools import pairwise
 from typing import Literal
@@ -155,3 +157,82 @@ def analyze(rows: list[dict], period: Literal["day", "week"], *, now: datetime |
             "asOf": observed_at,
             "ruleVersion": "chan.py · strict / chan / normal",
             "engine": {"name": "chan.py", "revision": REVISION, "config": ENGINE_CONFIG}}
+
+
+def iter_chan_frames(
+    rows: list[dict], period: Literal["day", "week"], *,
+    observed_dates: set[str], cancel_event=None, now: datetime | None = None,
+) -> Iterator[tuple[str, dict]]:
+    """Advance the pinned engine once, yielding immutable requested prefix frames.
+
+    Weekly evidence becomes available at the first supplied bar of the next
+    week, exactly as in analyze(). No future bar is used to close a partial week.
+    """
+    normalized = [ChanBar.model_validate(row).model_dump(mode="json") for row in rows]
+    if period not in {"day", "week"}:
+        raise ValueError("不支持的缠论周期")
+    if len(normalized) > 2000:
+        raise ValueError("最多分析2000根日K线")
+    if any(a["date"] >= b["date"] for a, b in pairwise(normalized)):
+        raise ValueError("K线日期必须严格递增且不能重复")
+    now = (now or datetime.now(ZoneInfo("Asia/Shanghai"))).astimezone(ZoneInfo("Asia/Shanghai"))
+    engine = CKLine_List(KL_TYPE.K_WEEK if period == "week" else KL_TYPE.K_DAY, CChanConfig(dict(ENGINE_CONFIG)))
+    seen: dict = {}
+    structures: list[dict] = []
+    chart_rows: list[dict] = []
+    metric = CMACD()
+    previous = None
+    observed_at = None
+    pending = None
+    previous_week = None
+
+    def measured(row, model):
+        m = model.add(row["close"])
+        return {**row, "macd_dif": m.DIF, "macd_dea": m.DEA, "macd_hist": m.macd}
+
+    def feed(row, available_at):
+        nonlocal previous, structures, observed_at
+        day = date.fromisoformat(row["date"])
+        unit = CKLine_Unit({**row, DATA_FIELD.FIELD_TIME: CTime(day.year, day.month, day.day, 0, 0, auto=False)})
+        unit.set_idx(len(chart_rows) - 1)
+        unit.kl_type = engine.kl_type
+        unit.set_pre_klu(previous)
+        previous = unit
+        engine.add_single_klu(unit)
+        observed_at = available_at
+        structures = _snapshot(engine, seen, available_at)
+
+    for row in normalized:
+        if cancel_event is not None and cancel_event.is_set():
+            return
+        if row["date"] == str(now.date()) and (now.hour, now.minute) < (15, 30):
+            break
+        if period == "day":
+            chart_rows.append(measured(row, metric))
+            feed(row, row["date"])
+            visible_rows = chart_rows
+        else:
+            day = date.fromisoformat(row["date"])
+            week = day - timedelta(days=day.weekday())
+            if week != previous_week:
+                if pending is not None:
+                    chart_rows.append(measured(pending, metric))
+                    feed(pending, row["date"])
+                pending = dict(row)
+                previous_week = week
+            else:
+                pending.update(date=row["date"], high=max(pending["high"], row["high"]),
+                               low=min(pending["low"], row["low"]), close=row["close"],
+                               volume=pending["volume"] + row["volume"])
+            visible_rows = [*chart_rows, measured(pending, deepcopy(metric))]
+        if row["date"] not in observed_dates:
+            continue
+        warnings = ["买卖点为当前帧形态信号，可能变化；不等同于已确认交易指令"]
+        if period == "week":
+            warnings.append("最后一周保守视为未完成，仅展示K线，不作为结构确认依据")
+        yield row["date"], {
+            "rows": [dict(r) for r in visible_rows], "structures": deepcopy(structures),
+            "warnings": warnings, "asOf": observed_at,
+            "ruleVersion": "chan.py · strict / chan / normal",
+            "engine": {"name": "chan.py", "revision": REVISION, "config": dict(ENGINE_CONFIG)},
+        }

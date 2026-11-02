@@ -357,6 +357,39 @@ export interface ChanAnalysisResponse {
   engine: { name: string; revision: string; config: Record<string, unknown> }
 }
 
+export interface ChanReviewRequest {
+  source: 'observed' | 'backfill'
+  period: 'day' | 'week'
+  scope: 'market' | 'watchlist' | 'symbols'
+  symbols: string[]
+  start: string
+  end: string
+  resume_from?: string | null
+}
+export interface ChanReviewRun {
+  run_id: string
+  status: string
+  request: ChanReviewRequest
+  created_at: string
+  error?: string | null
+  summary: { planned?: number; processed?: number; completed?: number; failed?: number; missing?: number; partial?: boolean; scope_note?: string; errors?: { symbol: string; message: string }[] }
+}
+export interface ChanReviewSignal {
+  id: string; symbol: string; name: string; source: 'observed' | 'backfill'; period: 'day' | 'week'
+  category: '1' | '2' | '3'; point_type: string; point_date: string; point_price: number
+  first_seen: string; last_seen: string; status: string; left_censored: boolean
+  snapshot_id: string; structure_id: string; engine_revision: string; config_hash: string; partial?: boolean
+}
+export interface ChanReviewList {
+  items: ChanReviewSignal[]; total: number; counts: Record<'1' | '2' | '3', number>; page: number; page_size: number
+}
+export interface ChanReviewSnapshot extends ChanAnalysisResponse { snapshot_id: string; observed_as_of: string; coverage?: { input_start: string; input_end: string; pre_window_rows: number; input_limit: number } }
+export interface ChanReviewObservation { observed_as_of: string; snapshot_id: string; created_at: string; run_id: string }
+export interface ChanReviewFilters {
+  source: 'observed' | 'backfill'; period: 'day' | 'week'; category: '1' | '2' | '3'
+  date_field: 'first_seen' | 'point_date'; start: string; end: string; point_type: string; q: string; page: number
+}
+
 // ===== Watchlist =====
 export interface WatchlistEntry {
   symbol: string
@@ -3266,6 +3299,16 @@ export const api = {
         : `/api/kline/daily?symbol=${encodeURIComponent(symbol)}&days=${days}`)
       + (extColumns ? `&ext_columns=${encodeURIComponent(extColumns)}` : ''),
     ),
+  chanReviewSignals: (filters: ChanReviewFilters, signal?: AbortSignal) => {
+    const params = new URLSearchParams(Object.entries(filters).filter(([, v]) => v !== '').map(([k, v]) => [k, String(v)]))
+    return request<ChanReviewList>(`/api/custom/chan-review/signals?${params}`, { signal })
+  },
+  chanReviewRuns: () => request<{ items: ChanReviewRun[] }>('/api/custom/chan-review/runs'),
+  chanReviewCreate: (body: ChanReviewRequest) => request<ChanReviewRun>('/api/custom/chan-review/runs', { method: 'POST', body: JSON.stringify(body) }),
+  chanReviewCancel: (id: string) => request<ChanReviewRun>(`/api/custom/chan-review/runs/${encodeURIComponent(id)}/cancel`, { method: 'POST' }),
+  chanReviewSnapshot: (id: string, signal?: AbortSignal) => request<ChanReviewSnapshot>(`/api/custom/chan-review/snapshots/${encodeURIComponent(id)}`, { signal }),
+  chanReviewSignal: (id: string, signal?: AbortSignal) => request<ChanReviewSignal & { observations: ChanReviewObservation[] }>(`/api/custom/chan-review/signals/${encodeURIComponent(id)}`, { signal }),
+  chanReviewFollowing: (id: string, signal?: AbortSignal) => request<{ symbol: string; period: 'day' | 'week'; rows: ChanBar[] }>(`/api/custom/chan-review/signals/${encodeURIComponent(id)}/following`, { signal }),
   chanAnalyze: (symbol: string, period: 'day' | 'week', rows: ChanBar[], signal?: AbortSignal) =>
     request<ChanAnalysisResponse>('/api/custom/chan/analyze', {
       method: 'POST', body: JSON.stringify({ symbol, period, rows }), signal, quiet: true, timeoutMs: 60_000,
