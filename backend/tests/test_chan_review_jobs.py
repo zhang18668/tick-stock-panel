@@ -26,6 +26,21 @@ class Repo:
             bump_enriched_generation(self.store.data_dir, "stock")
         return pl.DataFrame([{**r, "symbol": "600000.SH", "date": date.fromisoformat(r["date"])} for r in bars(150)])
 
+    def daily_snapshot(self, start, end, *, cancel_event=None):
+        from contextlib import contextmanager
+
+        from app.enriched_generation import get_enriched_generation
+        @contextmanager
+        def capture():
+            generation = get_enriched_generation(self.store.data_dir)
+            # Fake repository freezes its frame at the same boundary as the
+            # real repository pins its files; it never reads live data later.
+            data = self.get_daily_batch(getattr(self, "snapshot_symbols", ["600000.SH"]), start, end)
+            if generation != get_enriched_generation(self.store.data_dir):
+                raise ValueError("snapshot changed during capture")
+            yield SimpleNamespace(generation=generation, get_daily_batch=lambda symbols, start, end, columns=None: data.filter(pl.col("symbol").is_in(symbols)))
+        return capture()
+
 
 def request(**extra):
     return ReviewRunRequest(source="backfill", scope="symbols", symbols=["600000.SH"], start="2025-03-01", end="2025-03-05", **extra)
@@ -74,6 +89,48 @@ def test_generation_change_publishes_no_mixed_results(tmp_path):
         assert result["status"] == "failed"
         assert jobs.archive.list_signals("alice", {}, 1, 30)["total"] == 0
     finally:
+        jobs.shutdown()
+
+
+def test_live_generation_updates_after_capture_do_not_abort_scan(tmp_path):
+    repo = Repo(tmp_path)
+    jobs = ChanReviewJobs(tmp_path)
+    original = jobs._frames
+    def frames(*args, **kwargs):
+        bump_enriched_generation(tmp_path, "stock")
+        yield from original(*args, **kwargs)
+    jobs._frames = frames
+    try:
+        result = wait_done(jobs, jobs.create("alice", request(), repo))
+        assert result["status"] == "succeeded", result
+        assert result["summary"]["snapshot_generation"]
+        assert jobs.archive.list_signals("alice", {}, 1, 30)["total"] > 0
+    finally:
+        jobs.shutdown()
+
+
+def test_new_task_can_queue_while_publication_is_active(tmp_path):
+    from app.enriched_generation import EnrichedPublication, get_enriched_generation
+    from app.tickflow.daily_snapshot import daily_snapshot
+
+    path = tmp_path / "kline_daily_enriched/date=2025-03-05/part.parquet"
+    path.parent.mkdir(parents=True)
+    pl.DataFrame([{**bars(1)[0], "date": date(2025, 3, 5), "symbol": "600000.SH"}]).write_parquet(path)
+    generation = get_enriched_generation(tmp_path)
+    publication = EnrichedPublication(tmp_path)
+    publication.begin()
+    repo = Repo(tmp_path)
+    repo.daily_snapshot = lambda start, end, **kwargs: daily_snapshot(tmp_path, start, end, **kwargs)
+    jobs = ChanReviewJobs(tmp_path)
+    try:
+        run = jobs.create("alice", request(), repo)
+        assert run["data_fingerprint"]["generation"] is None
+        publication.abandon()
+        result = wait_done(jobs, run)
+        assert result["status"] == "succeeded", result
+        assert result["summary"]["snapshot_generation"] == generation
+    finally:
+        publication.abandon()
         jobs.shutdown()
 
 

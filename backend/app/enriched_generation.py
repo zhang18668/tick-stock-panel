@@ -334,6 +334,41 @@ def bump_enriched_generation(data_dir: Path, asset_type: str = "stock") -> str:
         return generation
 
 
+@contextmanager
+def enriched_read_lock(data_dir: Path, asset_type: str = "stock", *, cancel_event=None, timeout_s: float = 120):
+    """Briefly pin ready files under the same lock used for atomic replacement.
+
+    Release this before scanning or computing. A publishing generation is never
+    exposed; waiting occurs outside the lock so its writer can finish.
+    """
+    from contextlib import ExitStack
+
+    deadline = time.monotonic() + timeout_s
+    while True:
+        if cancel_event is not None and cancel_event.is_set():
+            raise InterruptedError("已取消行情快照准备")
+        with ExitStack() as stack:
+            ready = False
+            try:
+                stack.enter_context(_exclusive_generation_lock(data_dir, asset_type))
+                payload = _read_marker(_marker_path(data_dir, asset_type))
+                if payload is None:
+                    payload = _ready_payload(uuid.uuid4().hex)
+                    _write_marker(_marker_path(data_dir, asset_type), payload)
+                ready = _is_ready_payload(payload)
+            except EnrichedGenerationUnavailableError:
+                pass
+            if ready:
+                yield payload["generation"]
+                return
+        if time.monotonic() >= deadline:
+            raise EnrichedGenerationUnavailableError("行情仍在同步，暂时无法固定只读快照，请稍后重试")
+        if cancel_event is None:
+            time.sleep(.1)
+        else:
+            cancel_event.wait(.1)
+
+
 class EnrichedPublication:
     """Publish one logical enriched write batch under a stable generation token."""
 

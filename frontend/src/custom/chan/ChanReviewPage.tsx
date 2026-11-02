@@ -88,6 +88,7 @@ function ReviewPage({ owner }: { owner: string }) {
               : run.status !== 'succeeded' && <button type="button" className="text-accent disabled:opacity-40" disabled={create.isPending} onClick={() => { const { source, period, scope, symbols, start, end } = run.request; create.mutate({ source, period, scope, symbols, start, end, resume_from: run.run_id }) }}>续跑未完成标的</button>}
           </div>
           {run.error && <p className="mt-2 text-danger">{run.error}</p>}
+          {run.status === 'running' && <p className="mt-1 text-[10px] text-muted">{run.summary.phase === 'preparing_snapshot' ? '正在固定只读行情快照…' : '基于固定行情快照计算，实时更新不会中断扫描'}</p>}
           {run.summary.scope_note && <p className="mt-1 text-[10px] text-muted">{run.summary.scope_note}</p>}
           {run.summary.partial && <p className="mt-1 text-muted">覆盖不完整，已成功标的的归档仍可查看</p>}
           {run.summary.errors?.length ? <details className="mt-2 text-muted"><summary>失败明细</summary>{run.summary.errors.map((e, i) => <p key={i}>{e.symbol}：{e.message}</p>)}</details> : null}

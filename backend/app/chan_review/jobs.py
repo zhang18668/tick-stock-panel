@@ -15,7 +15,7 @@ import polars as pl
 
 from app.chan_review.contracts import ReviewRunRequest
 from app.chan_review.store import ChanReviewArchive, digest
-from app.enriched_generation import get_enriched_generation
+from app.enriched_generation import EnrichedGenerationUnavailableError, get_enriched_generation
 from app.services.chan_analysis import ENGINE_CONFIG, REVISION, ChanBar, iter_chan_frames
 from app.services.heavy_job_limiter import shared_heavy_job_limiter
 from app.services.mining_jobs import ACTIVE_RUN_STATUSES, MiningRunStore
@@ -113,7 +113,13 @@ class ChanReviewJobs:
         symbols = sorted(set(body.symbols if body.scope != "market" else names))
         if not symbols or any(s not in names for s in symbols):
             raise ValueError("请选择有效的股票范围；未知代码或非股票不能扫描")
-        generation = get_enriched_generation(self.data_dir, "stock")
+        try:
+            generation = get_enriched_generation(self.data_dir, "stock")
+        except EnrichedGenerationUnavailableError as exc:
+            if body.resume_from:
+                raise ValueError("行情正在同步，暂时无法校验旧任务，请稍后续跑或新建扫描") from exc
+            # Queue the task; its worker waits for a ready immutable snapshot.
+            generation = None
         fingerprint = {"generation": generation, "engine_revision": REVISION, "config": digest(ENGINE_CONFIG)}
         import psutil
         request = {**body.model_dump(mode="json"), "symbols": symbols, "owner_scope": owner,
@@ -122,7 +128,7 @@ class ChanReviewJobs:
             prior = self.get(owner, body.resume_from)
             def comparable(r):
                 return {k: v for k, v in r.items() if k not in {"resume_from", "coordinator_pid", "coordinator_started"}}
-            if prior["status"] in ACTIVE_RUN_STATUSES or prior["data_fingerprint"] != fingerprint or comparable(prior["request"]) != comparable(request):
+            if prior["status"] in ACTIVE_RUN_STATUSES or (prior["summary"].get("snapshot_generation", prior["data_fingerprint"]["generation"]) != generation or any(prior["data_fingerprint"][k] != fingerprint[k] for k in ("engine_revision", "config"))) or comparable(prior["request"]) != comparable(request):
                 raise ValueError("仅可在数据、规则和范围未改变时续跑已结束任务")
         with self._guard:
             if self._closed or any(self.get(owner, rid)["status"] in ACTIVE_RUN_STATUSES for rid, (_, _, who) in self._active.items() if who == owner):
@@ -146,10 +152,6 @@ class ChanReviewJobs:
                 if item["status"] != "cancelling":
                     self.store.transition_status(run_id, "cancelling")
         return self.get(owner, run_id)
-
-    def _unchanged(self, run):
-        if get_enriched_generation(self.data_dir, "stock") != run["data_fingerprint"]["generation"]:
-            raise ValueError("扫描期间行情数据版本发生变化，未发布混合结果；请重新扫描")
 
     def _new_worker(self, owner, period, cancel):
         context = mp.get_context("spawn")
@@ -217,78 +219,86 @@ class ChanReviewJobs:
                         self.store.transition_status(rid, "cancelled")
                         return
                     self.store.transition_status(rid, "running")
-                prior_completed = []
-                if body.resume_from:
-                    prior_completed = self.store.read_summary(body.resume_from).get("completed_symbols", [])
-                symbols = run["request"]["symbols"]
-                all_dates = set()
-                for offset in range(0, len(symbols), 100):
-                    if cancel.is_set():
-                        break
-                    self._unchanged(run)
-                    chunk = symbols[offset:offset + 100]
-                    data = repo.get_daily_batch(chunk, body.start - timedelta(days=1095), body.end,
-                                                columns=["symbol", "date", "open", "high", "low", "close", "volume"])
-                    self._unchanged(run)
-                    for symbol in chunk:
+                summary["phase"] = "preparing_snapshot"
+                self.store.write_summary(rid, summary)
+                with repo.daily_snapshot(body.start - timedelta(days=1095), body.end, cancel_event=cancel) as snapshot:
+                    summary["snapshot_generation"] = snapshot.generation
+                    summary["phase"] = "scanning"
+                    if body.resume_from:
+                        prior = self.get(owner, body.resume_from)
+                        expected = prior["summary"].get("snapshot_generation", prior["data_fingerprint"]["generation"])
+                        if snapshot.generation != expected:
+                            raise ValueError("续跑前行情快照已改变，请新建扫描")
+                    self.store.write_summary(rid, summary)
+                    prior_completed = []
+                    if body.resume_from:
+                        prior_completed = self.store.read_summary(body.resume_from).get("completed_symbols", [])
+                    symbols = run["request"]["symbols"]
+                    all_dates = set()
+                    for offset in range(0, len(symbols), 100):
                         if cancel.is_set():
                             break
-                        try:
-                            if symbol in prior_completed:
-                                self.archive.reuse_observations(owner, body.resume_from, rid, symbol)
-                            else:
-                                raw = data.filter(pl.col("symbol") == symbol).sort("date").to_dicts() if not data.is_empty() else []
-                                rows = [{k: (str(row[k])[:10] if k == "date" else row[k]) for k in ("date", "open", "high", "low", "close", "volume")} for row in raw if str(row["date"])[:10] <= body.end.isoformat()]
-                                rows = rows[-2000:]
-                                rows = [ChanBar.model_validate(r).model_dump(mode="json") for r in rows]
-                                dates = [r["date"] for r in rows if r["date"] >= body.start.isoformat()]
-                                if len({r["date"] for r in rows}) != len(rows):
-                                    raise ValueError("K线日期重复")
-                                all_dates.update(dates)
-                                if len(all_dates) > 252:
-                                    raise OverflowError("一次最多补算252个实际交易日，请缩短日期范围")
-                                if not dates:
-                                    summary["missing"] += 1
-                                    summary["processed"] += 1
-                                    continue
-                                input_hash = self.archive.save_input(owner, rows)
-                                if worker is None or not worker[0].is_alive():
-                                    self._stop_worker(worker)
-                                    worker = self._new_worker(owner, body.period, cancel)
-                                for frame in self._frames(owner, input_hash, body.period, dates, cancel, worker):
-                                    frame["coverage"] = {"input_start": rows[0]["date"], "input_end": rows[-1]["date"],
-                                                         "pre_window_rows": sum(r["date"] < dates[0] for r in rows),
-                                                         "input_limit": 2000, "price_basis": "enriched前复权"}
-                                    self.archive.save_observation(owner, rid, symbol, names[symbol], body.source, frame, input_hash,
-                                                                  frame["observed_as_of"] == dates[0])
-                                if cancel.is_set():
-                                    self.archive.discard_symbol(owner, rid, symbol)
-                                    break
-                            self.archive.compact_symbol(owner, rid, symbol)
-                            summary["completed"] += 1
-                            summary["completed_symbols"].append(symbol)
-                        except Exception as exc:
-                            # A consumer/write failure can leave the producer's
-                            # remaining frames in its queue. Never reuse it.
-                            self._stop_worker(worker)
-                            worker = None
-                            if isinstance(exc, OverflowError):
-                                raise ValueError(str(exc)) from exc
-                            logger.exception("chan review failed for %s", symbol)
-                            self.archive.discard_symbol(owner, rid, symbol)
-                            summary["failed"] += 1
-                            summary["errors"].append({"symbol": symbol, "message": str(exc) if isinstance(exc, ValueError) else "计算失败，请检查服务日志"})
-                        summary["processed"] += 1
-                        self.store.write_summary(rid, summary)
-                self._unchanged(run)
-                summary["partial"] = summary["completed"] != summary["planned"]
-                self.store.write_summary(rid, summary)
-                # Only complete symbols become visible; interrupted symbol frames
-                # are checkpoints but cannot imply a complete observation window.
-                self.archive.publish_run(owner, rid, summary)
-                with self._guard:
-                    self.store.transition_status(rid, "cancelled" if cancel.is_set() else "failed" if summary["partial"] else "succeeded",
-                                                 error="部分标的失败或缺少行情" if summary["partial"] and not cancel.is_set() else None)
+                        chunk = symbols[offset:offset + 100]
+                        data = snapshot.get_daily_batch(chunk, body.start - timedelta(days=1095), body.end,
+                                                    columns=["symbol", "date", "open", "high", "low", "close", "volume"])
+                        for symbol in chunk:
+                            if cancel.is_set():
+                                break
+                            try:
+                                if symbol in prior_completed:
+                                    self.archive.reuse_observations(owner, body.resume_from, rid, symbol)
+                                else:
+                                    raw = data.filter(pl.col("symbol") == symbol).sort("date").to_dicts() if not data.is_empty() else []
+                                    rows = [{k: (str(row[k])[:10] if k == "date" else row[k]) for k in ("date", "open", "high", "low", "close", "volume")} for row in raw if str(row["date"])[:10] <= body.end.isoformat()]
+                                    rows = rows[-2000:]
+                                    rows = [ChanBar.model_validate(r).model_dump(mode="json") for r in rows]
+                                    dates = [r["date"] for r in rows if r["date"] >= body.start.isoformat()]
+                                    if len({r["date"] for r in rows}) != len(rows):
+                                        raise ValueError("K线日期重复")
+                                    all_dates.update(dates)
+                                    if len(all_dates) > 252:
+                                        raise OverflowError("一次最多补算252个实际交易日，请缩短日期范围")
+                                    if not dates:
+                                        summary["missing"] += 1
+                                        summary["processed"] += 1
+                                        continue
+                                    input_hash = self.archive.save_input(owner, rows)
+                                    if worker is None or not worker[0].is_alive():
+                                        self._stop_worker(worker)
+                                        worker = self._new_worker(owner, body.period, cancel)
+                                    for frame in self._frames(owner, input_hash, body.period, dates, cancel, worker):
+                                        frame["coverage"] = {"input_start": rows[0]["date"], "input_end": rows[-1]["date"],
+                                                             "pre_window_rows": sum(r["date"] < dates[0] for r in rows),
+                                                             "input_limit": 2000, "price_basis": "enriched前复权"}
+                                        self.archive.save_observation(owner, rid, symbol, names[symbol], body.source, frame, input_hash,
+                                                                      frame["observed_as_of"] == dates[0])
+                                    if cancel.is_set():
+                                        self.archive.discard_symbol(owner, rid, symbol)
+                                        break
+                                self.archive.compact_symbol(owner, rid, symbol)
+                                summary["completed"] += 1
+                                summary["completed_symbols"].append(symbol)
+                            except Exception as exc:
+                                # A consumer/write failure can leave the producer's
+                                # remaining frames in its queue. Never reuse it.
+                                self._stop_worker(worker)
+                                worker = None
+                                if isinstance(exc, OverflowError):
+                                    raise ValueError(str(exc)) from exc
+                                logger.exception("chan review failed for %s", symbol)
+                                self.archive.discard_symbol(owner, rid, symbol)
+                                summary["failed"] += 1
+                                summary["errors"].append({"symbol": symbol, "message": str(exc) if isinstance(exc, ValueError) else "计算失败，请检查服务日志"})
+                            summary["processed"] += 1
+                            self.store.write_summary(rid, summary)
+                    summary["partial"] = summary["completed"] != summary["planned"]
+                    self.store.write_summary(rid, summary)
+                    # Only complete symbols become visible; interrupted symbol frames
+                    # are checkpoints but cannot imply a complete observation window.
+                    self.archive.publish_run(owner, rid, summary)
+                    with self._guard:
+                        self.store.transition_status(rid, "cancelled" if cancel.is_set() else "failed" if summary["partial"] else "succeeded",
+                                                     error="部分标的失败或缺少行情" if summary["partial"] and not cancel.is_set() else None)
         except Exception as exc:
             logger.exception("chan review run failed")
             with self._guard:

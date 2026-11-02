@@ -1658,6 +1658,12 @@ class KlineRepository:
 
         return df
 
+    def daily_snapshot(self, start: date, end: date, *, cancel_event=None):
+        """Return a context-managed, immutable stock daily view for long scans."""
+        from app.tickflow.daily_snapshot import daily_snapshot
+
+        return daily_snapshot(self.store.data_dir, start, end, cancel_event=cancel_event)
+
     def get_daily_batch(
         self,
         symbols: list[str],

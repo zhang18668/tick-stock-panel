@@ -372,7 +372,7 @@ export interface ChanReviewRun {
   request: ChanReviewRequest
   created_at: string
   error?: string | null
-  summary: { planned?: number; processed?: number; completed?: number; failed?: number; missing?: number; partial?: boolean; scope_note?: string; errors?: { symbol: string; message: string }[] }
+  summary: { planned?: number; processed?: number; completed?: number; failed?: number; missing?: number; partial?: boolean; phase?: string; snapshot_generation?: string; scope_note?: string; errors?: { symbol: string; message: string }[] }
 }
 export interface ChanReviewSignal {
   id: string; symbol: string; name: string; source: 'observed' | 'backfill'; period: 'day' | 'week'
